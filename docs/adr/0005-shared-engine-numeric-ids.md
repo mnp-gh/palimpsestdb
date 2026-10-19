@@ -1,0 +1,3 @@
+# All Databases share one Storage Engine and one WAL, keyed by numeric IDs
+
+Every Database on a Node lives in the same Storage Engine and the same WAL, separated by a key prefix of numeric IDs (`database_id ‖ collection_id ‖ …`); the Catalog maps names to IDs. One WAL means one fsync stream and lets a transaction span Databases without two-phase commit; numeric IDs make renames a Catalog update and drops a range delete. Tenant isolation is therefore logical (enforced by Roles), not physical — per-Database engines would have given easier per-tenant backup and deletion, at the cost of many WALs and distributed commit even on one Node.
