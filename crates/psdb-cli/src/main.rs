@@ -193,13 +193,24 @@ fn split_namespace(text: &str) -> Result<((&str, &str), &str), String> {
 
 /// Parse exactly `N` whitespace-separated Extended JSON values.
 fn values<const N: usize>(text: &str) -> Result<[Bson; N], String> {
-    let parsed = serde_json::Deserializer::from_str(text)
-        .into_iter::<serde_json::Value>()
-        .map(|v| {
-            let v = v.map_err(|e| format!("invalid JSON: {e}"))?;
-            Bson::try_from(v).map_err(|e| format!("invalid Extended JSON: {e}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
+    let mut parsed = Vec::new();
+    loop {
+        // Where the next argument starts, for pointing at it in errors.
+        let start = stream.byte_offset();
+        let Some(next) = stream.next() else { break };
+        let argument = parsed.len() + 1;
+        let json = next.map_err(|e| {
+            let token = text[start..].split_whitespace().next().unwrap_or("");
+            format!(
+                "argument {argument} is not valid JSON ({e}) at `{token}`\n\
+                 hint: quote strings (\"abc\"); write ObjectIds as {{\"$oid\": \"6ad6...\"}}"
+            )
+        })?;
+        let value = Bson::try_from(json)
+            .map_err(|e| format!("argument {argument} is not valid Extended JSON: {e}"))?;
+        parsed.push(value);
+    }
     let count = parsed.len();
     parsed
         .try_into()
