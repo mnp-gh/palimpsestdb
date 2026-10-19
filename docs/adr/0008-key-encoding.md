@@ -16,7 +16,7 @@ Every component is self-delimiting, so no logical key is a prefix of another and
 |---|---|---|
 | Integer (BSON int32 and int64, one class) | `0x10` | i64 with the sign bit flipped, big-endian |
 | String | `0x20` | UTF-8 with `0x00` escaped as `0x00 0xFF`, terminated by `0x00 0x00` |
-| Binary | `0x30` | subtype byte, then bytes escaped and terminated as for String |
+| Binary (including UUIDs, subtype 4) | `0x30` | subtype byte, then bytes escaped and terminated as for String |
 | ObjectId | `0x40` | the 12 raw bytes |
 | Boolean | `0x50` | `0x00` or `0x01` |
 | DateTime | `0x60` | milliseconds since epoch as for Integer |

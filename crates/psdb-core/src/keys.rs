@@ -109,7 +109,7 @@ pub(crate) fn encode_id(id: &Bson, out: &mut Vec<u8>) -> Result<()> {
         }
         other => {
             return Err(Error::InvalidId(format!(
-                "{:?} cannot be an _id; use an integer, string, binary, ObjectId, boolean or date",
+                "{:?} cannot be an _id; use an integer, string, binary (such as a UUID), ObjectId, boolean or date",
                 other.element_type()
             )));
         }
@@ -226,6 +226,10 @@ mod tests {
                     bytes,
                 })
             }),
+            any::<[u8; 16]>().prop_map(|b| Bson::Binary(Binary {
+                subtype: BinarySubtype::Uuid,
+                bytes: b.to_vec(),
+            })),
             any::<[u8; 12]>().prop_map(|b| Bson::ObjectId(ObjectId::from_bytes(b))),
             any::<bool>().prop_map(Bson::Boolean),
             any::<i64>().prop_map(|ms| Bson::DateTime(DateTime::from_millis(ms))),

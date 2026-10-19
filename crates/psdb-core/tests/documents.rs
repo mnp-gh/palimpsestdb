@@ -2,7 +2,7 @@
 
 mod common;
 
-use bson::{Bson, doc};
+use bson::{Bson, doc, oid::ObjectId, spec::BinarySubtype};
 use psdb_core::{Database, Error, Limits};
 use psdb_storage_memory::MemoryEngine;
 
@@ -37,11 +37,26 @@ fn insert_get_replace_delete() {
 }
 
 #[test]
-fn generated_ids_are_object_ids() {
+fn generated_ids_are_uuids_in_creation_order() {
     let db = common::shop();
-    let a = db.insert("shop", "orders", doc! { "n": 1 }).unwrap();
-    let b = db.insert("shop", "orders", doc! { "n": 2 }).unwrap();
-    assert!(matches!(a, Bson::ObjectId(_)) && a != b);
+    let ids: Vec<Bson> = (0..50)
+        .map(|n| db.insert("shop", "orders", doc! { "n": n }).unwrap())
+        .collect();
+    for id in &ids {
+        assert!(
+            matches!(id, Bson::Binary(b) if b.subtype == BinarySubtype::Uuid && b.bytes.len() == 16),
+            "{id:?}"
+        );
+    }
+    // UUIDv7 sorts by creation time, so find (which returns _id order)
+    // returns Documents in insertion order.
+    let found: Vec<i32> = db
+        .find("shop", "orders", &doc! {})
+        .unwrap()
+        .iter()
+        .map(|d| d.get_i32("n").unwrap())
+        .collect();
+    assert_eq!(found, (0..50).collect::<Vec<_>>());
 }
 
 #[test]
@@ -150,4 +165,30 @@ fn collections_are_separate() {
     assert_eq!(db.find("shop", "returns", &doc! {}).unwrap().len(), 1);
     db.delete("shop", "returns", &Bson::Int32(1)).unwrap();
     assert!(db.get("shop", "orders", &Bson::Int32(1)).unwrap().is_some());
+}
+
+#[test]
+fn client_supplied_object_ids_work_as_ids_and_fields() {
+    // Data imported from MongoDB keeps its ObjectId _ids and references.
+    let db = common::shop();
+    let (order, customer) = (ObjectId::new(), ObjectId::new());
+    db.insert(
+        "shop",
+        "orders",
+        doc! { "_id": order, "customer": customer },
+    )
+    .unwrap();
+    let err = db
+        .insert("shop", "orders", doc! { "_id": order })
+        .unwrap_err();
+    assert!(matches!(err, Error::DuplicateId(_)), "{err}");
+    assert!(
+        db.get("shop", "orders", &Bson::ObjectId(order))
+            .unwrap()
+            .is_some()
+    );
+    let found = db
+        .find("shop", "orders", &doc! { "customer": customer })
+        .unwrap();
+    assert_eq!(found.len(), 1);
 }

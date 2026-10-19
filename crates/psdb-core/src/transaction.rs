@@ -81,7 +81,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         Ok(rows)
     }
 
-    /// Insert a Document. If it has no `_id`, an ObjectId is generated.
+    /// Insert a Document. If it has no `_id`, a UUIDv7 is generated.
     /// Returns the Document ID.
     pub fn insert(&mut self, database: &str, collection: &str, doc: Document) -> Result<Bson> {
         let (db_id, coll_id) = self.resolve_collection(database, collection)?;
