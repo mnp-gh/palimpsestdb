@@ -29,7 +29,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - MVCC with Snapshot Isolation, first-committer-wins ([ADR 0001](./adr/0001-mvcc-lives-above-storage-engine.md))
 - Get, insert, replace and delete by Document ID; full-Collection scan with filters (equality, comparison, `$and`, `$or`, dotted paths)
 - Autocommit for single operations
-- Size limits (Document, Document ID, nesting depth, names)
+- Size limits: Document 16 MB, Document ID 1 KB, nesting depth 100, Database and Collection names 64 bytes without `.` or NUL. Configurable, except limits fixed by the on-disk format
 - Property tests with `proptest`
 
 ## v0.2: Durability
@@ -54,12 +54,13 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## v0.5: Serializable
 
-- Serializable Snapshot Isolation with Read Markers, escalating key → range → Collection ([ADR 0002](./adr/0002-ssi-not-2pl.md))
+- Serializable Snapshot Isolation with Read Markers, escalating key → range → Collection past a configurable per-Transaction threshold; Read Markers outlive commit until every overlapping Transaction finishes ([ADR 0002](./adr/0002-ssi-not-2pl.md))
+- Later: read-only safe-snapshot optimisation
 - History checker (Elle-style) running in the simulator
 
 ## v0.6: Server
 
-- `tokio` network front end with its own wire protocol ([ADR 0003](./adr/0003-own-wire-protocol.md))
+- `tokio` network front end ([ADR 0007](./adr/0007-runtime-model.md)) with its own wire protocol ([ADR 0003](./adr/0003-own-wire-protocol.md))
 - Rust client with a retrying `with_transaction` helper; CLI over the network
 - Group-commit thread, checkpoints, CPU thread pool
 
@@ -83,5 +84,6 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## v2.x: Distribution
 
+- Define "strong consistency" precisely first (linearizable single-Document operations vs strictly serializable Transactions)
 - Replication via Raft over the WAL
 - Later: sharding and distributed transactions
