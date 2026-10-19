@@ -1,13 +1,17 @@
 //! `psdb`: an interactive shell over an embedded, in-memory PalimpsestDB.
 //!
 //! Values are written as MongoDB relaxed Extended JSON, e.g.
-//! `{"_id": {"$oid": "65f0..."}, "n": 1}`. Everything is lost on exit.
+//! `{"_id": {"$uuid": "0192f3a8-..."}, "n": 1}`. Everything is lost on exit.
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal};
 
-use bson::{Bson, Document};
+use bson::{Binary, Bson, Document, spec::BinarySubtype};
 use psdb_core::{Database, Transaction};
 use psdb_storage_memory::MemoryEngine;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+use serde_json::{Value, json};
+use uuid::Uuid;
 
 type Db = Database<MemoryEngine>;
 type Txn<'db> = Transaction<'db, MemoryEngine>;
@@ -44,40 +48,81 @@ enum Outcome {
 fn main() {
     let db = Database::new(MemoryEngine::new());
     let mut txn: Option<Txn<'_>> = None;
-    let interactive = io::stdin().is_terminal();
-    if interactive {
+    let mut input = Input::open();
+    if matches!(input, Input::Terminal(_)) {
         println!(
             "PalimpsestDB v{} (in-memory). Type `help` for commands.",
             env!("CARGO_PKG_VERSION")
         );
     }
 
-    let mut line = String::new();
     loop {
-        if interactive {
-            print!(
-                "{}",
-                if txn.is_some() {
-                    "psdb(txn)> "
-                } else {
-                    "psdb> "
-                }
-            );
-            io::stdout().flush().expect("stdout");
-        }
-        line.clear();
-        match io::stdin().lock().read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("error: reading input: {e}");
-                break;
-            }
-        }
+        let prompt = if txn.is_some() {
+            "psdb(txn)> "
+        } else {
+            "psdb> "
+        };
+        let Some(line) = input.next_line(prompt) else {
+            break;
+        };
         match execute(&db, &mut txn, line.trim()) {
             Ok(Outcome::Continue) => {}
             Ok(Outcome::Quit) => break,
             Err(message) => eprintln!("error: {message}"),
+        }
+    }
+}
+
+/// Where commands come from: a line editor with history on a terminal,
+/// plain lines when input is piped (`psdb < script.txt`).
+enum Input {
+    Terminal(Box<DefaultEditor>),
+    Piped(io::StdinLock<'static>),
+}
+
+impl Input {
+    fn open() -> Self {
+        if io::stdin().is_terminal() {
+            match DefaultEditor::new() {
+                Ok(editor) => return Input::Terminal(Box::new(editor)),
+                Err(e) => eprintln!("warning: line editing unavailable: {e}"),
+            }
+        }
+        Input::Piped(io::stdin().lock())
+    }
+
+    /// The next line, or `None` at end of input (Ctrl-D).
+    fn next_line(&mut self, prompt: &str) -> Option<String> {
+        match self {
+            Input::Terminal(editor) => loop {
+                match editor.readline(prompt) {
+                    Ok(line) => {
+                        if !line.trim().is_empty() {
+                            // Failing to record history is harmless.
+                            let _ = editor.add_history_entry(line.as_str());
+                        }
+                        return Some(line);
+                    }
+                    // Ctrl-C discards the current line, like most shells.
+                    Err(ReadlineError::Interrupted) => continue,
+                    Err(ReadlineError::Eof) => return None,
+                    Err(e) => {
+                        eprintln!("error: reading input: {e}");
+                        return None;
+                    }
+                }
+            },
+            Input::Piped(stdin) => {
+                let mut line = String::new();
+                match stdin.read_line(&mut line) {
+                    Ok(0) => None,
+                    Ok(_) => Some(line),
+                    Err(e) => {
+                        eprintln!("error: reading input: {e}");
+                        None
+                    }
+                }
+            }
         }
     }
 }
@@ -131,7 +176,7 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
             let [id] = values::<1>(args)?;
             match with_txn(db, txn, |t| t.get(ns.0, ns.1, &id))? {
                 Some(doc) => println!("{}", to_json(Bson::Document(doc))),
-                None => println!("not found"),
+                None => not_found(&id),
             }
         }
         "replace" => {
@@ -139,13 +184,21 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
             let [id, doc] = values::<2>(args)?;
             let doc = as_document(doc)?;
             let replaced = with_txn(db, txn, |t| t.replace(ns.0, ns.1, &id, doc))?;
-            println!("{}", if replaced { "replaced" } else { "not found" });
+            if replaced {
+                println!("replaced");
+            } else {
+                not_found(&id);
+            }
         }
         "delete" => {
             let (ns, args) = split_namespace(rest)?;
             let [id] = values::<1>(args)?;
             let deleted = with_txn(db, txn, |t| t.delete(ns.0, ns.1, &id))?;
-            println!("{}", if deleted { "deleted" } else { "not found" });
+            if deleted {
+                println!("deleted");
+            } else {
+                not_found(&id);
+            }
         }
         "find" => {
             let (ns, args) = split_namespace(rest)?;
@@ -204,7 +257,7 @@ fn values<const N: usize>(text: &str) -> Result<[Bson; N], String> {
             let token = text[start..].split_whitespace().next().unwrap_or("");
             format!(
                 "argument {argument} is not valid JSON ({e}) at `{token}`\n\
-                 hint: quote strings (\"abc\"); write ObjectIds as {{\"$oid\": \"6ad6...\"}}"
+                 hint: quote strings (\"abc\"); write UUIDs as {{\"$uuid\": \"0192f3a8-...\"}}"
             )
         })?;
         let value = Bson::try_from(json)
@@ -225,7 +278,38 @@ fn as_document(value: Bson) -> Result<Document, String> {
 }
 
 fn to_json(value: Bson) -> String {
-    value.into_relaxed_extjson().to_string()
+    to_json_value(value).to_string()
+}
+
+/// Relaxed Extended JSON, except UUIDs print as `{"$uuid": "..."}`, the
+/// same form the shell accepts, rather than as base64 `$binary`.
+fn to_json_value(value: Bson) -> Value {
+    match value {
+        Bson::Binary(Binary {
+            subtype: BinarySubtype::Uuid,
+            bytes,
+        }) if bytes.len() == 16 => {
+            json!({ "$uuid": Uuid::from_slice(&bytes).expect("16 bytes").to_string() })
+        }
+        Bson::Document(doc) => Value::Object(
+            doc.into_iter()
+                .map(|(k, v)| (k, to_json_value(v)))
+                .collect(),
+        ),
+        Bson::Array(items) => Value::Array(items.into_iter().map(to_json_value).collect()),
+        other => other.into_relaxed_extjson(),
+    }
+}
+
+/// Report a missing Document, with a hint when the `_id` looks like a UUID
+/// typed as a plain string.
+fn not_found(id: &Bson) {
+    println!("not found");
+    if let Bson::String(text) = id
+        && Uuid::try_parse(text).is_ok()
+    {
+        println!("hint: {text:?} is a string; for a UUID write {{\"$uuid\": \"{text}\"}}");
+    }
 }
 
 fn print_names(names: &[String]) {
