@@ -1,0 +1,3 @@
+# tokio front end with dedicated threads for the log and CPU work
+
+Client connections run as async tasks on `tokio`; WAL appends and fsyncs go to a dedicated group-commit thread; CPU-heavy work (large sorts, aggregations) goes to a thread pool (`rayon` or `spawn_blocking`). We rejected thread-per-core runtimes (glommio, monoio on io_uring) despite their performance because they are Linux-only and the primary development machine is macOS, and rejected thread-per-connection because it scales poorly with idle clients. Versions before v0.6 are synchronous and single-threaded, so the async model is introduced only once the transaction core is stable.
