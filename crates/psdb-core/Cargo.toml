@@ -1,0 +1,19 @@
+[package]
+name = "psdb-core"
+description = "The PalimpsestDB Document Layer: Documents, Catalog, MVCC and Snapshot Isolation over any Storage Engine."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+psdb-storage.workspace = true
+bson.workspace = true
+uuid = { workspace = true, features = ["v7"] }
+getrandom.workspace = true
+
+[dev-dependencies]
+psdb-storage-memory.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

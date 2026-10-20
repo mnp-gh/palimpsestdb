@@ -4,7 +4,7 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 
 | Version | Theme | Status |
 |---|---|---|
-| v0.1 | Embedded, in-memory | Next |
+| v0.1 | Embedded, in-memory | In review |
 | v0.2 | Durability | Planned |
 | v0.3 | Indexes | Planned |
 | v0.4 | Concurrency | Planned |
@@ -48,6 +48,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.4: Concurrency
 
 - Thread-safe Document Layer; single in-order applier; visibility watermark
+- In-RAM Catalog cache (v0.1 reads Catalog entries from the engine on every operation)
 - Garbage collection of old Versions below the oldest active Snapshot
 - `fjall` Storage Engine, passing the conformance suite
 - Clock and I/O seams; deterministic simulator
@@ -67,6 +68,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.7: Access
 
 - Users and built-in Roles per Database (`read`, `readWrite`, `dbAdmin`, Node-wide `root`)
+- Roles are granted on a Database's ID, not its name: a Database must exist before access to it is granted, and dropping it removes its grants in the same Transaction, so a recreated Database with the same name starts with no access (unlike MongoDB). Record as an ADR when v0.7 starts
 - SCRAM-SHA-256 authentication over TLS (`rustls`)
 
 ## v0.8: Richer queries
