@@ -164,8 +164,15 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     /// Aborts with [`Error::WriteConflict`] if a concurrent Transaction
     /// committed a write to any key this one wrote, or with
     /// [`Error::CollectionChanged`] if a Catalog entry this one used changed
-    /// since its Snapshot. Both are retryable.
+    /// since its Snapshot. Both are retryable. A Transaction that wrote
+    /// nothing always commits.
     pub fn commit(self) -> Result<u64> {
+        // A read-only Transaction saw a consistent Snapshot and wrote nothing
+        // that could be lost, so it always commits, even if a Collection it
+        // read was dropped since.
+        if self.write_set.is_empty() {
+            return Ok(self.snapshot_ts);
+        }
         let mut last_committed = self.db.last_committed.lock().expect("lock poisoned");
         let engine = &self.db.engine;
         let changed_since_snapshot = |key: &[u8]| -> Result<bool> {
@@ -183,10 +190,6 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
                 return Err(Error::WriteConflict);
             }
         }
-        if self.write_set.is_empty() {
-            return Ok(self.snapshot_ts);
-        }
-
         let commit_ts = *last_committed + 1;
         let mut batch = WriteBatch::new();
         for (key, value) in &self.write_set {
