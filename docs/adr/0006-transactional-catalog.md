@@ -4,7 +4,7 @@ The Catalog is stored as ordinary MVCC-versioned keys in reserved system Databas
 
 ## Consequences
 
-- Snapshot Isolation alone does not catch "drop Collection" racing a write into it (that is read-write, not write-write). At commit, every Transaction checks that the Catalog entry of each Collection it touched is unchanged since its Snapshot; otherwise it aborts with a retryable `CollectionChanged`.
+- Snapshot Isolation alone does not catch "drop Collection" racing a write into it (that is read-write, not write-write). At commit, every Transaction that wrote something checks that the Catalog entry of each Collection it touched is unchanged since its Snapshot; otherwise it aborts with a retryable `CollectionChanged`. Read-only Transactions skip the check and always commit: they wrote nothing that could be lost, and their reads were a consistent Snapshot (as in PostgreSQL, where the drop would wait for them instead).
 - Concurrent creation of the same name is an ordinary write-write conflict on the Catalog key.
 - The Document Layer keeps an in-RAM cache of Catalog versions; the engine remains the source of truth.
 - Databases and Collections are created explicitly. Unlike MongoDB, writing to a missing one is an error rather than an implicit create, so a typo such as `shop.oders` fails instead of silently creating a new Collection.

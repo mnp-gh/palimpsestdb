@@ -127,13 +127,15 @@ fn write_into_concurrently_dropped_database_aborts() {
 }
 
 #[test]
-fn reading_a_concurrently_dropped_collection_aborts() {
+fn read_only_transactions_commit_even_if_a_collection_they_read_is_dropped() {
     let db = common::shop();
+    db.insert("shop", "orders", doc! { "_id": 1 }).unwrap();
     let mut t1 = db.begin();
-    assert!(t1.find("shop", "orders", &doc! {}).unwrap().is_empty());
     db.drop_collection("shop", "orders").unwrap();
-    // The answer "empty" depended on a Collection that no longer exists.
-    assert!(matches!(t1.commit(), Err(Error::CollectionChanged)));
+    // The Snapshot still shows the Collection and its Document.
+    assert_eq!(t1.find("shop", "orders", &doc! {}).unwrap().len(), 1);
+    t1.commit()
+        .expect("nothing was written, so nothing can be lost");
 }
 
 #[test]
