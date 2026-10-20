@@ -92,7 +92,7 @@ impl<E: StorageEngine> Database<E> {
 
     /// Autocommit [`Transaction::drop_collection`].
     pub fn drop_collection(&self, database: &str, name: &str) -> Result<()> {
-        self.run(|t| t.drop_collection(database, name))
+        self.run(|t: &mut Transaction<'_, E>| t.drop_collection(database, name))
     }
 
     /// Autocommit [`Transaction::list_collections`].

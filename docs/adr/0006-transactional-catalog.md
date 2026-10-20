@@ -8,4 +8,5 @@ The Catalog is stored as ordinary MVCC-versioned keys in reserved system Databas
 - Concurrent creation of the same name is an ordinary write-write conflict on the Catalog key.
 - The Document Layer keeps an in-RAM cache of Catalog versions; the engine remains the source of truth.
 - Databases and Collections are created explicitly. Unlike MongoDB, writing to a missing one is an error rather than an implicit create, so a typo such as `shop.oders` fails instead of silently creating a new Collection.
-- Database, Collection and Index IDs come from a monotonic counter and are never reused, so stale keys of a dropped Collection can never surface in a new one.
+- Database and Collection IDs are random 63-bit numbers, redrawn if any key (live or from a dropped Collection awaiting cleanup) already exists under them, so an ID is never reused and stale data can never surface in a new Collection.
+- IDs are random rather than counted so concurrent creates of different names never conflict (for example, parallel migration scripts creating tenants). A counter stored as a Catalog entry was implemented first; it made every pair of concurrent creates conflict. A non-transactional counter (like a Postgres sequence) would also avoid conflicts but needs its high-water mark persisted separately. Random IDs lose creation order, which only matters for debugging.

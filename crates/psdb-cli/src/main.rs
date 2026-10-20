@@ -161,7 +161,9 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
         }
         "drop-coll" => {
             let (d, c) = namespace(rest)?;
-            with_txn(db, txn, |t| t.drop_collection(d, c))?;
+            with_txn(db, txn, |t: &mut Transaction<'_, MemoryEngine>| {
+                t.drop_collection(d, c)
+            })?;
         }
 
         "insert" => {

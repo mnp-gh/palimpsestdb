@@ -468,6 +468,7 @@ name = "psdb-core"
 version = "0.1.0"
 dependencies = [
  "bson",
+ "getrandom 0.4.3",
  "proptest",
  "psdb-storage",
  "psdb-storage-memory",
