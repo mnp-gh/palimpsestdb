@@ -158,3 +158,21 @@ fn concurrent_create_of_one_name_conflicts() {
     t1.commit().unwrap();
     assert!(matches!(t2.commit(), Err(Error::WriteConflict)));
 }
+
+#[test]
+fn concurrent_creates_of_different_names_both_commit() {
+    let db = common::shop();
+    let mut t1 = db.begin();
+    let mut t2 = db.begin();
+    t1.create_database("acme").unwrap();
+    t2.create_database("globex").unwrap();
+    t1.create_collection("shop", "audit").unwrap();
+    t2.create_collection("shop", "returns").unwrap();
+    t1.commit().unwrap();
+    t2.commit().unwrap();
+    assert_eq!(db.list_databases().unwrap(), ["acme", "globex", "shop"]);
+    assert_eq!(
+        db.list_collections("shop").unwrap(),
+        ["audit", "orders", "returns"]
+    );
+}

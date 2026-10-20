@@ -74,6 +74,17 @@ pub(crate) fn latest_commit_ts<E: StorageEngine>(
     }
 }
 
+/// Whether any Version of any key under `prefix` exists, live or deleted,
+/// at any timestamp.
+pub(crate) fn any_version_under<E: StorageEngine>(engine: &E, prefix: &[u8]) -> Result<bool> {
+    let mut found = false;
+    engine.scan(&KeyRange::prefix(prefix), &mut |_, _| {
+        found = true;
+        ControlFlow::Break(())
+    })?;
+    Ok(found)
+}
+
 /// Call `visit` with every logical key under `prefix` that has a live
 /// Version at `snapshot_ts`, in key order, with that Version's value.
 pub(crate) fn scan_at<E: StorageEngine>(

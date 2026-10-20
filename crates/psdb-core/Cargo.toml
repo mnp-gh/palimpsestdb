@@ -9,6 +9,7 @@ repository.workspace = true
 psdb-storage.workspace = true
 bson.workspace = true
 uuid = { workspace = true, features = ["v7"] }
+getrandom.workspace = true
 
 [dev-dependencies]
 psdb-storage-memory.workspace = true

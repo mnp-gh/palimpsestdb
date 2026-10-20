@@ -10,7 +10,6 @@ use crate::error::{Error, Result};
 
 /// The Database that holds the Catalog (ADR 0006).
 pub(crate) const CATALOG_DATABASE: u64 = 0;
-const COUNTER_COLLECTION: u64 = 0;
 const DATABASES_COLLECTION: u64 = 1;
 const COLLECTIONS_COLLECTION: u64 = 2;
 
@@ -45,13 +44,6 @@ pub(crate) fn document_key(database_id: u64, collection_id: u64, id: &Bson) -> R
         )));
     }
     Ok(key)
-}
-
-/// The logical key of the Catalog's ID counter.
-pub(crate) fn counter_key() -> Vec<u8> {
-    let mut key = collection_prefix(CATALOG_DATABASE, COUNTER_COLLECTION);
-    push_escaped(&mut key, b"next_id");
-    key
 }
 
 /// The prefix of every Database entry in the Catalog.

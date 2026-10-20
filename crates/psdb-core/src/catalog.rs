@@ -1,10 +1,11 @@
 //! The Catalog: which Databases and Collections exist, stored as versioned
 //! entries in Database 0 so DDL is transactional (ADR 0006).
 //!
-//! Each entry's value is a BSON document `{ name, id }`. IDs come from a
-//! counter that only increases, so an ID is never reused for a different
-//! Database or Collection. Allocating an ID writes the counter, so two
-//! Transactions that both create something conflict and one retries.
+//! Each entry's value is a BSON document `{ name, id }`. IDs are random and
+//! checked against every key ever written under them, so an ID is never
+//! reused, even while a dropped Collection's data is still in the engine.
+//! Creating different names concurrently never conflicts; creating the same
+//! name does, because both write the same Catalog entry.
 
 use bson::{Document, doc};
 use psdb_storage::StorageEngine;
@@ -12,6 +13,7 @@ use psdb_storage::StorageEngine;
 use crate::document::{self, validate_name};
 use crate::error::{Error, Result};
 use crate::keys;
+use crate::mvcc;
 use crate::transaction::Transaction;
 
 impl<E: StorageEngine> Transaction<'_, E> {
@@ -22,7 +24,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         if self.read(&key)?.is_some() {
             return Err(Error::DatabaseExists(name.to_owned()));
         }
-        let id = self.allocate_id()?;
+        let id = self.allocate_id(&[])?;
         self.write(key, Some(entry(name, id)));
         Ok(())
     }
@@ -55,7 +57,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
                 collection: name.to_owned(),
             });
         }
-        let id = self.allocate_id()?;
+        let id = self.allocate_id(&db_id.to_be_bytes())?;
         self.write(key, Some(entry(name, id)));
         Ok(())
     }
@@ -105,16 +107,42 @@ impl<E: StorageEngine> Transaction<'_, E> {
         Ok((db_id, entry_id(&value)?))
     }
 
-    fn allocate_id(&mut self) -> Result<u64> {
-        let key = keys::counter_key();
-        let next = match self.read(&key)? {
-            Some(bytes) => read_u64(&document::decode(&bytes)?, "next")?,
-            // ID 0 is the Catalog's own Database.
-            None => 1,
-        };
-        self.write(key, Some(encode(&doc! { "next": as_i64(next + 1) })));
-        Ok(next)
+    /// A random ID with no key ever written under `parent ‖ id`: pass no
+    /// parent for a Database ID, and the Database ID's bytes for a
+    /// Collection ID, matching the key layout (ADR 0008).
+    ///
+    /// Two Transactions drawing the same ID concurrently is not checked; with
+    /// 63 random bits it is too unlikely to matter.
+    fn allocate_id(&self, parent: &[u8]) -> Result<u64> {
+        pick_unused(std::iter::repeat_with(random_id), |id| {
+            let mut prefix = parent.to_vec();
+            prefix.extend_from_slice(&id.to_be_bytes());
+            mvcc::any_version_under(&self.db.engine, &prefix)
+        })
     }
+}
+
+/// The first candidate that is not 0 (the Catalog's own Database) and not
+/// in use.
+fn pick_unused(
+    candidates: impl IntoIterator<Item = u64>,
+    in_use: impl Fn(u64) -> Result<bool>,
+) -> Result<u64> {
+    const ATTEMPTS: usize = 16;
+    for id in candidates.into_iter().take(ATTEMPTS) {
+        if id != keys::CATALOG_DATABASE && !in_use(id)? {
+            return Ok(id);
+        }
+    }
+    Err(Error::Corruption(format!(
+        "no unused catalog ID in {ATTEMPTS} random draws"
+    )))
+}
+
+/// A random ID in `0..=i64::MAX`, so it fits the BSON int64 stored in
+/// Catalog entries.
+fn random_id() -> u64 {
+    getrandom::u64().expect("the OS random number generator failed") & (i64::MAX as u64)
 }
 
 fn entry(name: &str, id: u64) -> Vec<u8> {
@@ -149,4 +177,27 @@ fn as_i64(n: u64) -> i64 {
 
 fn encode(doc: &Document) -> Vec<u8> {
     doc.to_vec().expect("catalog entries always encode")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pick_unused_skips_zero_and_ids_in_use() {
+        let in_use = |id| Ok(id == 5);
+        assert_eq!(pick_unused([0, 5, 5, 7], in_use).unwrap(), 7);
+    }
+
+    #[test]
+    fn pick_unused_gives_up_eventually() {
+        assert!(pick_unused(std::iter::repeat(5), |_| Ok(true)).is_err());
+    }
+
+    #[test]
+    fn random_ids_fit_in_i64() {
+        for _ in 0..1000 {
+            assert!(i64::try_from(random_id()).is_ok());
+        }
+    }
 }
