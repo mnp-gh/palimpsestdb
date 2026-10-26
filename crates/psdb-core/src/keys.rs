@@ -61,7 +61,7 @@ pub(crate) fn database_entry_key(name: &str) -> Vec<u8> {
 /// The prefix of every Collection entry of one Database in the Catalog.
 pub(crate) fn collections_prefix(database_id: u64) -> Vec<u8> {
     let mut key = collection_prefix(CATALOG_DATABASE, COLLECTIONS_COLLECTION);
-    push_integer(&mut key, database_id as i64);
+    key.extend_from_slice(&database_id.to_be_bytes());
     key
 }
 
