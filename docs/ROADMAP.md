@@ -43,6 +43,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 - Single-field secondary Indexes, versioned and maintained in the same Write Set
 - Index-backed filters
+- Evaluate filters on raw BSON (`RawDocument`) instead of decoding whole Documents
 - Configurable Write Set cap (default 16 MB)
 
 ## v0.4: Concurrency
@@ -50,7 +51,8 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Thread-safe Document Layer; single in-order applier; visibility watermark
 - In-RAM Catalog cache (v0.1 reads Catalog entries from the engine on every operation)
 - Garbage collection of old Versions below the oldest active Snapshot
-- `fjall` Storage Engine, passing the conformance suite
+- `fjall` Storage Engine, passing the conformance suite, with block compression (LZ4 or zstd) enabled
+- Streaming scans: `find` iterates instead of loading the whole Collection into memory
 - Clock and I/O seams; deterministic simulator
 
 ## v0.5: Serializable
@@ -74,7 +76,9 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.8: Richer queries
 
 - Partial updates (`$set`, `$inc`), projections, sort
-- Compound and multikey Indexes; basic query planning
+- Compound and multikey Indexes
+- Rule-based query planner: equality Index, else range Index, else full scan
+- Optional per-Collection validation schemas (Collections stay schemaless by default); the planner uses their type, required and never-an-array facts as hints
 
 ## v0.9: Own Storage Engine
 
@@ -83,6 +87,11 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v1.0: Hardening
 
 - Documentation pass, benchmarks, fuzzing, stabilised on-disk format
+- Measure the space field names cost after compression; decide on a per-Collection field-name dictionary from the numbers (Documents stay BSON until then)
+
+## Unscheduled
+
+- Query planner statistics (sampled per-path counts and histograms) and a cost model for choosing between Indexes
 
 ## v2.x: Distribution
 
