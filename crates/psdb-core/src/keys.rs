@@ -12,6 +12,8 @@ use crate::error::{Error, Result};
 pub(crate) const CATALOG_DATABASE: u64 = 0;
 const DATABASES_COLLECTION: u64 = 1;
 const COLLECTIONS_COLLECTION: u64 = 2;
+const DATABASE_IDS_COLLECTION: u64 = 3;
+const COLLECTION_IDS_COLLECTION: u64 = 4;
 
 /// The largest encoded Document ID accepted, in bytes.
 pub const MAX_ID_BYTES: usize = 1024;
@@ -69,6 +71,22 @@ pub(crate) fn collections_prefix(database_id: u64) -> Vec<u8> {
 pub(crate) fn collection_entry_key(database_id: u64, name: &str) -> Vec<u8> {
     let mut key = collections_prefix(database_id);
     push_escaped(&mut key, name.as_bytes());
+    key
+}
+
+/// The key that marks a Database ID as used, forever (ADR 0006).
+pub(crate) fn database_id_key(id: u64) -> Vec<u8> {
+    let mut key = collection_prefix(CATALOG_DATABASE, DATABASE_IDS_COLLECTION);
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+/// The key that marks a Collection ID in a Database as used, forever
+/// (ADR 0006).
+pub(crate) fn collection_id_key(database_id: u64, id: u64) -> Vec<u8> {
+    let mut key = collection_prefix(CATALOG_DATABASE, COLLECTION_IDS_COLLECTION);
+    key.extend_from_slice(&database_id.to_be_bytes());
+    key.extend_from_slice(&id.to_be_bytes());
     key
 }
 
