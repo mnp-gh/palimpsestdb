@@ -9,11 +9,11 @@ use bson::Bson;
 use crate::error::{Error, Result};
 
 /// The Database that holds the Catalog (ADR 0006).
-pub(crate) const CATALOG_DATABASE: u64 = 0;
-const DATABASES_COLLECTION: u64 = 1;
-const COLLECTIONS_COLLECTION: u64 = 2;
-const DATABASE_IDS_COLLECTION: u64 = 3;
-const COLLECTION_IDS_COLLECTION: u64 = 4;
+pub(crate) const CATALOG_DATABASE: u32 = 0;
+const DATABASES_COLLECTION: u32 = 1;
+const COLLECTIONS_COLLECTION: u32 = 2;
+const DATABASE_IDS_COLLECTION: u32 = 3;
+const COLLECTION_IDS_COLLECTION: u32 = 4;
 
 /// The largest encoded Document ID accepted, in bytes.
 pub const MAX_ID_BYTES: usize = 1024;
@@ -28,15 +28,15 @@ const TAG_DATE_TIME: u8 = 0x60;
 const TIMESTAMP_BYTES: usize = 8;
 
 /// The key prefix shared by every logical key in one Collection.
-pub(crate) fn collection_prefix(database_id: u64, collection_id: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(16);
+pub(crate) fn collection_prefix(database_id: u32, collection_id: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8);
     key.extend_from_slice(&database_id.to_be_bytes());
     key.extend_from_slice(&collection_id.to_be_bytes());
     key
 }
 
 /// The logical key of a Document.
-pub(crate) fn document_key(database_id: u64, collection_id: u64, id: &Bson) -> Result<Vec<u8>> {
+pub(crate) fn document_key(database_id: u32, collection_id: u32, id: &Bson) -> Result<Vec<u8>> {
     let mut key = collection_prefix(database_id, collection_id);
     let start = key.len();
     encode_id(id, &mut key)?;
@@ -61,21 +61,21 @@ pub(crate) fn database_entry_key(name: &str) -> Vec<u8> {
 }
 
 /// The prefix of every Collection entry of one Database in the Catalog.
-pub(crate) fn collections_prefix(database_id: u64) -> Vec<u8> {
+pub(crate) fn collections_prefix(database_id: u32) -> Vec<u8> {
     let mut key = collection_prefix(CATALOG_DATABASE, COLLECTIONS_COLLECTION);
     key.extend_from_slice(&database_id.to_be_bytes());
     key
 }
 
 /// The logical key of a Collection entry in the Catalog.
-pub(crate) fn collection_entry_key(database_id: u64, name: &str) -> Vec<u8> {
+pub(crate) fn collection_entry_key(database_id: u32, name: &str) -> Vec<u8> {
     let mut key = collections_prefix(database_id);
     push_escaped(&mut key, name.as_bytes());
     key
 }
 
 /// The key that marks a Database ID as used, forever (ADR 0006).
-pub(crate) fn database_id_key(id: u64) -> Vec<u8> {
+pub(crate) fn database_id_key(id: u32) -> Vec<u8> {
     let mut key = collection_prefix(CATALOG_DATABASE, DATABASE_IDS_COLLECTION);
     key.extend_from_slice(&id.to_be_bytes());
     key
@@ -83,7 +83,7 @@ pub(crate) fn database_id_key(id: u64) -> Vec<u8> {
 
 /// The key that marks a Collection ID in a Database as used, forever
 /// (ADR 0006).
-pub(crate) fn collection_id_key(database_id: u64, id: u64) -> Vec<u8> {
+pub(crate) fn collection_id_key(database_id: u32, id: u32) -> Vec<u8> {
     let mut key = collection_prefix(CATALOG_DATABASE, COLLECTION_IDS_COLLECTION);
     key.extend_from_slice(&database_id.to_be_bytes());
     key.extend_from_slice(&id.to_be_bytes());
