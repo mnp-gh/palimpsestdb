@@ -1,11 +1,12 @@
 //! The Catalog: which Databases and Collections exist, stored as versioned
 //! entries in Database 0 so DDL is transactional (ADR 0006).
 //!
-//! Each entry's value is a BSON document `{ name, id }`. IDs are random and
-//! checked against every key ever written under them, so an ID is never
-//! reused, even while a dropped Collection's data is still in the engine.
-//! Creating different names concurrently never conflicts; creating the same
-//! name does, because both write the same Catalog entry.
+//! Each entry's value is a BSON document `{ name, id }`. IDs are random, and
+//! creating one also writes its ID key, which dropping leaves in place, so an
+//! ID is never reused, even by a Database or Collection that holds no
+//! Documents. Creating different names concurrently never conflicts;
+//! creating the same name, or drawing the same ID, does, because both
+//! Transactions write the same key.
 
 use bson::{Document, doc};
 use psdb_storage::StorageEngine;
@@ -24,7 +25,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         if self.read(&key)?.is_some() {
             return Err(Error::DatabaseExists(name.to_owned()));
         }
-        let id = self.allocate_id(&[])?;
+        let id = self.allocate_id(None)?;
         self.write(key, Some(entry(name, id)));
         Ok(())
     }
@@ -57,7 +58,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
                 collection: name.to_owned(),
             });
         }
-        let id = self.allocate_id(&db_id.to_be_bytes())?;
+        let id = self.allocate_id(Some(db_id))?;
         self.write(key, Some(entry(name, id)));
         Ok(())
     }
@@ -107,18 +108,29 @@ impl<E: StorageEngine> Transaction<'_, E> {
         Ok((db_id, entry_id(&value)?))
     }
 
-    /// A random ID with no key ever written under `parent ‖ id`: pass no
-    /// parent for a Database ID, and the Database ID's bytes for a
-    /// Collection ID, matching the key layout (ADR 0008).
-    ///
-    /// Two Transactions drawing the same ID concurrently is not checked; with
-    /// 63 random bits it is too unlikely to matter.
-    fn allocate_id(&self, parent: &[u8]) -> Result<u64> {
-        pick_unused(std::iter::repeat_with(random_id), |id| {
-            let mut prefix = parent.to_vec();
-            prefix.extend_from_slice(&id.to_be_bytes());
-            mvcc::any_version_under(&self.db.engine, &prefix)
-        })
+    /// A random ID for a new Database (`database: None`) or for a new
+    /// Collection in `database`.
+    fn allocate_id(&mut self, database: Option<u64>) -> Result<u64> {
+        self.allocate_id_from(std::iter::repeat_with(random_id), database)
+    }
+
+    /// The first of `candidates` whose ID key was never written, at any
+    /// timestamp. Writes the ID key, so a concurrent Transaction that draws
+    /// the same ID fails to commit with a Write Conflict.
+    fn allocate_id_from(
+        &mut self,
+        candidates: impl IntoIterator<Item = u64>,
+        database: Option<u64>,
+    ) -> Result<u64> {
+        let id_key = |id| match database {
+            None => keys::database_id_key(id),
+            Some(db_id) => keys::collection_id_key(db_id, id),
+        };
+        let id = pick_unused(candidates, |id| {
+            mvcc::any_version_under(&self.db.engine, &id_key(id))
+        })?;
+        self.write(id_key(id), Some(Vec::new()));
+        Ok(id)
     }
 }
 
@@ -181,7 +193,39 @@ fn encode(doc: &Document) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use psdb_storage_memory::MemoryEngine;
+
     use super::*;
+    use crate::Database;
+
+    #[test]
+    fn id_of_an_empty_database_is_in_use() {
+        let db = Database::new(MemoryEngine::new());
+        db.create_database("shop").unwrap();
+        let mut txn = db.begin();
+        let taken = txn.resolve_database("shop").unwrap();
+        assert_eq!(txn.allocate_id_from([taken, 7], None).unwrap(), 7);
+    }
+
+    #[test]
+    fn id_of_an_empty_collection_is_in_use() {
+        let db = Database::new(MemoryEngine::new());
+        db.create_database("shop").unwrap();
+        db.create_collection("shop", "orders").unwrap();
+        let mut txn = db.begin();
+        let (db_id, taken) = txn.resolve_collection("shop", "orders").unwrap();
+        assert_eq!(txn.allocate_id_from([taken, 7], Some(db_id)).unwrap(), 7);
+    }
+
+    #[test]
+    fn concurrent_draws_of_one_id_conflict() {
+        let db = Database::new(MemoryEngine::new());
+        let (mut t1, mut t2) = (db.begin(), db.begin());
+        t1.allocate_id_from([7], None).unwrap();
+        t2.allocate_id_from([7], None).unwrap();
+        t1.commit().unwrap();
+        assert!(matches!(t2.commit(), Err(Error::WriteConflict)));
+    }
 
     #[test]
     fn pick_unused_skips_zero_and_ids_in_use() {
