@@ -1,0 +1,21 @@
+[package]
+name = "psdb-cli"
+description = "An interactive shell for an embedded, in-memory PalimpsestDB."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "psdb"
+path = "src/main.rs"
+
+[dependencies]
+psdb-core.workspace = true
+psdb-storage-memory.workspace = true
+bson = { workspace = true, features = ["serde", "serde_json-1"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+uuid.workspace = true
+rustyline.workspace = true
+
+[lints]
+workspace = true

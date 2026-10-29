@@ -1,0 +1,9 @@
+[package]
+name = "psdb-storage"
+description = "The StorageEngine contract for PalimpsestDB and the conformance suite every engine must pass."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

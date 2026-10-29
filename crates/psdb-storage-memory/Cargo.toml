@@ -1,0 +1,12 @@
+[package]
+name = "psdb-storage-memory"
+description = "In-memory Storage Engine for PalimpsestDB."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+psdb-storage.workspace = true
+
+[lints]
+workspace = true
