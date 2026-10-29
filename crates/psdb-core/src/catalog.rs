@@ -82,7 +82,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
 
     /// The ID of a Database at this Snapshot. Records the dependency, so the
     /// commit aborts if the Database is dropped concurrently.
-    pub(crate) fn resolve_database(&mut self, name: &str) -> Result<u64> {
+    pub(crate) fn resolve_database(&mut self, name: &str) -> Result<u32> {
         let key = keys::database_entry_key(name);
         let value = self
             .read(&key)?
@@ -97,7 +97,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         &mut self,
         database: &str,
         collection: &str,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u32, u32)> {
         let db_id = self.resolve_database(database)?;
         let key = keys::collection_entry_key(db_id, collection);
         let value = self.read(&key)?.ok_or_else(|| Error::NoSuchCollection {
@@ -110,7 +110,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
 
     /// A random ID for a new Database (`database: None`) or for a new
     /// Collection in `database`.
-    fn allocate_id(&mut self, database: Option<u64>) -> Result<u64> {
+    fn allocate_id(&mut self, database: Option<u32>) -> Result<u32> {
         self.allocate_id_from(std::iter::repeat_with(random_id), database)
     }
 
@@ -119,9 +119,9 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// the same ID fails to commit with a Write Conflict.
     fn allocate_id_from(
         &mut self,
-        candidates: impl IntoIterator<Item = u64>,
-        database: Option<u64>,
-    ) -> Result<u64> {
+        candidates: impl IntoIterator<Item = u32>,
+        database: Option<u32>,
+    ) -> Result<u32> {
         let id_key = |id| match database {
             None => keys::database_id_key(id),
             Some(db_id) => keys::collection_id_key(db_id, id),
@@ -137,9 +137,9 @@ impl<E: StorageEngine> Transaction<'_, E> {
 /// The first candidate that is not 0 (the Catalog's own Database) and not
 /// in use.
 fn pick_unused(
-    candidates: impl IntoIterator<Item = u64>,
-    in_use: impl Fn(u64) -> Result<bool>,
-) -> Result<u64> {
+    candidates: impl IntoIterator<Item = u32>,
+    in_use: impl Fn(u32) -> Result<bool>,
+) -> Result<u32> {
     const ATTEMPTS: usize = 16;
     for id in candidates.into_iter().take(ATTEMPTS) {
         if id != keys::CATALOG_DATABASE && !in_use(id)? {
@@ -151,18 +151,17 @@ fn pick_unused(
     )))
 }
 
-/// A random ID in `0..=i64::MAX`, so it fits the BSON int64 stored in
-/// Catalog entries.
-fn random_id() -> u64 {
-    getrandom::u64().expect("the OS random number generator failed") & (i64::MAX as u64)
+/// A random 32-bit ID.
+fn random_id() -> u32 {
+    getrandom::u32().expect("the OS random number generator failed")
 }
 
-fn entry(name: &str, id: u64) -> Vec<u8> {
-    encode(&doc! { "name": name, "id": as_i64(id) })
+fn entry(name: &str, id: u32) -> Vec<u8> {
+    encode(&doc! { "name": name, "id": i64::from(id) })
 }
 
-fn entry_id(bytes: &[u8]) -> Result<u64> {
-    read_u64(&document::decode(bytes)?, "id")
+fn entry_id(bytes: &[u8]) -> Result<u32> {
+    read_u32(&document::decode(bytes)?, "id")
 }
 
 fn entry_name(bytes: &[u8]) -> Result<String> {
@@ -172,19 +171,15 @@ fn entry_name(bytes: &[u8]) -> Result<String> {
         .map_err(|e| Error::Corruption(format!("catalog entry name: {e}")))
 }
 
-fn read_u64(doc: &Document, field: &str) -> Result<u64> {
+fn read_u32(doc: &Document, field: &str) -> Result<u32> {
     doc.get_i64(field)
         .ok()
-        .and_then(|n| u64::try_from(n).ok())
+        .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| {
             Error::Corruption(format!(
-                "catalog field {field:?} is not a non-negative int64"
+                "catalog field {field:?} is not an int64 in the u32 range"
             ))
         })
-}
-
-fn as_i64(n: u64) -> i64 {
-    i64::try_from(n).expect("catalog IDs fit in i64")
 }
 
 fn encode(doc: &Document) -> Vec<u8> {
@@ -236,12 +231,5 @@ mod tests {
     #[test]
     fn pick_unused_gives_up_eventually() {
         assert!(pick_unused(std::iter::repeat(5), |_| Ok(true)).is_err());
-    }
-
-    #[test]
-    fn random_ids_fit_in_i64() {
-        for _ in 0..1000 {
-            assert!(i64::try_from(random_id()).is_ok());
-        }
     }
 }
