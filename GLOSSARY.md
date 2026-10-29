@@ -35,7 +35,7 @@ An identity that can authenticate to a Node. Users belong to the Node, not to an
 _Avoid_: Account, login, principal
 
 **Role**:
-A named set of permissions granted to a User on one Database (or Node-wide, for root).
+A named set of permissions granted to a User on one Database (or Node-wide, for root). It belongs to that Database, not to its name: dropping the Database removes it.
 _Avoid_: Permission group, grant
 
 Tenants are not modelled; a tenant is a convention of Users holding Roles on a set of Databases.
