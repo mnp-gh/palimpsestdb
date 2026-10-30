@@ -6,10 +6,11 @@
 
 use std::ops::ControlFlow;
 
-use psdb_storage::{KeyRange, StorageEngine};
+use psdb_storage::{KeyRange, StorageEngine, WriteBatch};
 
 use crate::error::{Error, Result};
-use crate::keys::{physical_key, split_physical};
+use crate::keys::{applied_up_to_key, physical_key, split_physical};
+use crate::transaction::Write;
 
 const TOMBSTONE: u8 = 0x00;
 const LIVE: u8 = 0x01;
@@ -25,6 +26,20 @@ pub(crate) fn encode_value(value: Option<&[u8]>) -> Vec<u8> {
             out
         }
     }
+}
+
+/// The batch that Applies a committed Write Set: one Version per logical key
+/// at `commit_ts`, plus the `applied_up_to` marker (ADR 0004).
+pub(crate) fn commit_batch<'a>(
+    commit_ts: u64,
+    writes: impl IntoIterator<Item = Write<'a>>,
+) -> WriteBatch {
+    let mut batch = WriteBatch::new();
+    for (key, value) in writes {
+        batch.put(physical_key(key, commit_ts), encode_value(value));
+    }
+    batch.put(applied_up_to_key(), commit_ts.to_be_bytes());
+    batch
 }
 
 fn decode_value(stored: &[u8]) -> Result<Option<Vec<u8>>> {

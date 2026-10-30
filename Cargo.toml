@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/mnp-gh/palimpsestdb"
 
@@ -17,6 +17,7 @@ proptest = "1.12"
 uuid = "1.28"
 rustyline = "19"
 getrandom = "0.4"
+crc32c = "0.6"
 
 [workspace.lints.rust]
 missing_docs = "deny"

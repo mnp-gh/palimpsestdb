@@ -1,19 +1,22 @@
 //! The entry point: a [`Database`] over one Storage Engine.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use bson::{Bson, Document};
 use psdb_storage::StorageEngine;
 
 use crate::document::Limits;
-use crate::error::Result;
-use crate::transaction::Transaction;
+use crate::error::{Error, Result};
+use crate::mvcc;
+use crate::transaction::{self, Transaction};
+use crate::wal::{OsWalFile, Wal, WalFile};
 
 /// An embedded PalimpsestDB instance over the Storage Engine `E`.
 ///
 /// Every Database (namespace) and Collection lives in the one engine
-/// (ADR 0005). v0.1 keeps nothing durable and starts empty: open it over a
-/// fresh engine.
+/// (ADR 0005). [`open`](Self::open) makes it durable with a WAL (ADR 0004);
+/// [`new`](Self::new) keeps nothing durable.
 ///
 /// ```
 /// use bson::doc;
@@ -30,23 +33,91 @@ use crate::transaction::Transaction;
 pub struct Database<E: StorageEngine> {
     pub(crate) engine: E,
     pub(crate) limits: Limits,
-    /// The newest Commit Timestamp; new Snapshots are taken here. Holding
-    /// the lock serialises commits, which keeps them applied in order.
-    pub(crate) last_committed: Mutex<u64>,
+    /// Holding the lock serialises commits, which keeps them logged and
+    /// applied in Commit Timestamp order.
+    pub(crate) commits: Mutex<CommitState>,
+}
+
+/// The state commits serialise on.
+pub(crate) struct CommitState {
+    /// The newest Commit Timestamp; new Snapshots are taken here.
+    pub(crate) last: u64,
+    /// `None` when nothing is durable.
+    pub(crate) wal: Option<Wal>,
+    /// Set when a commit's outcome is unknown; nothing more may commit.
+    pub(crate) poisoned: bool,
 }
 
 impl<E: StorageEngine> Database<E> {
-    /// Open over an empty engine with default [`Limits`].
+    /// Open over an empty engine with default [`Limits`], keeping nothing
+    /// durable.
     pub fn new(engine: E) -> Self {
         Self::with_limits(engine, Limits::default())
     }
 
-    /// Open over an empty engine with custom [`Limits`].
+    /// Open over an empty engine with custom [`Limits`], keeping nothing
+    /// durable.
     pub fn with_limits(engine: E, limits: Limits) -> Self {
+        Self::from_parts(engine, limits, 0, None)
+    }
+
+    /// Open a durable Database whose WAL lives in `dir`, creating `dir` and
+    /// the WAL if needed, and replay the WAL into `engine`, which must be
+    /// empty.
+    ///
+    /// ```
+    /// use bson::doc;
+    /// use psdb_core::Database;
+    /// use psdb_storage_memory::MemoryEngine;
+    ///
+    /// # let dir = std::env::temp_dir().join(format!("psdb-doc-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&dir);
+    /// let db = Database::open(MemoryEngine::new(), &dir)?;
+    /// db.create_database("shop")?;
+    /// drop(db);
+    ///
+    /// let db = Database::open(MemoryEngine::new(), &dir)?;
+    /// assert_eq!(db.list_databases()?, ["shop"]);
+    /// # std::fs::remove_dir_all(&dir)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn open(engine: E, dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(engine, OsWalFile::open(dir)?, Limits::default())
+    }
+
+    /// Open a durable Database over any [`WalFile`], such as a
+    /// [`SimDisk`](crate::wal::SimDisk) file in tests, and replay it into
+    /// `engine`, which must be empty.
+    ///
+    /// Fails with [`Error::EngineNotEmpty`], [`Error::UnrecognisedWal`] or
+    /// [`Error::Corruption`] without changing the WAL. On success, a torn
+    /// write at the WAL's end has been truncated, and a WAL cut off while
+    /// being created has been rewritten.
+    pub fn open_with(engine: E, wal: impl WalFile + 'static, limits: Limits) -> Result<Self> {
+        if mvcc::any_version_under(&engine, &[])? {
+            return Err(Error::EngineNotEmpty);
+        }
+        let (wal, records) = Wal::open(Box::new(wal))?;
+        let mut last = 0;
+        for record in &records {
+            engine.write_batch(mvcc::commit_batch(
+                record.commit_ts,
+                transaction::writes(&record.write_set),
+            ))?;
+            last = record.commit_ts;
+        }
+        Ok(Self::from_parts(engine, limits, last, Some(wal)))
+    }
+
+    fn from_parts(engine: E, limits: Limits, last: u64, wal: Option<Wal>) -> Self {
         Self {
             engine,
             limits,
-            last_committed: Mutex::new(0),
+            commits: Mutex::new(CommitState {
+                last,
+                wal,
+                poisoned: false,
+            }),
         }
     }
 
@@ -57,7 +128,7 @@ impl<E: StorageEngine> Database<E> {
 
     /// Begin a Transaction with a Snapshot of everything committed so far.
     pub fn begin(&self) -> Transaction<'_, E> {
-        let snapshot_ts = *self.last_committed.lock().expect("lock poisoned");
+        let snapshot_ts = self.commits.lock().expect("lock poisoned").last;
         Transaction::new(self, snapshot_ts)
     }
 

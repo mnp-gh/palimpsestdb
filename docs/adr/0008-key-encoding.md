@@ -4,7 +4,7 @@ The Storage Engine compares keys as raw bytes, so the Document Layer encodes eve
 
 ## Layout
 
-- **Logical key**: `database_id (u32 BE) ‖ collection_id (u32 BE) ‖ components…`. For Documents the single component is the encoded Document ID. The Catalog lives in Database 0: Collection 1 holds Databases (component: name), 2 holds Collections (components: database ID as 4 big-endian bytes, as in every key, then name), 3 holds the ID keys of Databases (component: database ID) and 4 those of Collections (components: database ID, then collection ID). Database and Collection ID keys live in separate Collections so that neither is a prefix of the other. Collection 0 is unused. Database and Collection IDs are random 32-bit numbers (ADR 0006), never 0.
+- **Logical key**: `database_id (u32 BE) ‖ collection_id (u32 BE) ‖ components…`. For Documents the single component is the encoded Document ID. The Catalog lives in Database 0: Collection 1 holds Databases (component: name), 2 holds Collections (components: database ID as 4 big-endian bytes, as in every key, then name), 3 holds the ID keys of Databases (component: database ID) and 4 those of Collections (components: database ID, then collection ID). Database and Collection ID keys live in separate Collections so that neither is a prefix of the other. Collection 0 holds unversioned Document Layer state: the `applied_up_to` marker (component: the bytes `applied_up_to`; value: a Commit Timestamp as u64 BE, ADR 0004). Database and Collection IDs are random 32-bit numbers (ADR 0006), never 0.
 - **Physical key**: `logical key ‖ !commit_ts (u64 BE)`. Bitwise NOT makes larger timestamps sort first.
 - **Value**: `0x00` for a tombstone (the Document was deleted at that Version), or `0x01 ‖ BSON bytes`.
 

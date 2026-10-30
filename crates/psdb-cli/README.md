@@ -1,9 +1,9 @@
 # psdb-cli
 
-`psdb`: an interactive shell over an embedded, in-memory PalimpsestDB. Values are MongoDB relaxed Extended JSON. All data is lost on exit.
+`psdb`: an interactive shell over an embedded PalimpsestDB. Values are MongoDB relaxed Extended JSON. With `--data-dir <path>`, every commit is durable in a WAL in that directory; without it, all data is lost on exit.
 
 ```
-$ cargo run -p psdb-cli
+$ cargo run -p psdb-cli -- --data-dir ./data
 psdb> create-db shop
 psdb> create-coll shop.orders
 psdb> insert shop.orders {"_id": 1, "item": "book", "qty": 2}

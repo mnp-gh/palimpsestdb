@@ -8,8 +8,14 @@ use bson::Bson;
 
 use crate::error::{Error, Result};
 
-/// The Database that holds the Catalog (ADR 0006).
-pub(crate) const CATALOG_DATABASE: u32 = 0;
+/// The reserved system Database: the Catalog (ADR 0006) and unversioned
+/// Document Layer state.
+pub(crate) const SYSTEM_DATABASE: u32 = 0;
+/// Unversioned Document Layer state, such as `applied_up_to`.
+const STATE_COLLECTION: u32 = 0;
+/// The component naming the `applied_up_to` entry in [`STATE_COLLECTION`].
+/// Part of the on-disk layout (ADR 0008): never change it.
+const APPLIED_UP_TO: &[u8] = b"applied_up_to";
 const DATABASES_COLLECTION: u32 = 1;
 const COLLECTIONS_COLLECTION: u32 = 2;
 const DATABASE_IDS_COLLECTION: u32 = 3;
@@ -50,7 +56,7 @@ pub(crate) fn document_key(database_id: u32, collection_id: u32, id: &Bson) -> R
 
 /// The prefix of every Database entry in the Catalog.
 pub(crate) fn databases_prefix() -> Vec<u8> {
-    collection_prefix(CATALOG_DATABASE, DATABASES_COLLECTION)
+    collection_prefix(SYSTEM_DATABASE, DATABASES_COLLECTION)
 }
 
 /// The logical key of a Database entry in the Catalog.
@@ -62,7 +68,7 @@ pub(crate) fn database_entry_key(name: &str) -> Vec<u8> {
 
 /// The prefix of every Collection entry of one Database in the Catalog.
 pub(crate) fn collections_prefix(database_id: u32) -> Vec<u8> {
-    let mut key = collection_prefix(CATALOG_DATABASE, COLLECTIONS_COLLECTION);
+    let mut key = collection_prefix(SYSTEM_DATABASE, COLLECTIONS_COLLECTION);
     key.extend_from_slice(&database_id.to_be_bytes());
     key
 }
@@ -76,7 +82,7 @@ pub(crate) fn collection_entry_key(database_id: u32, name: &str) -> Vec<u8> {
 
 /// The key that marks a Database ID as used, forever (ADR 0006).
 pub(crate) fn database_id_key(id: u32) -> Vec<u8> {
-    let mut key = collection_prefix(CATALOG_DATABASE, DATABASE_IDS_COLLECTION);
+    let mut key = collection_prefix(SYSTEM_DATABASE, DATABASE_IDS_COLLECTION);
     key.extend_from_slice(&id.to_be_bytes());
     key
 }
@@ -84,9 +90,17 @@ pub(crate) fn database_id_key(id: u32) -> Vec<u8> {
 /// The key that marks a Collection ID in a Database as used, forever
 /// (ADR 0006).
 pub(crate) fn collection_id_key(database_id: u32, id: u32) -> Vec<u8> {
-    let mut key = collection_prefix(CATALOG_DATABASE, COLLECTION_IDS_COLLECTION);
+    let mut key = collection_prefix(SYSTEM_DATABASE, COLLECTION_IDS_COLLECTION);
     key.extend_from_slice(&database_id.to_be_bytes());
     key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+/// The unversioned key holding the Commit Timestamp of the newest commit
+/// Applied to the engine (ADR 0004).
+pub(crate) fn applied_up_to_key() -> Vec<u8> {
+    let mut key = collection_prefix(SYSTEM_DATABASE, STATE_COLLECTION);
+    key.extend_from_slice(APPLIED_UP_TO);
     key
 }
 
