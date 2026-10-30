@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "psdb-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bson",
  "psdb-core",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "psdb-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bson",
  "crc32c",
@@ -487,11 +487,11 @@ dependencies = [
 
 [[package]]
 name = "psdb-storage"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "psdb-storage-memory"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "psdb-storage",
 ]
