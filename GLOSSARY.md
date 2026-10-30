@@ -110,3 +110,15 @@ _Avoid_: Flushed, persisted
 
 **Visible**:
 A Transaction is Visible once new Snapshots include its writes. A client is told COMMITTED only after its Transaction is Durable and Visible.
+
+**WAL Record**:
+One committed Transaction's Commit Timestamp and Write Set, appended to the write-ahead log (WAL) and synced before the Transaction is Applied.
+_Avoid_: Log entry, journal entry
+
+**Recovery**:
+Replaying, on open, every WAL Record newer than the last Applied Commit Timestamp recorded in the Storage Engine, after cutting off a torn last record.
+_Avoid_: Restore, repair
+
+**Commit Outcome Unknown**:
+The error when writing, syncing or applying a WAL Record fails during commit: the Transaction may or may not be Durable. The Database refuses every later operation until it is reopened and Recovery decides. Not an Abort and not retryable.
+_Avoid_: Commit failed, commit error
