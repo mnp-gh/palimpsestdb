@@ -10,6 +10,11 @@ use crate::error::{Error, Result};
 
 /// The Database that holds the Catalog (ADR 0006).
 pub(crate) const CATALOG_DATABASE: u32 = 0;
+/// Unversioned Document Layer state, such as `applied_up_to`.
+const STATE_COLLECTION: u32 = 0;
+/// The component naming the `applied_up_to` entry in [`STATE_COLLECTION`].
+/// Part of the on-disk layout (ADR 0008): never change it.
+const APPLIED_UP_TO: &[u8] = b"applied_up_to";
 const DATABASES_COLLECTION: u32 = 1;
 const COLLECTIONS_COLLECTION: u32 = 2;
 const DATABASE_IDS_COLLECTION: u32 = 3;
@@ -87,6 +92,14 @@ pub(crate) fn collection_id_key(database_id: u32, id: u32) -> Vec<u8> {
     let mut key = collection_prefix(CATALOG_DATABASE, COLLECTION_IDS_COLLECTION);
     key.extend_from_slice(&database_id.to_be_bytes());
     key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+/// The unversioned key holding the Commit Timestamp of the newest commit
+/// Applied to the engine (ADR 0004).
+pub(crate) fn applied_up_to_key() -> Vec<u8> {
+    let mut key = collection_prefix(CATALOG_DATABASE, STATE_COLLECTION);
+    key.extend_from_slice(APPLIED_UP_TO);
     key
 }
 
