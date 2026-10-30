@@ -207,6 +207,15 @@ impl WalFile for SimWalFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wal::conformance;
+
+    #[test]
+    fn passes_conformance_suite() {
+        conformance::run_all(|| {
+            let disk = SimDisk::new();
+            move || disk.file()
+        });
+    }
 
     #[test]
     fn file_vanishes_unless_directory_synced() {

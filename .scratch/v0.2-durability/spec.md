@@ -1,6 +1,6 @@
 # v0.2: Durability
 
-Status: ready-for-human
+Status: ready-for-human (implemented on `v0.2-durability`)
 
 The in-memory Storage Engine plus a WAL owned by the Document Layer is a durable database: every commit acknowledged as COMMITTED survives a crash. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0004](../../docs/adr/0004-document-layer-owns-wal.md).
 
@@ -32,23 +32,23 @@ The `applied_up_to` marker is written from v0.2, although nothing reads it back 
 
 ## Failure handling
 
-- A failed WAL write or fsync poisons the `Database`: every later operation returns an error until it is reopened. Never retry fsync: after a failure the kernel may already have dropped the dirty pages and would report success for data that never reached disk ("fsyncgate").
+- A failed WAL write or fsync, or a failed engine apply after the record is Durable, poisons the `Database`: every later commit, including a read-only one, returns `Poisoned` until it is reopened. `begin` and reads inside a Transaction still work; only commits are refused. Never retry fsync: after a failure the kernel may already have dropped the dirty pages and would report success for data that never reached disk ("fsyncgate").
 - The failing commit returns a new error, Commit Outcome Unknown. It is neither an Abort nor retryable, because the Transaction may or may not be present after a restart.
 
 ## Opening and recovery
 
-- `Database::open(engine, dir)` opens or creates the WAL and replays it into `engine`. `Database::new(engine)` stays as it is and means "no WAL".
-- `open` returns an error if the engine is not empty, meaning it already holds an `applied_up_to` marker.
+- `Database::open(engine, dir)` opens or creates the WAL (creating `dir` too, and syncing its parent) and replays it into `engine`. `Database::open_with(engine, wal_file, limits)` does the same over any `WalFile`. `Database::new(engine)` stays as it is and means "no WAL".
+- `open` returns `EngineNotEmpty` if the engine holds any key at all, such as an `applied_up_to` marker.
 - Replay applies each record's Write Set straight to the engine, without conflict checks. It then sets the newest Commit Timestamp to the last replayed one, so new Snapshots see every recovered commit.
 - A record whose Commit Timestamp does not strictly increase over the previous one is corruption.
 - **Torn tail**: a bad record (short, wrong length, or bad CRC) with nothing valid after it is a write interrupted by a crash. It is truncated and open succeeds.
-- **Corruption in the middle**: a bad record followed by valid ones means open refuses with an error, rather than silently dropping acknowledged commits.
+- **Corruption in the middle**: a bad record followed by any record with a valid CRC, found at any byte offset and whatever its Commit Timestamp, means open refuses with an error, rather than silently dropping acknowledged commits. The search does not trust the bad record's length, which may itself be damaged. A Document whose bytes contain a valid WAL record inside a torn write can therefore make open refuse needlessly; that fails safe.
 - **Header mismatch**: a wrong magic or an unknown version means open refuses, and it never truncates or rewrites the file. A wrong path must not destroy someone else's file.
 - **Interrupted creation**: a file shorter than the header whose bytes are a prefix of the expected header came from a crash during creation, before any commit could be acknowledged. Open reinitialises it. It refuses any other short file.
 
 ## File seam
 
-The WAL does all its I/O through a small trait (append, sync, and the create, truncate and directory-sync calls it needs). The real implementation uses `std::fs`. The fake implementation is for tests:
+The WAL does all its I/O through a small trait (append, sync, and the create, truncate and directory-sync calls it needs). The trait's contract is written on it, and both implementations pass a shared conformance suite (`psdb_core::wal::conformance`). The real implementation uses `std::fs`. The fake implementation is for tests:
 
 - It records which bytes have been synced.
 - A simulated power loss drops every unsynced byte, optionally keeping a torn prefix of the last unsynced write.

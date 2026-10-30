@@ -16,43 +16,63 @@ use std::process::{Command, Stdio};
 use bson::{Bson, doc};
 use proptest::prelude::*;
 use psdb_core::wal::SimDisk;
-use psdb_core::{Database, Limits};
+use psdb_core::{Database, Limits, Transaction};
 use psdb_storage_memory::MemoryEngine;
 
-/// `shop.orders` as `_id → v`, or `None` before it exists.
-type State = Option<BTreeMap<i32, i32>>;
+/// What a Database holds: whether `shop` exists, and `shop.orders` as
+/// `_id → v` once it exists.
+#[derive(Debug, Clone, PartialEq)]
+struct State {
+    shop: bool,
+    orders: Option<BTreeMap<i32, i32>>,
+}
 
 /// One write in a Transaction: set `_id` to `v`, or delete it.
 type Op = (i32, Option<i32>);
 
+/// The `_id` every workload Transaction sets to its own sequence number, so
+/// each commit leaves a different State and a recovered State names exactly
+/// how many commits survived.
+const SEQUENCE_ID: i32 = -1;
+
+fn open(disk: &SimDisk) -> psdb_core::Result<Database<MemoryEngine>> {
+    Database::open_with(MemoryEngine::new(), disk.file(), Limits::default())
+}
+
 fn state(db: &Database<MemoryEngine>) -> State {
-    let has_orders = db.list_databases().unwrap().contains(&"shop".to_string())
+    let shop = db.list_databases().unwrap().contains(&"shop".to_string());
+    let has_orders = shop
         && db
             .list_collections("shop")
             .unwrap()
             .contains(&"orders".to_string());
-    has_orders.then(|| {
+    let orders = has_orders.then(|| {
         db.find("shop", "orders", &doc! {})
             .unwrap()
             .into_iter()
             .map(|d| (d.get_i32("_id").unwrap(), d.get_i32("v").unwrap()))
             .collect()
-    })
+    });
+    State { shop, orders }
 }
 
-/// Run `txn` as one Transaction and commit it.
-fn run(db: &Database<MemoryEngine>, txn: &[Op]) -> psdb_core::Result<()> {
+/// Set `_id` to `v` in `shop.orders`, inserting or replacing.
+fn upsert(t: &mut Transaction<'_, MemoryEngine>, id: i32, v: i32) -> psdb_core::Result<()> {
+    if !t.replace("shop", "orders", &Bson::Int32(id), doc! { "v": v })? {
+        t.insert("shop", "orders", doc! { "_id": id, "v": v })?;
+    }
+    Ok(())
+}
+
+/// Run `txn`, the `sequence`th workload Transaction, and commit it.
+fn run(db: &Database<MemoryEngine>, sequence: i32, txn: &[Op]) -> psdb_core::Result<()> {
     let mut t = db.begin();
+    upsert(&mut t, SEQUENCE_ID, sequence)?;
     for &(id, value) in txn {
-        let id = Bson::Int32(id);
         match value {
-            Some(v) => {
-                if !t.replace("shop", "orders", &id, doc! { "v": v })? {
-                    t.insert("shop", "orders", doc! { "_id": id, "v": v })?;
-                }
-            }
+            Some(v) => upsert(&mut t, id, v)?,
             None => {
-                t.delete("shop", "orders", &id)?;
+                t.delete("shop", "orders", &Bson::Int32(id))?;
             }
         }
     }
@@ -73,23 +93,29 @@ proptest! {
         crash_after in 0..80usize,
         keep_unsynced in prop_oneof![Just(0), Just(usize::MAX), 0..200usize],
     ) {
-        // states[n] is the expected state after the first n commits.
-        let mut states: Vec<State> = vec![None, None, Some(BTreeMap::new())];
-        for txn in &txns {
-            let mut next = states.last().unwrap().clone().unwrap();
+        // states[n] is the expected State after the first n commits; no two
+        // are equal.
+        let mut states = vec![
+            State { shop: false, orders: None },
+            State { shop: true, orders: None },
+            State { shop: true, orders: Some(BTreeMap::new()) },
+        ];
+        for (sequence, txn) in (0..).zip(&txns) {
+            let mut orders = states.last().unwrap().orders.clone().unwrap();
+            orders.insert(SEQUENCE_ID, sequence);
             for &(id, value) in txn {
                 match value {
-                    Some(v) => next.insert(id, v),
-                    None => next.remove(&id),
+                    Some(v) => orders.insert(id, v),
+                    None => orders.remove(&id),
                 };
             }
-            states.push(Some(next));
+            states.push(State { shop: true, orders: Some(orders) });
         }
 
         let disk = SimDisk::new();
         disk.crash_after(crash_after, keep_unsynced);
         let mut acknowledged = 0;
-        if let Ok(db) = Database::open_with(MemoryEngine::new(), disk.file(), Limits::default()) {
+        if let Ok(db) = open(&disk) {
             let setup: [&dyn Fn() -> psdb_core::Result<()>; 2] = [
                 &|| db.create_database("shop"),
                 &|| db.create_collection("shop", "orders"),
@@ -97,7 +123,7 @@ proptest! {
             let commits = setup
                 .iter()
                 .map(|f| f())
-                .chain(txns.iter().map(|t| run(&db, t)));
+                .chain((0..).zip(&txns).map(|(sequence, t)| run(&db, sequence, t)));
             for outcome in commits {
                 if outcome.is_err() {
                     break;
@@ -108,23 +134,24 @@ proptest! {
         // If the scheduled crash never fired, cut the power now.
         disk.power_loss(keep_unsynced);
 
-        let db = Database::open_with(MemoryEngine::new(), disk.file(), Limits::default()).unwrap();
-        let recovered = state(&db);
-        let in_flight = (acknowledged + 1).min(states.len() - 1);
+        // Since every State differs, matching one proves the recovered
+        // commits are exactly the first `survived`: none lost, none invented,
+        // no gap.
+        let recovered = state(&open(&disk).unwrap());
+        let survived = states.iter().position(|s| *s == recovered);
         prop_assert!(
-            recovered == states[acknowledged] || recovered == states[in_flight],
-            "recovered {recovered:?} after {acknowledged} acknowledged commits"
+            survived == Some(acknowledged) || survived == Some(acknowledged + 1),
+            "recovered {recovered:?} (commit {survived:?}) after {acknowledged} acknowledged"
         );
 
         // The recovered Database keeps working and survives another reopen.
-        drop(db);
-        let db = Database::open_with(MemoryEngine::new(), disk.file(), Limits::default()).unwrap();
+        let db = open(&disk).unwrap();
         prop_assert_eq!(state(&db), recovered.clone());
-        if recovered.is_some() {
+        if recovered.orders.is_some() {
             db.insert("shop", "orders", doc! { "_id": 99, "v": 0 }).unwrap();
             drop(db);
-            let db = Database::open_with(MemoryEngine::new(), disk.file(), Limits::default()).unwrap();
-            prop_assert_eq!(state(&db).unwrap().get(&99).copied(), Some(0));
+            let orders = state(&open(&disk).unwrap()).orders.unwrap();
+            prop_assert_eq!(orders.get(&99).copied(), Some(0));
         }
     }
 }
@@ -196,7 +223,7 @@ fn kill_keeps_exactly_a_prefix_of_commits() {
 
 fn recovered_ids(dir: &Path) -> Vec<i32> {
     let db = Database::open(MemoryEngine::new(), dir).unwrap();
-    match state(&db) {
+    match state(&db).orders {
         Some(docs) => docs.into_keys().collect(),
         None => Vec::new(),
     }
