@@ -5,9 +5,10 @@
 //! under Snapshot Isolation. See `GLOSSARY.md` for the vocabulary and
 //! `docs/adr/` for the decisions behind the design.
 //!
-//! v0.1 is embedded, single-threaded in intent and in-memory: nothing is
-//! durable, old Versions are never collected, and `find` scans the whole
-//! Collection.
+//! v0.2 is embedded and single-threaded in intent. A Database opened with
+//! [`Database::open`] is durable through a WAL replayed into an empty
+//! engine on every open. Old Versions are never collected, and `find` scans
+//! the whole Collection.
 //!
 //! Start with [`Database`].
 
@@ -19,6 +20,7 @@ mod filter;
 mod keys;
 mod mvcc;
 mod transaction;
+pub mod wal;
 
 pub use database::Database;
 pub use document::{Limits, MAX_NAME_BYTES};

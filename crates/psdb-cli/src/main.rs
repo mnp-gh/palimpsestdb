@@ -1,9 +1,12 @@
-//! `psdb`: an interactive shell over an embedded, in-memory PalimpsestDB.
+//! `psdb`: an interactive shell over an embedded PalimpsestDB.
 //!
 //! Values are written as MongoDB relaxed Extended JSON, e.g.
-//! `{"_id": {"$uuid": "0192f3a8-..."}, "n": 1}`. Everything is lost on exit.
+//! `{"_id": {"$uuid": "0192f3a8-..."}, "n": 1}`. With `--data-dir <path>`
+//! every commit is durable in a WAL in that directory; without it,
+//! everything is lost on exit.
 
 use std::io::{self, BufRead, IsTerminal};
+use std::path::PathBuf;
 
 use bson::{Binary, Bson, Document, spec::BinarySubtype};
 use psdb_core::{Database, Transaction};
@@ -38,7 +41,9 @@ Transactions (without begin, every command commits on its own)
   abort                        discard it
 
   help                         show this help
-  quit                         exit (all data is lost)";
+  quit                         exit (without --data-dir, all data is lost)";
+
+const USAGE: &str = "usage: psdb [--data-dir <path>]";
 
 enum Outcome {
     Continue,
@@ -46,12 +51,28 @@ enum Outcome {
 }
 
 fn main() {
-    let db = Database::new(MemoryEngine::new());
+    let data_dir = match parse_args(std::env::args().skip(1)) {
+        Ok(dir) => dir,
+        Err(message) => {
+            eprintln!("{message}\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let (db, mode) = match &data_dir {
+        Some(dir) => match Database::open(MemoryEngine::new(), dir) {
+            Ok(db) => (db, format!("data in {}", dir.display())),
+            Err(e) => {
+                eprintln!("error: opening {}: {e}", dir.display());
+                std::process::exit(1);
+            }
+        },
+        None => (Database::new(MemoryEngine::new()), "in-memory".to_string()),
+    };
     let mut txn: Option<Txn<'_>> = None;
     let mut input = Input::open();
     if matches!(input, Input::Terminal(_)) {
         println!(
-            "PalimpsestDB v{} (in-memory). Type `help` for commands.",
+            "PalimpsestDB v{} ({mode}). Type `help` for commands.",
             env!("CARGO_PKG_VERSION")
         );
     }
@@ -71,6 +92,21 @@ fn main() {
             Err(message) => eprintln!("error: {message}"),
         }
     }
+}
+
+/// The `--data-dir` path, if given.
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<PathBuf>, String> {
+    let mut data_dir = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => {
+                let dir = args.next().ok_or("--data-dir needs a path")?;
+                data_dir = Some(PathBuf::from(dir));
+            }
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    Ok(data_dir)
 }
 
 /// Where commands come from: a line editor with history on a terminal,
