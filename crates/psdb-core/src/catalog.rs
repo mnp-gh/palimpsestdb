@@ -142,7 +142,7 @@ fn pick_unused(
 ) -> Result<u32> {
     const ATTEMPTS: usize = 16;
     for id in candidates.into_iter().take(ATTEMPTS) {
-        if id != keys::CATALOG_DATABASE && !in_use(id)? {
+        if id != keys::SYSTEM_DATABASE && !in_use(id)? {
             return Ok(id);
         }
     }
