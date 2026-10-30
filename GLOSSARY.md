@@ -63,8 +63,8 @@ The Documents a Transaction has written but not yet committed; visible only to t
 _Avoid_: Buffer, pending writes
 
 **Commit Timestamp**:
-The logical time at which a committed Transaction's writes become visible to later Snapshots.
-_Avoid_: Version number, LSN
+A counter, not clock time, that orders committed Transactions: each commit takes the next value, so no two share one. A committed Transaction's writes become visible to Snapshots taken at or after it.
+_Avoid_: Version number, LSN, wall-clock time
 
 **Version**:
 One committed state of a Document, identified by its Commit Timestamp.
@@ -95,11 +95,19 @@ An Abort because committing would produce an outcome not equivalent to any seria
 **Collection Changed**:
 An Abort because a Collection the Transaction used was dropped, renamed or re-indexed after its Snapshot.
 
+**Commit Outcome Unknown**:
+The result of a commit whose durability could not be confirmed: the Transaction may or may not survive a restart. Not an Abort, and not safely retryable.
+_Avoid_: Failed commit, I/O error
+
 **Node**:
 One running instance of PalimpsestDB. Until replication exists, PalimpsestDB runs as exactly one Node.
 _Avoid_: Server, instance, replica (until replication is designed)
 
 ## Commit lifecycle
+
+**WAL**:
+The append-only log of every committed Transaction's writes, in Commit Timestamp order. A Transaction is Durable once its record in the WAL is on disk.
+_Avoid_: Journal, redo log, commit log
 
 **Durable**:
 A Transaction is Durable once its commit is guaranteed to survive a crash.
