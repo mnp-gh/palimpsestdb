@@ -4,8 +4,8 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 
 | Version | Theme | Status |
 |---|---|---|
-| v0.1 | Embedded, in-memory | In review |
-| v0.2 | Durability | Planned |
+| v0.1 | Embedded, in-memory | Done |
+| v0.2 | Durability | In progress |
 | v0.3 | Indexes | Planned |
 | v0.4 | Concurrency | Planned |
 | v0.5 | Serializable | Planned |
@@ -35,9 +35,10 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.2: Durability
 
 - WAL owned by the Document Layer, one fsync per commit ([ADR 0004](./adr/0004-document-layer-owns-wal.md))
-- Length and CRC32C per record; recovery replays above `applied_up_to`
+- Length and CRC32C per record; recovery replays above `applied_up_to` ([ADR 0010](./adr/0010-wal-record-format.md))
 - Crash test harness: kill at random points, verify every acknowledged commit survives
 - The in-memory engine plus the WAL is a durable database
+- No checkpoints yet: the WAL grows without bound and recovery replays it from the start
 
 ## v0.3: Indexes
 
@@ -53,6 +54,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Garbage collection of old Versions below the oldest active Snapshot
 - `fjall` Storage Engine, passing the conformance suite, with block compression (LZ4 or zstd) enabled
 - Streaming scans: `find` iterates instead of loading the whole Collection into memory
+- Checkpoints: `flush()` the engine, then truncate the WAL at or below the durable `applied_up_to`
 - Clock and I/O seams; deterministic simulator
 
 ## v0.5: Serializable
@@ -65,7 +67,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 - `tokio` network front end ([ADR 0007](./adr/0007-runtime-model.md)) with its own wire protocol ([ADR 0003](./adr/0003-own-wire-protocol.md))
 - Rust client with a retrying `with_transaction` helper; CLI over the network
-- Group-commit thread, checkpoints, CPU thread pool
+- Group-commit thread, CPU thread pool
 
 ## v0.7: Access
 

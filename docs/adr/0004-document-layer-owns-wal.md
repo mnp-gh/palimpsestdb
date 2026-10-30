@@ -9,4 +9,4 @@ Durability is provided by a logical write-ahead log owned by the Document Layer,
 - The engine contract shrinks to: ordered keys, atomic batches applied in order, and `flush()` for checkpoints. Recovery replays WAL records above `applied_up_to`.
 - WAL records carry length and CRC32C; replay stops at the first bad record (torn write).
 - On macOS a plain `fsync` does not flush the disk cache; WAL durability uses `File::sync_all`, which issues `F_FULLFSYNC` on Apple platforms. Its cost is why group commit exists.
-- Staged delivery: no WAL in v0.1, WAL + recovery in v0.2, group commit and checkpoints in v0.3+.
+- Staged delivery: no WAL in v0.1, WAL + recovery in v0.2, checkpoints with the first durable engine (v0.4), group commit with the server (v0.6). Until checkpoints exist the WAL grows without bound, because the in-memory engine's `flush()` makes nothing durable and so no record can be dropped.
