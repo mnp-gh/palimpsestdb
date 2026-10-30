@@ -9,7 +9,7 @@ use psdb_storage::StorageEngine;
 use crate::document::Limits;
 use crate::error::{Error, Result};
 use crate::mvcc;
-use crate::transaction::Transaction;
+use crate::transaction::{self, Transaction};
 use crate::wal::{OsWalFile, Wal, WalFile};
 
 /// An embedded PalimpsestDB instance over the Storage Engine `E`.
@@ -100,7 +100,10 @@ impl<E: StorageEngine> Database<E> {
         let (wal, records) = Wal::open(Box::new(wal))?;
         let mut last = 0;
         for record in &records {
-            engine.write_batch(mvcc::commit_batch(record.commit_ts, record.writes()))?;
+            engine.write_batch(mvcc::commit_batch(
+                record.commit_ts,
+                transaction::writes(&record.write_set),
+            ))?;
             last = record.commit_ts;
         }
         Ok(Self::from_parts(engine, limits, last, Some(wal)))

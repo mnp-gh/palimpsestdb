@@ -54,6 +54,9 @@ pub enum Error {
     /// The WAL file has the wrong magic number or an unknown format
     /// version. It was left untouched.
     UnrecognisedWal(String),
+    /// The Transaction's WAL Record would exceed 4 GiB. Nothing was
+    /// written. Not retryable.
+    TransactionTooLarge,
     /// [`Database::open`](crate::Database::open) was given an engine that
     /// already holds data; the WAL is replayed into an empty engine.
     EngineNotEmpty,
@@ -72,6 +75,11 @@ impl Error {
     /// caused by concurrency.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Error::WriteConflict | Error::CollectionChanged)
+    }
+
+    /// Whether the Database can no longer commit until it is reopened.
+    pub fn requires_reopen(&self) -> bool {
+        matches!(self, Error::CommitOutcomeUnknown(_) | Error::Poisoned)
     }
 }
 
@@ -101,6 +109,9 @@ impl fmt::Display for Error {
             Error::Storage(e) => write!(f, "{e}"),
             Error::Io(e) => write!(f, "WAL I/O error: {e}"),
             Error::UnrecognisedWal(msg) => write!(f, "unrecognised WAL: {msg}"),
+            Error::TransactionTooLarge => {
+                f.write_str("transaction too large: its WAL record would exceed 4 GiB")
+            }
             Error::EngineNotEmpty => {
                 f.write_str("the storage engine already holds data; open a WAL into an empty engine")
             }

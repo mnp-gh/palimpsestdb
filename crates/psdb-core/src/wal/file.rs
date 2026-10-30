@@ -52,15 +52,17 @@ impl OsWalFile {
         let dir = dir.as_ref().to_path_buf();
         if !dir.exists() {
             fs::create_dir(&dir)?;
-            // Make the new directory's own entry durable.
-            if let Some(parent) = dir.parent() {
-                let parent = if parent.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    parent
-                };
-                sync_dir(parent)?;
-            }
+        }
+        // Make the directory's own entry durable. Done on every open, not
+        // only after creating it: an earlier run may have created it and
+        // crashed before this sync.
+        if let Some(parent) = dir.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            sync_dir(parent)?;
         }
         let file = OpenOptions::new()
             .read(true)
