@@ -36,8 +36,8 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 - WAL owned by the Document Layer, one fsync per commit ([ADR 0004](./adr/0004-document-layer-owns-wal.md))
 - Length and CRC32C per record; recovery replays above `applied_up_to`
-- Crash test harness: kill at random points, verify every acknowledged commit survives
-- The in-memory engine plus the WAL is a durable database
+- Crash test harness: kill at random points, and simulate power loss through a WAL file seam that drops unsynced bytes. After recovery, every acknowledged commit is present, every recovered commit was attempted, and recovered commits form an unbroken run in Commit Timestamp order
+- The in-memory engine plus the WAL is a durable database; `psdb-cli --data-dir <path>` opens one
 
 ## v0.3: Indexes
 
