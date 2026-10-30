@@ -49,6 +49,25 @@ pub enum Error {
     Corruption(String),
     /// The Storage Engine failed.
     Storage(StorageError),
+    /// Reading or writing the WAL failed while opening a Database.
+    Io(std::io::Error),
+    /// The WAL file has the wrong magic number or an unknown format
+    /// version. It was left untouched.
+    UnrecognisedWal(String),
+    /// The Transaction's WAL Record would exceed 4 GiB. Nothing was
+    /// written. Not retryable.
+    TransactionTooLarge,
+    /// [`Database::open`](crate::Database::open) was given an engine that
+    /// already holds data; the WAL is replayed into an empty engine.
+    EngineNotEmpty,
+    /// The commit could not be confirmed Durable, or was Durable but could
+    /// not be Applied: the Transaction may or may not be present after the
+    /// Database is reopened. Not an Abort, and not retryable. The Database
+    /// is now poisoned.
+    CommitOutcomeUnknown(Box<Error>),
+    /// An earlier commit ended in [`Error::CommitOutcomeUnknown`], so
+    /// nothing more can commit until the Database is reopened.
+    Poisoned,
 }
 
 impl Error {
@@ -56,6 +75,11 @@ impl Error {
     /// caused by concurrency.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Error::WriteConflict | Error::CollectionChanged)
+    }
+
+    /// Whether the Database can no longer commit until it is reopened.
+    pub fn requires_reopen(&self) -> bool {
+        matches!(self, Error::CommitOutcomeUnknown(_) | Error::Poisoned)
     }
 }
 
@@ -83,6 +107,21 @@ impl fmt::Display for Error {
             Error::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Error::Corruption(msg) => write!(f, "corrupted data: {msg}"),
             Error::Storage(e) => write!(f, "{e}"),
+            Error::Io(e) => write!(f, "WAL I/O error: {e}"),
+            Error::UnrecognisedWal(msg) => write!(f, "unrecognised WAL: {msg}"),
+            Error::TransactionTooLarge => {
+                f.write_str("transaction too large: its WAL record would exceed 4 GiB")
+            }
+            Error::EngineNotEmpty => {
+                f.write_str("the storage engine already holds data; open a WAL into an empty engine")
+            }
+            Error::CommitOutcomeUnknown(cause) => write!(
+                f,
+                "commit outcome unknown ({cause}); the transaction may or may not survive a reopen, and the database must be reopened"
+            ),
+            Error::Poisoned => f.write_str(
+                "an earlier commit's outcome is unknown, so nothing more can commit; reopen the database",
+            ),
         }
     }
 }
@@ -91,6 +130,8 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Storage(e) => Some(e),
+            Error::Io(e) => Some(e),
+            Error::CommitOutcomeUnknown(cause) => Some(cause.as_ref()),
             _ => None,
         }
     }
@@ -99,5 +140,11 @@ impl std::error::Error for Error {
 impl From<StorageError> for Error {
     fn from(e: StorageError) -> Self {
         Error::Storage(e)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
     }
 }
