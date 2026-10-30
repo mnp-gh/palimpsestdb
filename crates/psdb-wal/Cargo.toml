@@ -1,0 +1,19 @@
+[package]
+name = "psdb-wal"
+description = "The PalimpsestDB write-ahead log: WAL Records, the LogFile contract, and a fault-injecting file for crash tests."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[features]
+# Exposes `FaultyLogFile` to other crates' tests.
+testing = []
+
+[dependencies]
+crc32c.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
