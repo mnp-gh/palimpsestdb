@@ -35,11 +35,11 @@ pub struct Database<E: StorageEngine> {
     pub(crate) limits: Limits,
     /// Holding the lock serialises commits, which keeps them logged and
     /// applied in Commit Timestamp order.
-    pub(crate) commits: Mutex<Commits>,
+    pub(crate) commits: Mutex<CommitState>,
 }
 
 /// The state commits serialise on.
-pub(crate) struct Commits {
+pub(crate) struct CommitState {
     /// The newest Commit Timestamp; new Snapshots are taken here.
     pub(crate) last: u64,
     /// `None` when nothing is durable.
@@ -100,11 +100,7 @@ impl<E: StorageEngine> Database<E> {
         let (wal, records) = Wal::open(Box::new(wal))?;
         let mut last = 0;
         for record in &records {
-            let writes = record
-                .writes
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_deref()));
-            engine.write_batch(mvcc::commit_batch(record.commit_ts, writes))?;
+            engine.write_batch(mvcc::commit_batch(record.commit_ts, record.writes()))?;
             last = record.commit_ts;
         }
         Ok(Self::from_parts(engine, limits, last, Some(wal)))
@@ -114,7 +110,7 @@ impl<E: StorageEngine> Database<E> {
         Self {
             engine,
             limits,
-            commits: Mutex::new(Commits {
+            commits: Mutex::new(CommitState {
                 last,
                 wal,
                 poisoned: false,

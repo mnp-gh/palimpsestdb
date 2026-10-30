@@ -10,6 +10,7 @@ use psdb_storage::{KeyRange, StorageEngine, WriteBatch};
 
 use crate::error::{Error, Result};
 use crate::keys::{applied_up_to_key, physical_key, split_physical};
+use crate::transaction::Write;
 
 const TOMBSTONE: u8 = 0x00;
 const LIVE: u8 = 0x01;
@@ -31,7 +32,7 @@ pub(crate) fn encode_value(value: Option<&[u8]>) -> Vec<u8> {
 /// at `commit_ts`, plus the `applied_up_to` marker (ADR 0004).
 pub(crate) fn commit_batch<'a>(
     commit_ts: u64,
-    writes: impl IntoIterator<Item = (&'a [u8], Option<&'a [u8]>)>,
+    writes: impl IntoIterator<Item = Write<'a>>,
 ) -> WriteBatch {
     let mut batch = WriteBatch::new();
     for (key, value) in writes {

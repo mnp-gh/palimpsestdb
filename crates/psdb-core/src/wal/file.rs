@@ -112,23 +112,22 @@ fn sync_dir(_dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+    use crate::wal::conformance;
 
     #[test]
-    fn writes_survive_reopen() {
-        let dir = std::env::temp_dir().join(format!("psdb-wal-file-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-
-        let mut file = OsWalFile::open(&dir).unwrap();
-        file.append(b"hello world").unwrap();
-        file.truncate(5).unwrap();
-        file.append(b"!").unwrap();
-        file.sync().unwrap();
-        file.sync_dir().unwrap();
-        drop(file);
-
-        let mut file = OsWalFile::open(&dir).unwrap();
-        assert_eq!(file.read_all().unwrap(), b"hello!");
-        fs::remove_dir_all(&dir).unwrap();
+    fn passes_conformance_suite() {
+        let root = std::env::temp_dir().join(format!("psdb-wal-file-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let next = Cell::new(0);
+        conformance::run_all(|| {
+            let dir = root.join(next.get().to_string());
+            next.set(next.get() + 1);
+            move || OsWalFile::open(&dir).unwrap()
+        });
+        fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -13,6 +13,10 @@ use crate::filter::Filter;
 use crate::keys;
 use crate::mvcc;
 
+/// One entry of a Write Set: a logical key and its new value (`None`
+/// deletes).
+pub(crate) type Write<'a> = (&'a [u8], Option<&'a [u8]>);
+
 /// A Transaction: reads see the Snapshot taken at [`Database::begin`] plus
 /// this Transaction's own writes; writes stay in its Write Set until
 /// [`commit`](Self::commit).
@@ -50,6 +54,13 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
             Some(own) => Ok(own.clone()),
             None => mvcc::read_at(&self.db.engine, logical, self.snapshot_ts),
         }
+    }
+
+    /// The Write Set, in key order.
+    fn writes(&self) -> impl Iterator<Item = Write<'_>> {
+        self.write_set
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_deref()))
     }
 
     pub(crate) fn write(&mut self, logical: Vec<u8>, value: Option<Vec<u8>>) {
@@ -198,22 +209,17 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
             }
         }
         let commit_ts = commits.last + 1;
-        let writes = || {
-            self.write_set
-                .iter()
-                .map(|(k, v)| (k.as_slice(), v.as_deref()))
-        };
         let Some(wal) = &mut commits.wal else {
-            engine.write_batch(mvcc::commit_batch(commit_ts, writes()))?;
+            engine.write_batch(mvcc::commit_batch(commit_ts, self.writes()))?;
             commits.last = commit_ts;
             return Ok(commit_ts);
         };
         // Once the record may be in the WAL, any failure leaves the outcome
         // unknown, and retrying fsync is unsafe (ADR 0004).
         let outcome = wal
-            .append(commit_ts, writes())
+            .append(commit_ts, self.writes())
             .map_err(Error::Io)
-            .and_then(|()| Ok(engine.write_batch(mvcc::commit_batch(commit_ts, writes()))?));
+            .and_then(|()| Ok(engine.write_batch(mvcc::commit_batch(commit_ts, self.writes()))?));
         if let Err(cause) = outcome {
             commits.poisoned = true;
             return Err(Error::CommitOutcomeUnknown(Box::new(cause)));

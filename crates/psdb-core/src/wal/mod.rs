@@ -16,8 +16,16 @@
 //! are logical keys and values are BSON, exactly as in the Write Set.
 //!
 //! All I/O goes through the [`WalFile`] seam, so tests can simulate power
-//! loss with [`SimDisk`].
+//! loss with [`SimDisk`]. Every implementation passes [`conformance`].
+//!
+//! The seam is a `Box<dyn WalFile>` rather than a generic parameter, an
+//! exception to the generics-at-seams rule in `docs/CONVENTIONS.md`: a
+//! generic would spread a second type parameter through `Database` and
+//! `Transaction` for a virtual call that costs nothing next to an fsync.
+//! [`SimDisk`] is public, like `psdb_storage::conformance`, because the
+//! crash tests in `tests/` can only use public items.
 
+pub mod conformance;
 mod file;
 mod sim;
 
@@ -25,6 +33,7 @@ pub use file::{OsWalFile, WalFile};
 pub use sim::{SimDisk, SimWalFile};
 
 use crate::error::{Error, Result};
+use crate::transaction::Write;
 
 const MAGIC: [u8; 8] = *b"PSDBWAL\0";
 const FORMAT_VERSION: u32 = 1;
@@ -34,6 +43,8 @@ const FRAME_LEN: usize = 8;
 /// Commit Timestamp and write count.
 const MIN_BODY_LEN: usize = 12;
 
+// The WAL's own tags, independent of the Version value encoding in `mvcc`
+// although the bytes happen to match.
 const TOMBSTONE: u8 = 0x00;
 const LIVE: u8 = 0x01;
 
@@ -41,8 +52,17 @@ const LIVE: u8 = 0x01;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Record {
     pub(crate) commit_ts: u64,
-    /// Logical key → new value (`None` deletes), as in the Write Set.
-    pub(crate) writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Logical key → new value (`None` deletes), as in the Transaction.
+    pub(crate) write_set: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl Record {
+    /// The Write Set, in the order it was logged.
+    pub(crate) fn writes(&self) -> impl Iterator<Item = Write<'_>> {
+        self.write_set
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_deref()))
+    }
 }
 
 /// An open WAL, positioned to append after its last valid record.
@@ -96,10 +116,16 @@ impl Wal {
         let mut last_ts = 0;
         let mut pos = HEADER_LEN;
         while pos < bytes.len() {
-            let Some(body) = frame_at(&bytes, pos) else {
-                if (pos + 1..bytes.len())
-                    .any(|p| frame_ts_at(&bytes, p).is_some_and(|ts| ts > last_ts))
-                {
+            let Some(body) = body_at(&bytes, pos) else {
+                // Every commit is synced before the next is appended, so a
+                // torn write is always the last record. Any intact record
+                // after this one, wherever it starts and whatever its
+                // Commit Timestamp, means the damage is mid-log. Searching
+                // every offset, rather than trusting this record's possibly
+                // damaged length, prefers refusing to open over dropping a
+                // Durable commit; a Document holding the bytes of a WAL
+                // record inside a torn write can make it refuse needlessly.
+                if (pos + 1..bytes.len()).any(|p| body_at(&bytes, p).is_some()) {
                     return Err(Error::Corruption(format!(
                         "bad WAL record at byte {pos} is followed by valid records"
                     )));
@@ -133,7 +159,7 @@ impl Wal {
     pub(crate) fn append<'a>(
         &mut self,
         commit_ts: u64,
-        writes: impl IntoIterator<Item = (&'a [u8], Option<&'a [u8]>)>,
+        writes: impl IntoIterator<Item = Write<'a>>,
     ) -> std::io::Result<()> {
         let record = encode_record(commit_ts, writes)?;
         self.file.append(&record)?;
@@ -149,7 +175,7 @@ fn header() -> Vec<u8> {
 
 fn encode_record<'a>(
     commit_ts: u64,
-    writes: impl IntoIterator<Item = (&'a [u8], Option<&'a [u8]>)>,
+    writes: impl IntoIterator<Item = Write<'a>>,
 ) -> std::io::Result<Vec<u8>> {
     let mut body = Vec::new();
     body.extend_from_slice(&commit_ts.to_be_bytes());
@@ -192,17 +218,12 @@ fn len_u32(len: usize) -> std::io::Result<u32> {
 
 /// The body of the record at `pos` if its length fits in the file and its
 /// CRC32C matches.
-fn frame_at(bytes: &[u8], pos: usize) -> Option<&[u8]> {
+fn body_at(bytes: &[u8], pos: usize) -> Option<&[u8]> {
     let frame = bytes.get(pos..pos + FRAME_LEN)?;
     let len = read_u32(frame) as usize;
     let crc = read_u32(&frame[4..]);
     let body = bytes.get(pos + FRAME_LEN..pos + FRAME_LEN + len)?;
     (len >= MIN_BODY_LEN && crc32c::crc32c(body) == crc).then_some(body)
-}
-
-/// The Commit Timestamp of a valid record at `pos`, if there is one.
-fn frame_ts_at(bytes: &[u8], pos: usize) -> Option<u64> {
-    frame_at(bytes, pos).map(read_u64)
 }
 
 /// Decode a body whose CRC32C matched. A malformed one cannot be a torn
@@ -225,7 +246,10 @@ fn decode_body(body: &[u8]) -> Result<Record> {
     if !reader.rest.is_empty() {
         return Err(malformed());
     }
-    Ok(Record { commit_ts, writes })
+    Ok(Record {
+        commit_ts,
+        write_set: writes,
+    })
 }
 
 struct Reader<'a> {
@@ -291,11 +315,11 @@ mod tests {
             vec![
                 Record {
                     commit_ts: 1,
-                    writes: vec![(b"a".to_vec(), Some(b"1".to_vec())), (b"b".to_vec(), None)],
+                    write_set: vec![(b"a".to_vec(), Some(b"1".to_vec())), (b"b".to_vec(), None)],
                 },
                 Record {
                     commit_ts: 2,
-                    writes: vec![]
+                    write_set: vec![]
                 },
             ]
         );
@@ -352,6 +376,15 @@ mod tests {
         let before = disk.contents();
         assert!(matches!(open(&disk), Err(Error::Corruption(_))));
         assert_eq!(disk.contents(), before, "nothing truncated");
+    }
+
+    #[test]
+    fn corruption_followed_by_an_older_record_refuses_to_open() {
+        let mut bad = record(2, &[(b"a", Some(b"1"))]);
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF;
+        let disk = disk_with(&[record(1, &[]), bad, record(1, &[])]);
+        assert!(matches!(open(&disk), Err(Error::Corruption(_))));
     }
 
     #[test]
