@@ -4,8 +4,8 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 
 | Version | Theme | Status |
 |---|---|---|
-| v0.1 | Embedded, in-memory | In review |
-| v0.2 | Durability | Planned |
+| v0.1 | Embedded, in-memory | Done |
+| v0.2 | Durability | In review |
 | v0.3 | Indexes | Planned |
 | v0.4 | Concurrency | Planned |
 | v0.5 | Serializable | Planned |
