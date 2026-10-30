@@ -33,7 +33,7 @@ pub use file::{OsWalFile, WalFile};
 pub use sim::{SimDisk, SimWalFile};
 
 use crate::error::{Error, Result};
-use crate::transaction::Write;
+use crate::transaction::{Write, WriteSet};
 
 const MAGIC: [u8; 8] = *b"PSDBWAL\0";
 const FORMAT_VERSION: u32 = 1;
@@ -52,17 +52,7 @@ const LIVE: u8 = 0x01;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Record {
     pub(crate) commit_ts: u64,
-    /// Logical key → new value (`None` deletes), as in the Transaction.
-    pub(crate) write_set: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-}
-
-impl Record {
-    /// The Write Set, in the order it was logged.
-    pub(crate) fn writes(&self) -> impl Iterator<Item = Write<'_>> {
-        self.write_set
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_deref()))
-    }
+    pub(crate) write_set: WriteSet,
 }
 
 /// An open WAL, positioned to append after its last valid record.
@@ -151,18 +141,13 @@ impl Wal {
         Ok((Self { file }, records))
     }
 
-    /// Append the record of a commit and fsync it. Once this returns `Ok`
-    /// the commit is Durable.
+    /// Append a record from [`encode_record`] and fsync it. Once this
+    /// returns `Ok` the commit is Durable.
     ///
     /// On error the record may or may not be on disk, and must not be
     /// retried (ADR 0004).
-    pub(crate) fn append<'a>(
-        &mut self,
-        commit_ts: u64,
-        writes: impl IntoIterator<Item = Write<'a>>,
-    ) -> std::io::Result<()> {
-        let record = encode_record(commit_ts, writes)?;
-        self.file.append(&record)?;
+    pub(crate) fn append(&mut self, record: &[u8]) -> std::io::Result<()> {
+        self.file.append(record)?;
         self.file.sync()
     }
 }
@@ -173,10 +158,12 @@ fn header() -> Vec<u8> {
     out
 }
 
-fn encode_record<'a>(
+/// The WAL Record of a commit. Fails with [`Error::TransactionTooLarge`] if
+/// it would exceed 4 GiB; nothing has been written then.
+pub(crate) fn encode_record<'a>(
     commit_ts: u64,
     writes: impl IntoIterator<Item = Write<'a>>,
-) -> std::io::Result<Vec<u8>> {
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     body.extend_from_slice(&commit_ts.to_be_bytes());
     body.extend_from_slice(&[0; 4]);
@@ -201,19 +188,14 @@ fn encode_record<'a>(
     Ok(out)
 }
 
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> std::io::Result<()> {
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     out.extend_from_slice(&len_u32(bytes.len())?.to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-fn len_u32(len: usize) -> std::io::Result<u32> {
-    u32::try_from(len).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "WAL record larger than 4 GiB",
-        )
-    })
+fn len_u32(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| Error::TransactionTooLarge)
 }
 
 /// The body of the record at `pos` if its length fits in the file and its
@@ -233,7 +215,7 @@ fn decode_body(body: &[u8]) -> Result<Record> {
     let mut reader = Reader { rest: body };
     let commit_ts = read_u64(reader.take(8).ok_or_else(malformed)?);
     let count = read_u32(reader.take(4).ok_or_else(malformed)?);
-    let mut writes = Vec::new();
+    let mut write_set = WriteSet::new();
     for _ in 0..count {
         let key = reader.bytes().ok_or_else(malformed)?.to_vec();
         let value = match reader.take(1).ok_or_else(malformed)? {
@@ -241,14 +223,14 @@ fn decode_body(body: &[u8]) -> Result<Record> {
             [LIVE] => Some(reader.bytes().ok_or_else(malformed)?.to_vec()),
             _ => return Err(malformed()),
         };
-        writes.push((key, value));
+        write_set.insert(key, value);
     }
     if !reader.rest.is_empty() {
         return Err(malformed());
     }
     Ok(Record {
         commit_ts,
-        write_set: writes,
+        write_set,
     })
 }
 
@@ -315,11 +297,14 @@ mod tests {
             vec![
                 Record {
                     commit_ts: 1,
-                    write_set: vec![(b"a".to_vec(), Some(b"1".to_vec())), (b"b".to_vec(), None)],
+                    write_set: WriteSet::from([
+                        (b"a".to_vec(), Some(b"1".to_vec())),
+                        (b"b".to_vec(), None),
+                    ]),
                 },
                 Record {
                     commit_ts: 2,
-                    write_set: vec![]
+                    write_set: WriteSet::new()
                 },
             ]
         );
@@ -330,8 +315,8 @@ mod tests {
         let disk = SimDisk::new();
         let (mut wal, records) = Wal::open(Box::new(disk.file())).unwrap();
         assert!(records.is_empty());
-        wal.append(1, [(&b"k"[..], Some(&b"v"[..]))]).unwrap();
-        wal.append(2, [(&b"k"[..], None)]).unwrap();
+        wal.append(&record(1, &[(b"k", Some(b"v"))])).unwrap();
+        wal.append(&record(2, &[(b"k", None)])).unwrap();
         drop(wal);
         assert_eq!(open(&disk).unwrap().len(), 2);
     }

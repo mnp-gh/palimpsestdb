@@ -12,10 +12,19 @@ use crate::error::{Error, Result};
 use crate::filter::Filter;
 use crate::keys;
 use crate::mvcc;
+use crate::wal;
 
 /// One entry of a Write Set: a logical key and its new value (`None`
 /// deletes).
 pub(crate) type Write<'a> = (&'a [u8], Option<&'a [u8]>);
+
+/// Logical key → new value (`None` deletes), in key order.
+pub(crate) type WriteSet = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
+/// Every entry of `write_set`, borrowed, in key order.
+pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
+    write_set.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
+}
 
 /// A Transaction: reads see the Snapshot taken at [`Database::begin`] plus
 /// this Transaction's own writes; writes stay in its Write Set until
@@ -27,7 +36,7 @@ pub struct Transaction<'db, E: StorageEngine> {
     pub(crate) snapshot_ts: u64,
     /// Logical key → new value (`None` deletes). Ordered so scans can
     /// overlay it on the Snapshot.
-    pub(crate) write_set: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    pub(crate) write_set: WriteSet,
     /// Catalog entries this Transaction depended on; checked at commit
     /// (ADR 0006).
     pub(crate) catalog_reads: BTreeSet<Vec<u8>>,
@@ -38,7 +47,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         Self {
             db,
             snapshot_ts,
-            write_set: BTreeMap::new(),
+            write_set: WriteSet::new(),
             catalog_reads: BTreeSet::new(),
         }
     }
@@ -54,13 +63,6 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
             Some(own) => Ok(own.clone()),
             None => mvcc::read_at(&self.db.engine, logical, self.snapshot_ts),
         }
-    }
-
-    /// The Write Set, in key order.
-    fn writes(&self) -> impl Iterator<Item = Write<'_>> {
-        self.write_set
-            .iter()
-            .map(|(k, v)| (k.as_slice(), v.as_deref()))
     }
 
     pub(crate) fn write(&mut self, logical: Vec<u8>, value: Option<Vec<u8>>) {
@@ -176,19 +178,21 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     /// committed a write to any key this one wrote, or with
     /// [`Error::CollectionChanged`] if a Catalog entry this one used changed
     /// since its Snapshot. Both are retryable. A Transaction that wrote
-    /// nothing always commits.
+    /// nothing always commits, unless the Database is poisoned.
     ///
-    /// In a durable Database, fails with [`Error::CommitOutcomeUnknown`] if
-    /// the WAL or the engine fails partway, which poisons the Database:
-    /// every later commit fails with [`Error::Poisoned`].
+    /// In a durable Database, fails with [`Error::TransactionTooLarge`] if
+    /// its WAL Record would exceed 4 GiB, before anything is written. Fails
+    /// with [`Error::CommitOutcomeUnknown`] if the WAL or the engine fails
+    /// partway, which poisons the Database: every later commit, read-only
+    /// or not, fails with [`Error::Poisoned`].
     pub fn commit(self) -> Result<u64> {
         let mut commits = self.db.commits.lock().expect("lock poisoned");
         if commits.poisoned {
             return Err(Error::Poisoned);
         }
         // A read-only Transaction saw a consistent Snapshot and wrote nothing
-        // that could be lost, so it always commits, even if a Collection it
-        // read was dropped since.
+        // that could be lost, so it commits even if a Collection it read was
+        // dropped since.
         if self.write_set.is_empty() {
             return Ok(self.snapshot_ts);
         }
@@ -210,16 +214,17 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         }
         let commit_ts = commits.last + 1;
         let Some(wal) = &mut commits.wal else {
-            engine.write_batch(mvcc::commit_batch(commit_ts, self.writes()))?;
+            engine.write_batch(mvcc::commit_batch(commit_ts, writes(&self.write_set)))?;
             commits.last = commit_ts;
             return Ok(commit_ts);
         };
+        let record = wal::encode_record(commit_ts, writes(&self.write_set))?;
         // Once the record may be in the WAL, any failure leaves the outcome
         // unknown, and retrying fsync is unsafe (ADR 0004).
-        let outcome = wal
-            .append(commit_ts, self.writes())
-            .map_err(Error::Io)
-            .and_then(|()| Ok(engine.write_batch(mvcc::commit_batch(commit_ts, self.writes()))?));
+        let outcome = wal.append(&record).map_err(Error::Io).and_then(|()| {
+            let batch = mvcc::commit_batch(commit_ts, writes(&self.write_set));
+            Ok(engine.write_batch(batch)?)
+        });
         if let Err(cause) = outcome {
             commits.poisoned = true;
             return Err(Error::CommitOutcomeUnknown(Box::new(cause)));

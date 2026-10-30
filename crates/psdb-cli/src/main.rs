@@ -179,7 +179,7 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
         }
         "commit" => {
             let open = txn.take().ok_or("no open transaction")?;
-            let ts = open.commit().map_err(|e| e.to_string())?;
+            let ts = open.commit().map_err(message)?;
             println!("committed at {ts}");
         }
         "abort" => {
@@ -268,7 +268,17 @@ fn with_txn<'db, T>(
         Some(open) => work(open),
         None => db.run(work),
     }
-    .map_err(|e| e.to_string())
+    .map_err(message)
+}
+
+/// The error as a message to print. Exits instead if the database can no
+/// longer commit, so a script fed to `psdb` stops with a non-zero status.
+fn message(e: psdb_core::Error) -> String {
+    if e.requires_reopen() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+    e.to_string()
 }
 
 fn namespace(text: &str) -> Result<(&str, &str), String> {
