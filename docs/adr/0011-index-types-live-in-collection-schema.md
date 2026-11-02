@@ -1,0 +1,14 @@
+# Index Types live in a Collection Schema, not on each Index
+
+An Index covers one kind of value (its Index Type), and that type is declared once per field in the Collection's Collection Schema, stored in its Catalog entry, rather than on each Index. Per-Index types would let two Indexes on one field disagree about what that field may hold, so whether a write is accepted would depend on which Indexes happen to exist. The schema arrives in v0.3 holding only field types, years before v0.8 validation; v0.8 extends this same schema rather than adding a second one.
+
+## Consequences
+
+- Collections stay schemaless by default: a Document whose field holds another type is left out of the Index. Stored Documents are never changed; coercion happens only when building Index keys.
+- Rejecting wrongly typed writes is the schema's job, never an Index's: a field declared strict rejects them with Type Mismatch whether or not it is indexed, and a unique Index can only be created on a strict field. An Index that rejected writes itself would bring back the problem this ADR exists to avoid.
+- Numbers have two Index Types, `int` and `float`. The other kind of number is coerced into the key (`floor` for `int`, conversion to double for `float`), so queries read inclusive bounds and recheck the filter. Skipping it instead would miss matches, because filters compare ints and doubles as numbers.
+- A strict field rejects any value that does not convert exactly to its type: a strict `int` accepts `30.0` (which JavaScript clients send for `30`) but rejects `30.5`; a strict `float` rejects integers beyond 2⁵³ and NaN (±Infinity are fine). Missing and null are allowed and never collide in a unique Index.
+- In a non-strict `float` Index, NaN is filed lowest and the recheck drops it, since NaN matches no filter comparison.
+- An Index can only be created on a field whose type the Collection Schema already declares, and that type cannot be changed or removed while an Index on the field exists: drop the Index, change the type, re-create it. Re-typing never triggers a hidden rebuild. Likewise, making a field strict scans the Collection and fails with Type Mismatch if any Document breaks the rule, and a strict field cannot be relaxed while a unique Index on it exists.
+- Index entries point to Document IDs, never to physical locations, and a write whose indexed value is unchanged writes nothing to that Index: the existing entry stays valid because every lookup fetches the Document at its Snapshot and rechecks. This avoids PostgreSQL's write amplification, where an update adds an entry to every index because entries point to row addresses (Uber's main reason for moving to MySQL in 2016), at the cost of a second lookup per Index hit, as in InnoDB.
+- Changing the Collection Schema rewrites the Collection's Catalog entry, so concurrent writers abort with Collection Changed.
