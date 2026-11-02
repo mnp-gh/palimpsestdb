@@ -130,16 +130,12 @@ _Avoid_: Server, instance, replica (until replication is designed)
 ## Commit lifecycle
 
 **WAL**:
-The append-only log of every committed Transaction's writes and every Index build, in Commit Timestamp order. A Transaction is Durable once its WAL Record is on disk.
+The append-only log of every committed Transaction's writes, in Commit Timestamp order. A Transaction is Durable once its WAL Record is on disk.
 _Avoid_: Journal, redo log, commit log
 
 **WAL Record**:
 One committed Transaction in the WAL: its Commit Timestamp and Write Set. Aborted and read-only Transactions have none.
 _Avoid_: Log entry, journal entry
-
-**Index Build Record**:
-One chunk of a new Index's entries in the WAL, tagged with the Commit Timestamp its build will commit at. It takes effect only if that commit follows.
-_Avoid_: Partial commit, WAL Record (that is one committed Transaction)
 
 **Recovery**:
 Replaying the WAL into the Storage Engine when a Node opens. A torn last WAL Record is cut off; damage anywhere else stops the Node from opening rather than lose Durable Transactions.

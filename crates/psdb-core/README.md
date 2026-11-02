@@ -1,6 +1,6 @@
 # psdb-core
 
-The Document Layer: Databases, Collections and the transactional Catalog; BSON Documents; Versions encoded into engine keys (ADR 0008); Transactions under Snapshot Isolation with first-committer-wins; durability through a WAL (ADR 0004).
+The Document Layer: Databases, Collections and the transactional Catalog; BSON Documents; single-field Indexes over a Collection Schema (ADR 0010, ADR 0011); Versions encoded into engine keys (ADR 0008); Transactions under Snapshot Isolation with first-committer-wins; durability through a WAL (ADR 0004).
 
 ```rust
 use bson::doc;
@@ -21,7 +21,8 @@ txn.commit()?;
 |---|---|
 | `database` | `Database`: begin Transactions, autocommit helpers |
 | `transaction` | Snapshot reads, Write Set, commit-time conflict checks |
-| `catalog` | Databases and Collections as versioned Catalog entries |
+| `catalog` | Databases, Collections, Collection Schemas and Indexes as versioned Catalog entries |
+| `index` | Index Types, Strict Fields, Index entry keys, choosing an Index for a filter |
 | `mvcc` | Which Version of a key a Snapshot sees |
 | `keys` | Order-preserving key encoding |
 | `document` | Limits, Document IDs, name rules |

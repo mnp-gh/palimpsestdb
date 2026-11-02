@@ -105,6 +105,7 @@ fn limits_are_enforced() {
     let limits = Limits {
         max_document_bytes: 100,
         max_nesting_depth: 2,
+        ..Limits::default()
     };
     let db = Database::with_limits(MemoryEngine::new(), limits);
     db.create_database("d").unwrap();

@@ -6,7 +6,7 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 |---|---|---|
 | v0.1 | Embedded, in-memory | Done |
 | v0.2 | Durability | Done |
-| v0.3 | Indexes | Planned |
+| v0.3 | Indexes | In review |
 | v0.4 | Concurrency | Planned |
 | v0.5 | Serializable | Planned |
 | v0.6 | Server | Planned |
@@ -42,10 +42,10 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.3: Indexes
 
 - Single-field secondary Indexes, at most one per field path, versioned and maintained in the same Write Set; each has its own never-reused ID as its key prefix
-- Collection Schema declaring each indexed field's Index Type (`int`, `float`, `string`, `date`, `bool`, `objectId`, `binary`) and whether it is a Strict Field ([ADR 0011](./adr/0011-index-types-live-in-collection-schema.md)). Values of other types are left out of the Index; `int` and `float` coerce the other kind of number into the key
+- Collection Schema declaring each indexed field's Index Type (`int`, `double`, `string`, `date`, `bool`, `objectId`, `binary`) and whether it is a Strict Field ([ADR 0011](./adr/0011-index-types-live-in-collection-schema.md)). Values of other types are left out of the Index; `int` and `double` coerce the other kind of number into the key
 - Unique Indexes, on Strict Fields only, keyed by value alone so concurrent duplicates become Write Conflicts; missing and null never collide
-- Index builds streamed into the WAL as Index Build Records, outside the Write Set and its cap, made visible by one final commit ([ADR 0010](./adr/0010-index-builds-stream-into-wal.md))
-- Index-backed filters: an equality or range comparison at the top level or in a top-level `$and`, whose value is in the Index's type; equality preferred over range; the full filter is always rechecked
+- Index builds in the foreground, committing their entries in chunks outside the Write Set and its cap, made visible by one final commit ([ADR 0010](./adr/0010-index-builds-commit-in-chunks.md))
+- Index-backed filters: an equality or range comparison at the top level or in `$and`, whose value is in the Index's type, or an `$or` whose every branch can use an Index (the union of their ranges); equality first, then `$or`, then range; the full filter is always rechecked
 - Exact comparison between integers and doubles in filters (today large integers lose precision when converted to double)
 - Evaluate filters on raw BSON (`RawDocument`) instead of decoding whole Documents
 - Configurable Write Set cap (default 16 MB)
@@ -53,9 +53,10 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.4: Concurrency
 
 - Thread-safe Document Layer; single in-order applier; visibility watermark
-- Index builds that hold no Commit Timestamp while they run, so a long build no longer hides other commits ([ADR 0010](./adr/0010-index-builds-stream-into-wal.md))
+- Background Index builds, so a long build no longer stops every other commit ([ADR 0010](./adr/0010-index-builds-commit-in-chunks.md))
 - In-RAM Catalog cache (v0.1 reads Catalog entries from the engine on every operation)
 - Garbage collection of old Versions below the oldest active Snapshot
+- Reclaim dropped Collections, dropped Indexes and orphaned Index build chunks: range-delete an ID's keys once no active Snapshot can see a Catalog entry naming it. Version-by-version collection never removes them, because their newest Versions are still live
 - `fjall` Storage Engine, passing the conformance suite, with block compression (LZ4 or zstd) enabled
 - Streaming scans: `find` iterates instead of loading the whole Collection into memory
 - Clock and I/O seams; deterministic simulator
@@ -98,6 +99,8 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 - Query planner statistics (sampled per-path counts and histograms) and a cost model for choosing between Indexes
 - Index hints: the client names the Index a query should use
+- Sparse Indexes, as an opt-in: leave out Documents whose field is null or missing, so an Index on a rarely set field stays small; `{field: null}` then scans the whole Collection. Indexes keep null and missing by default
+- A `decimal128` Index Type, with exact decimal comparison against integers and doubles in filters (today Decimal128 compares only for equality)
 - Range comparisons on binary values: filters only test binary for equality, so a `binary` Index answers equality only. Decide an order first (MongoDB: length, subtype, bytes; our key encoding: subtype, bytes)
 
 ## v2.x: Distribution
