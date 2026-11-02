@@ -101,6 +101,33 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         Ok(())
     }
 
+    /// Whether any live value exists under `prefix`, in the Snapshot with own
+    /// writes overlaid. Stops at the first one.
+    pub(crate) fn any_live_under(&self, prefix: &[u8]) -> Result<bool> {
+        let own = self
+            .write_set
+            .range(prefix.to_vec()..)
+            .take_while(|(k, _)| k.starts_with(prefix));
+        if own.clone().any(|(_, v)| v.is_some()) {
+            return Ok(true);
+        }
+        let mut found = false;
+        mvcc::scan_range_at(
+            &self.db.engine,
+            &KeyRange::prefix(prefix),
+            self.snapshot_ts,
+            &mut |key, _| {
+                // Skip a value this Transaction deleted.
+                if self.write_set.get(key) == Some(&None) {
+                    return ControlFlow::Continue(());
+                }
+                found = true;
+                ControlFlow::Break(())
+            },
+        )?;
+        Ok(found)
+    }
+
     /// Every live value under `prefix`: the Snapshot with own writes
     /// overlaid, in key order.
     pub(crate) fn scan(&self, prefix: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
@@ -201,18 +228,15 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         let old = old.map(document::raw).transpose()?;
         let new_doc = new.as_deref().map(document::raw).transpose()?;
         if let Some(doc) = new_doc {
-            index::check_strict(doc, &entry.schema)?;
+            entry.check_strict(doc)?;
         }
         let doc_id = &key[keys::collection_prefix(db_id, entry.id).len()..];
         let mut writes = Vec::new();
         for ix in &entry.indexes {
-            let ty = entry
-                .schema
-                .get(&ix.path)
-                .ok_or_else(|| Error::Corruption(format!("index on undeclared field {}", ix.path)))?
-                .index_type;
+            let segments = entry.segments(&ix.path)?;
+            let ty = entry.schema[&ix.path].index_type;
             let component = |doc: Option<&bson::RawDocument>| match doc {
-                Some(doc) => index::component_of(doc, &ix.path, ty),
+                Some(doc) => index::component_of(doc, segments, ty),
                 None => Ok(None),
             };
             let (before, after) = (component(old)?, component(new_doc)?);
@@ -328,6 +352,10 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
                 return Err(Error::CollectionChanged);
             }
         }
+        // Reads every Version ever written under the Collection, while
+        // holding the commit lock: rare (strict-field changes and Index
+        // creation on empty Collections) and bounded once garbage
+        // collection exists (v0.4).
         for prefix in &self.collection_reads {
             if mvcc::changed_since(engine, prefix, self.snapshot_ts)? {
                 return Err(Error::CollectionChanged);

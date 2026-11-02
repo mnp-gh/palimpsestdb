@@ -23,7 +23,9 @@ pub struct Limits {
     pub max_nesting_depth: usize,
     /// The largest Write Set a Transaction may build, counting the bytes of
     /// every key and value written, Index entries included. A write that
-    /// would cross it fails with Transaction Too Large.
+    /// would cross it fails with Transaction Too Large. The default leaves
+    /// room for a Document of the largest default size plus Index entries
+    /// on its large fields.
     pub max_write_set_bytes: usize,
 }
 
@@ -32,7 +34,7 @@ impl Default for Limits {
         Self {
             max_document_bytes: 16 * 1024 * 1024,
             max_nesting_depth: 100,
-            max_write_set_bytes: 16 * 1024 * 1024,
+            max_write_set_bytes: 64 * 1024 * 1024,
         }
     }
 }

@@ -32,8 +32,8 @@ Single-field secondary Indexes, typed by a Collection Schema, kept consistent wi
 
 ## Building
 
-- `Database::create_index` holds the commit lock, reads the Collection at its Snapshot 1024 Documents at a time, and commits each chunk's entries as an ordinary fsynced commit. A final commit adds the Index to the Catalog entry. A duplicate in a unique build fails with Duplicate Value; committed chunks stay as orphans.
-- `Transaction::create_index` works only on a Collection that is empty in the Transaction's view, as an ordinary Catalog write; otherwise it fails with Collection Not Empty. A Document committed concurrently makes it abort with Collection Changed.
+- `Database::create_index` holds the commit lock, reads the Collection at its Snapshot in chunks of at most 1024 Documents or 16 MiB of Documents, whichever comes first, and commits each chunk's entries as an ordinary fsynced commit. A final commit adds the Index to the Catalog entry. A duplicate in a unique build fails with Duplicate Value; committed chunks stay as orphans.
+- `Transaction::create_index` works only on a Collection that is empty in the Transaction's view, as an ordinary Catalog write; otherwise it fails with Collection Not Empty, checked before the Index ID is drawn so a refusal writes nothing. A Document committed concurrently makes it abort with Collection Changed.
 
 ## Queries
 
@@ -45,7 +45,7 @@ Single-field secondary Indexes, typed by a Collection Schema, kept consistent wi
 
 ## Write Set cap
 
-- `Limits::max_write_set_bytes`, default 16 MB, counts the bytes of every key and value in the Write Set, Index entries included. A write that would cross it fails with Transaction Too Large and is not made.
+- `Limits::max_write_set_bytes`, default 64 MB (a 16 MB Document plus Index entries on its large fields must fit), counts the bytes of every key and value in the Write Set, Index entries included. A write that would cross it fails with Transaction Too Large and is not made.
 
 ## Tests
 
