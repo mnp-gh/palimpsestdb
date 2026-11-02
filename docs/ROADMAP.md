@@ -48,7 +48,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Index-backed filters: an equality or range comparison at the top level or in `$and`, whose value is in the Index's type, or an `$or` whose every branch can use an Index (the union of their ranges); equality first, then `$or`, then range; the full filter is always rechecked
 - Exact comparison between integers and doubles in filters (today large integers lose precision when converted to double)
 - Evaluate filters on raw BSON (`RawDocument`) instead of decoding whole Documents
-- Configurable Write Set cap (default 16 MB)
+- Configurable Write Set cap (default 64 MB: room for a Document of the largest default size, 16 MB, plus Index entries on its large fields)
 
 ## v0.4: Concurrency
 
@@ -56,7 +56,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Background Index builds, so a long build no longer stops every other commit ([ADR 0010](./adr/0010-index-builds-commit-in-chunks.md))
 - In-RAM Catalog cache (v0.1 reads Catalog entries from the engine on every operation)
 - Garbage collection of old Versions below the oldest active Snapshot
-- Reclaim dropped Collections, dropped Indexes and orphaned Index build chunks: range-delete an ID's keys once no active Snapshot can see a Catalog entry naming it. Version-by-version collection never removes them, because their newest Versions are still live
+- Reclaim dropped Collections, dropped Indexes and orphaned Index build chunks: range-delete an ID's keys once no active Snapshot can see a Catalog entry naming it. Version-by-version collection never removes them, because their newest Versions are still live. This also bounds the commit-time check for strict-field changes and Index creation on empty Collections, which today reads every Version ever written under the Collection while holding the commit lock
 - `fjall` Storage Engine, passing the conformance suite, with block compression (LZ4 or zstd) enabled
 - Streaming scans: `find` iterates instead of loading the whole Collection into memory
 - Clock and I/O seams; deterministic simulator

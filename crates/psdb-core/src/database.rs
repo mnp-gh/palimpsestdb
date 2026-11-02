@@ -17,8 +17,12 @@ use crate::mvcc;
 use crate::transaction::{self, Transaction, WriteSet};
 use crate::wal::{self, OsWalFile, Wal, WalFile};
 
-/// How many Documents an Index build reads before committing their entries.
+/// An Index build commits the entries for at most this many Documents at a
+/// time...
 const BUILD_CHUNK_DOCUMENTS: usize = 1024;
+/// ...and stops reading a chunk once its Documents reach this many bytes,
+/// so neither its memory nor its WAL Record grows with Document size.
+const BUILD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// An embedded PalimpsestDB instance over the Storage Engine `E`.
 ///
@@ -224,13 +228,18 @@ impl<E: StorageEngine> Database<E> {
         snapshot_ts: u64,
     ) -> Result<()> {
         let ty = entry.schema[&index.path].index_type;
+        let segments = entry.segments(&index.path)?;
         let prefix = keys::collection_prefix(db_id, entry.id);
         let mut range = KeyRange::prefix(&prefix);
         loop {
             let mut page = Vec::new();
+            let mut page_bytes = 0;
+            let mut more = false;
             mvcc::scan_range_at(&self.engine, &range, snapshot_ts, &mut |key, value| {
+                page_bytes += value.len();
                 page.push((key.to_vec(), value));
-                if page.len() == BUILD_CHUNK_DOCUMENTS {
+                more = page.len() == BUILD_CHUNK_DOCUMENTS || page_bytes >= BUILD_CHUNK_BYTES;
+                if more {
                     ControlFlow::Break(())
                 } else {
                     ControlFlow::Continue(())
@@ -238,7 +247,7 @@ impl<E: StorageEngine> Database<E> {
             })?;
             let mut chunk = WriteSet::new();
             for (key, bytes) in &page {
-                let Some(c) = index::component_of(document::raw(bytes)?, &index.path, ty)? else {
+                let Some(c) = index::component_of(document::raw(bytes)?, segments, ty)? else {
                     continue;
                 };
                 let doc_id = &key[prefix.len()..];
@@ -258,12 +267,10 @@ impl<E: StorageEngine> Database<E> {
             if !chunk.is_empty() {
                 self.apply_commit(commits, &chunk)?;
             }
-            let Some((last, _)) = page.last() else {
+            // `more` means the chunk filled up, not that the Collection ended.
+            let (true, Some((last, _))) = (more, page.last()) else {
                 return Ok(());
             };
-            if page.len() < BUILD_CHUNK_DOCUMENTS {
-                return Ok(());
-            }
             // Past every Version of the last Document read.
             range.start = [keys::physical_key(last, 0).as_slice(), &[0]].concat();
         }

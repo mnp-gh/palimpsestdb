@@ -266,11 +266,13 @@ fn as_i64(v: &Bson) -> Option<i64> {
     }
 }
 
+/// 2⁶³ as a double, which is exact. Every i64 lies in [-2⁶³, 2⁶³), so a
+/// double in that range has a whole part that converts to i64 exactly.
+pub(crate) const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+
 /// Compare an integer with a double without converting the integer, which
 /// would round integers above 2⁵³ and make equality non-transitive.
 fn cmp_int_double(i: i64, f: f64) -> Option<Ordering> {
-    // -2⁶³ and 2⁶³ are exact doubles; every i64 lies in [-2⁶³, 2⁶³).
-    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
     if f.is_nan() {
         return None;
     }

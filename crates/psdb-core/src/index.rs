@@ -23,7 +23,7 @@ use bson::{Bson, RawDocument};
 use psdb_storage::KeyRange;
 
 use crate::error::{Error, Result};
-use crate::filter::{CompareOp, Filter, lookup_raw};
+use crate::filter::{CompareOp, Filter, TWO_63, lookup_raw};
 use crate::keys;
 
 /// The kind of value an Index covers, declared per field in the Collection
@@ -151,7 +151,7 @@ pub(crate) type Schema = BTreeMap<String, FieldType>;
 /// segments, none starting with `$`, and not `_id`, which is already the
 /// key of every Document.
 pub(crate) fn split_path(path: &str) -> Result<Vec<String>> {
-    let segments: Vec<String> = path.split('.').map(str::to_owned).collect();
+    let segments = segments(path);
     if segments.iter().any(|s| s.is_empty() || s.starts_with('$')) {
         return Err(Error::InvalidSchema(format!(
             "{path:?} is not a field path"
@@ -163,6 +163,12 @@ pub(crate) fn split_path(path: &str) -> Result<Vec<String>> {
         ));
     }
     Ok(segments)
+}
+
+/// A declared path's segments, without checking them: the Catalog only
+/// holds paths that passed [`split_path`].
+pub(crate) fn segments(path: &str) -> Vec<String> {
+    path.split('.').map(str::to_owned).collect()
 }
 
 /// The Index key component for `value` (`None` when the field is missing),
@@ -192,30 +198,26 @@ pub(crate) fn component(value: Option<&Bson>, ty: IndexType) -> Option<Vec<u8>> 
     Some(out)
 }
 
-/// The Index key component for the value at `path` in a stored Document.
+/// The Index key component for the value at the path with `segments` in a
+/// stored Document.
 pub(crate) fn component_of(
     doc: &RawDocument,
-    path: &str,
+    segments: &[String],
     ty: IndexType,
 ) -> Result<Option<Vec<u8>>> {
-    let segments: Vec<String> = path.split('.').map(str::to_owned).collect();
-    Ok(component(lookup_raw(doc, &segments)?.as_ref(), ty))
+    Ok(component(lookup_raw(doc, segments)?.as_ref(), ty))
 }
 
-/// Fail with [`Error::TypeMismatch`] if `doc` breaks any Strict Field in
-/// `schema`.
-pub(crate) fn check_strict(doc: &RawDocument, schema: &Schema) -> Result<()> {
-    for (path, field) in schema.iter().filter(|(_, f)| f.strict) {
-        check_field(doc, path, *field)?;
-    }
-    Ok(())
-}
-
-/// Fail with [`Error::TypeMismatch`] unless the value at `path` is missing,
-/// null, or converts exactly to the field's Index Type.
-pub(crate) fn check_field(doc: &RawDocument, path: &str, field: FieldType) -> Result<()> {
-    let segments: Vec<String> = path.split('.').map(str::to_owned).collect();
-    match lookup_raw(doc, &segments)? {
+/// Fail with [`Error::TypeMismatch`] unless the value at `path` (split into
+/// `segments`) is missing, null, or converts exactly to the field's Index
+/// Type.
+pub(crate) fn check_field(
+    doc: &RawDocument,
+    path: &str,
+    segments: &[String],
+    field: FieldType,
+) -> Result<()> {
+    match lookup_raw(doc, segments)? {
         None | Some(Bson::Null) => Ok(()),
         Some(v) if fits_exactly(&v, field.index_type) => Ok(()),
         Some(v) => Err(Error::TypeMismatch(format!(
@@ -229,8 +231,6 @@ pub(crate) fn check_field(doc: &RawDocument, path: &str, field: FieldType) -> Re
 /// anything: an `int` accepts `30.0` (which JavaScript sends for `30`) but
 /// not `30.5`; a `double` accepts integers up to 2⁵³ but not NaN.
 fn fits_exactly(value: &Bson, ty: IndexType) -> bool {
-    // 2⁶³ is an exact double; every i64 lies in [-2⁶³, 2⁶³).
-    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
     const TWO_53: u64 = 1 << 53;
     match (value, ty) {
         (Bson::Int32(_) | Bson::Int64(_), IndexType::Int) => true,

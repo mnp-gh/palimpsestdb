@@ -528,3 +528,68 @@ fn write_set_cap_fails_the_write_that_crosses_it() {
     txn.commit().unwrap();
     assert_eq!(db.find("d", "c", &doc! {}).unwrap().len(), written as usize);
 }
+
+#[test]
+fn largest_document_fits_the_default_write_set_cap() {
+    let db = indexed("s", IndexType::String, false, false);
+    let max = db.limits().max_document_bytes;
+    // An indexed string almost as large as the Document: the entry key
+    // carries the whole value, doubling what the write adds.
+    let doc = doc! { "_id": 1, "s": "x".repeat(max - 100) };
+    db.insert("shop", "orders", doc).unwrap();
+    assert_eq!(
+        db.find("shop", "orders", &doc! { "s": "x".repeat(max - 100) })
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn build_over_large_documents_reads_them_in_byte_bounded_chunks() {
+    let db = common::shop();
+    let pad = "x".repeat(1024 * 1024);
+    // 40 MiB of Documents, so the build stops several chunks on bytes, not
+    // on the Document count.
+    for i in 0..40 {
+        db.insert("shop", "orders", doc! { "_id": i, "n": i % 4, "pad": &pad })
+            .unwrap();
+    }
+    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+        .unwrap();
+    db.create_index("shop", "orders", "n", false).unwrap();
+    assert_eq!(
+        db.find("shop", "orders", &doc! { "n": 3 }).unwrap().len(),
+        10
+    );
+}
+
+#[test]
+fn refused_index_in_a_transaction_writes_nothing() {
+    let db = common::shop();
+    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+        .unwrap();
+    db.insert("shop", "orders", doc! { "n": 1 }).unwrap();
+    let mut txn = db.begin();
+    let snapshot = txn.snapshot_ts();
+    assert!(matches!(
+        txn.create_index("shop", "orders", "n", false),
+        Err(Error::CollectionNotEmpty { .. })
+    ));
+    // Still read-only: committing returns the Snapshot, not a new timestamp.
+    assert_eq!(txn.commit().unwrap(), snapshot);
+}
+
+#[test]
+fn deleting_the_last_document_lets_a_transaction_create_an_index() {
+    let db = common::shop();
+    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+        .unwrap();
+    db.insert("shop", "orders", doc! { "_id": 1, "n": 1 })
+        .unwrap();
+    db.run(|t| {
+        t.delete("shop", "orders", &Bson::Int32(1))?;
+        t.create_index("shop", "orders", "n", false)
+    })
+    .unwrap();
+}

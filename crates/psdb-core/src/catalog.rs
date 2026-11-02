@@ -40,6 +40,9 @@ pub(crate) struct CollectionEntry {
     pub(crate) id: u32,
     pub(crate) schema: Schema,
     pub(crate) indexes: Vec<IndexDef>,
+    /// Each declared path split into segments once, rather than on every
+    /// write.
+    segments: BTreeMap<String, Vec<String>>,
 }
 
 impl CollectionEntry {
@@ -82,12 +85,33 @@ impl CollectionEntry {
                 })
             })
             .collect::<Result<_>>()?;
+        let segments = schema
+            .keys()
+            .map(|path| (path.clone(), index::segments(path)))
+            .collect();
         Ok(Self {
-            name: entry_name(bytes)?,
+            name: doc.get_str("name").map_err(|_| corrupt("name"))?.to_owned(),
             id: read_u32(&doc, "id")?,
             schema,
             indexes,
+            segments,
         })
+    }
+
+    /// The segments of a path declared in the schema.
+    pub(crate) fn segments(&self, path: &str) -> Result<&[String]> {
+        self.segments
+            .get(path)
+            .map(Vec::as_slice)
+            .ok_or_else(|| Error::Corruption(format!("index on undeclared field {path}")))
+    }
+
+    /// Fail with [`Error::TypeMismatch`] if `doc` breaks any Strict Field.
+    pub(crate) fn check_strict(&self, doc: &bson::RawDocument) -> Result<()> {
+        for (path, field) in self.schema.iter().filter(|(_, f)| f.strict) {
+            index::check_field(doc, path, self.segments(path)?, *field)?;
+        }
+        Ok(())
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -245,7 +269,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         path: &str,
         field: FieldType,
     ) -> Result<()> {
-        index::split_path(path)?;
+        let segments = index::split_path(path)?;
         let (db_id, mut entry) = self.collection_entry(database, collection)?;
         let old = entry.schema.get(path).copied();
         if let (Some(ix), Some(old)) = (entry.index_on(path), old) {
@@ -264,7 +288,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         if field.strict && !already_enforced {
             let prefix = keys::collection_prefix(db_id, entry.id);
             for bytes in self.scan(&prefix)?.values() {
-                index::check_field(document::raw(bytes)?, path, field)?;
+                index::check_field(document::raw(bytes)?, path, &segments, field)?;
             }
             // A Document committed concurrently was not checked.
             self.collection_reads.insert(prefix);
@@ -317,14 +341,17 @@ impl<E: StorageEngine> Transaction<'_, E> {
         path: &str,
         unique: bool,
     ) -> Result<()> {
-        let (db_id, mut entry, index) = self.prepare_index(database, collection, path, unique)?;
+        // Checked before the ID is drawn, which writes, so a refusal leaves
+        // the Transaction untouched.
+        let (db_id, entry) = self.collection_entry(database, collection)?;
         let prefix = keys::collection_prefix(db_id, entry.id);
-        if !self.scan(&prefix)?.is_empty() {
+        if self.any_live_under(&prefix)? {
             return Err(Error::CollectionNotEmpty {
                 database: database.to_owned(),
                 collection: collection.to_owned(),
             });
         }
+        let (db_id, mut entry, index) = self.prepare_index(database, collection, path, unique)?;
         self.collection_reads.insert(prefix);
         entry.indexes.push(index);
         self.write_collection_entry(db_id, &entry)
