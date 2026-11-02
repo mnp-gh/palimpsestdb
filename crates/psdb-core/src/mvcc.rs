@@ -100,19 +100,50 @@ pub(crate) fn any_version_under<E: StorageEngine>(engine: &E, prefix: &[u8]) -> 
     Ok(found)
 }
 
-/// Call `visit` with every logical key under `prefix` that has a live
-/// Version at `snapshot_ts`, in key order, with that Version's value.
-pub(crate) fn scan_at<E: StorageEngine>(
+/// A scan callback: a logical key and its visible value; `Break` stops.
+pub(crate) type Visit<'a> = dyn FnMut(&[u8], Vec<u8>) -> ControlFlow<()> + 'a;
+
+/// Whether any key under `prefix` has a Version committed after
+/// `snapshot_ts`.
+pub(crate) fn changed_since<E: StorageEngine>(
     engine: &E,
     prefix: &[u8],
     snapshot_ts: u64,
-    visit: &mut dyn FnMut(&[u8], Vec<u8>),
+) -> Result<bool> {
+    let mut changed = false;
+    let mut failure = None;
+    engine.scan(
+        &KeyRange::prefix(prefix),
+        &mut |key, _| match split_physical(key) {
+            Ok((_, ts)) if ts > snapshot_ts => {
+                changed = true;
+                ControlFlow::Break(())
+            }
+            Ok(_) => ControlFlow::Continue(()),
+            Err(e) => {
+                failure = Some(e);
+                ControlFlow::Break(())
+            }
+        },
+    )?;
+    failure.map_or(Ok(changed), Err)
+}
+
+/// Call `visit` with every logical key in `range` that has a live Version
+/// at `snapshot_ts`, in key order, with that Version's value, until it
+/// returns `Break`. The range bounds compare against physical keys, so a
+/// bound should be a logical key or a prefix of one.
+pub(crate) fn scan_range_at<E: StorageEngine>(
+    engine: &E,
+    range: &KeyRange,
+    snapshot_ts: u64,
+    visit: &mut Visit<'_>,
 ) -> Result<()> {
     // The logical key whose visible Version was already found; its older
     // Versions are skipped.
     let mut decided: Option<Vec<u8>> = None;
     let mut failure = None;
-    engine.scan(&KeyRange::prefix(prefix), &mut |key, value| {
+    engine.scan(range, &mut |key, value| {
         let (logical, ts) = match split_physical(key) {
             Ok(parts) => parts,
             Err(e) => {
@@ -126,13 +157,12 @@ pub(crate) fn scan_at<E: StorageEngine>(
         decided = Some(logical.to_vec());
         match decode_value(value) {
             Ok(Some(bytes)) => visit(logical, bytes),
-            Ok(None) => {}
+            Ok(None) => ControlFlow::Continue(()),
             Err(e) => {
                 failure = Some(e);
-                return ControlFlow::Break(());
+                ControlFlow::Break(())
             }
         }
-        ControlFlow::Continue(())
     })?;
     failure.map_or(Ok(()), Err)
 }
@@ -180,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_at_returns_one_visible_version_per_key() {
+    fn scan_range_at_returns_one_visible_version_per_key() {
         let engine = MemoryEngine::new();
         // Keys are self-delimiting in real use; here the 1-byte suffix stands in.
         put_version(&engine, b"pa", 1, Some(b"a1"));
@@ -192,7 +222,11 @@ mod tests {
 
         let collect = |ts| {
             let mut out = Vec::new();
-            scan_at(&engine, b"p", ts, &mut |k, v| out.push((k.to_vec(), v))).unwrap();
+            scan_range_at(&engine, &KeyRange::prefix(b"p"), ts, &mut |k, v| {
+                out.push((k.to_vec(), v));
+                ControlFlow::Continue(())
+            })
+            .unwrap();
             out
         };
         assert_eq!(

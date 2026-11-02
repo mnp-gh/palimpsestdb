@@ -1,16 +1,24 @@
 //! The entry point: a [`Database`] over one Storage Engine.
 
+use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Mutex;
 
 use bson::{Bson, Document};
-use psdb_storage::StorageEngine;
+use psdb_storage::{KeyRange, StorageEngine};
 
-use crate::document::Limits;
+use crate::catalog::CollectionEntry;
+use crate::document::{self, Limits};
 use crate::error::{Error, Result};
+use crate::index::{self, FieldType, IndexDef, IndexInfo};
+use crate::keys;
 use crate::mvcc;
-use crate::transaction::{self, Transaction};
-use crate::wal::{OsWalFile, Wal, WalFile};
+use crate::transaction::{self, Transaction, WriteSet};
+use crate::wal::{self, OsWalFile, Wal, WalFile};
+
+/// How many Documents an Index build reads before committing their entries.
+const BUILD_CHUNK_DOCUMENTS: usize = 1024;
 
 /// An embedded PalimpsestDB instance over the Storage Engine `E`.
 ///
@@ -121,9 +129,144 @@ impl<E: StorageEngine> Database<E> {
         }
     }
 
-    /// The limits Documents are checked against.
+    /// The limits Documents and Transactions are checked against.
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// Log, Apply and publish a Write Set that has passed its conflict
+    /// checks, at the next Commit Timestamp.
+    pub(crate) fn apply_commit(
+        &self,
+        commits: &mut CommitState,
+        write_set: &WriteSet,
+    ) -> Result<u64> {
+        let commit_ts = commits.last + 1;
+        let Some(wal) = &mut commits.wal else {
+            self.engine.write_batch(mvcc::commit_batch(
+                commit_ts,
+                transaction::writes(write_set),
+            ))?;
+            commits.last = commit_ts;
+            return Ok(commit_ts);
+        };
+        let record = wal::encode_record(commit_ts, transaction::writes(write_set))?;
+        // Once the record may be in the WAL, any failure leaves the outcome
+        // unknown, and retrying fsync is unsafe (ADR 0004).
+        let outcome = wal.append(&record).map_err(Error::Io).and_then(|()| {
+            let batch = mvcc::commit_batch(commit_ts, transaction::writes(write_set));
+            Ok(self.engine.write_batch(batch)?)
+        });
+        if let Err(cause) = outcome {
+            commits.poisoned = true;
+            return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
+        }
+        commits.last = commit_ts;
+        Ok(commit_ts)
+    }
+
+    /// Create an Index on a field and build it from the Documents already in
+    /// the Collection (ADR 0010). The field's type must be declared in the
+    /// Collection Schema; a unique Index needs a Strict Field.
+    ///
+    /// The build runs in the foreground, holding the commit lock, so no
+    /// other commit happens until it finishes. It commits the entries in
+    /// chunks, each an ordinary fsynced commit, so it never holds more than
+    /// one chunk in memory; the entries stay unreachable until a final
+    /// commit adds the Index to the Catalog. If the build fails, for
+    /// example with [`Error::DuplicateValue`], or the Node crashes, the
+    /// committed chunks are left behind under an Index ID that is never
+    /// reused, until garbage collection exists.
+    ///
+    /// ```
+    /// use bson::doc;
+    /// use psdb_core::{Database, FieldType, IndexType};
+    /// use psdb_storage_memory::MemoryEngine;
+    ///
+    /// let db = Database::new(MemoryEngine::new());
+    /// db.create_database("shop")?;
+    /// db.create_collection("shop", "orders")?;
+    /// db.insert("shop", "orders", doc! { "total": 30 })?;
+    /// let total = FieldType { index_type: IndexType::Int, strict: false };
+    /// db.set_field_type("shop", "orders", "total", total)?;
+    /// db.create_index("shop", "orders", "total", false)?;
+    /// assert_eq!(db.find("shop", "orders", &doc! { "total": { "$gt": 10 } })?.len(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn create_index(
+        &self,
+        database: &str,
+        collection: &str,
+        path: &str,
+        unique: bool,
+    ) -> Result<()> {
+        let mut commits = self.commits.lock().expect("lock poisoned");
+        if commits.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let mut txn = Transaction::new(self, commits.last);
+        let (db_id, mut entry, index) = txn.prepare_index(database, collection, path, unique)?;
+        self.build_index(&mut commits, db_id, &entry, &index, txn.snapshot_ts())?;
+        entry.indexes.push(index);
+        txn.write_collection_entry(db_id, &entry)?;
+        txn.commit_locked(&mut commits)?;
+        Ok(())
+    }
+
+    /// Commit an entry in `index` for every Document of the Collection at
+    /// `snapshot_ts`, one chunk at a time.
+    fn build_index(
+        &self,
+        commits: &mut CommitState,
+        db_id: u32,
+        entry: &CollectionEntry,
+        index: &IndexDef,
+        snapshot_ts: u64,
+    ) -> Result<()> {
+        let ty = entry.schema[&index.path].index_type;
+        let prefix = keys::collection_prefix(db_id, entry.id);
+        let mut range = KeyRange::prefix(&prefix);
+        loop {
+            let mut page = Vec::new();
+            mvcc::scan_range_at(&self.engine, &range, snapshot_ts, &mut |key, value| {
+                page.push((key.to_vec(), value));
+                if page.len() == BUILD_CHUNK_DOCUMENTS {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })?;
+            let mut chunk = WriteSet::new();
+            for (key, bytes) in &page {
+                let Some(c) = index::component_of(document::raw(bytes)?, &index.path, ty)? else {
+                    continue;
+                };
+                let doc_id = &key[prefix.len()..];
+                let entry_key = index::entry_key(db_id, index, &c, doc_id);
+                if index.unique
+                    && !keys::is_null(&c)
+                    && (chunk.contains_key(&entry_key)
+                        || mvcc::read_at(&self.engine, &entry_key, commits.last)?.is_some())
+                {
+                    return Err(Error::DuplicateValue(format!(
+                        "two documents share a value of {}, so it cannot have a unique index",
+                        index.path
+                    )));
+                }
+                chunk.insert(entry_key, Some(doc_id.to_vec()));
+            }
+            if !chunk.is_empty() {
+                self.apply_commit(commits, &chunk)?;
+            }
+            let Some((last, _)) = page.last() else {
+                return Ok(());
+            };
+            if page.len() < BUILD_CHUNK_DOCUMENTS {
+                return Ok(());
+            }
+            // Past every Version of the last Document read.
+            range.start = [keys::physical_key(last, 0).as_slice(), &[0]].concat();
+        }
     }
 
     /// Begin a Transaction with a Snapshot of everything committed so far.
@@ -195,6 +338,41 @@ impl<E: StorageEngine> Database<E> {
     /// Autocommit [`Transaction::delete`].
     pub fn delete(&self, database: &str, collection: &str, id: &Bson) -> Result<bool> {
         self.run(|t| t.delete(database, collection, id))
+    }
+
+    /// Autocommit [`Transaction::set_field_type`].
+    pub fn set_field_type(
+        &self,
+        database: &str,
+        collection: &str,
+        path: &str,
+        field: FieldType,
+    ) -> Result<()> {
+        self.run(|t| t.set_field_type(database, collection, path, field))
+    }
+
+    /// Autocommit [`Transaction::remove_field_type`].
+    pub fn remove_field_type(&self, database: &str, collection: &str, path: &str) -> Result<()> {
+        self.run(|t| t.remove_field_type(database, collection, path))
+    }
+
+    /// Autocommit [`Transaction::collection_schema`].
+    pub fn collection_schema(
+        &self,
+        database: &str,
+        collection: &str,
+    ) -> Result<BTreeMap<String, FieldType>> {
+        self.run(|t| t.collection_schema(database, collection))
+    }
+
+    /// Autocommit [`Transaction::drop_index`].
+    pub fn drop_index(&self, database: &str, collection: &str, path: &str) -> Result<()> {
+        self.run(|t| t.drop_index(database, collection, path))
+    }
+
+    /// Autocommit [`Transaction::list_indexes`].
+    pub fn list_indexes(&self, database: &str, collection: &str) -> Result<Vec<IndexInfo>> {
+        self.run(|t| t.list_indexes(database, collection))
     }
 
     /// Autocommit [`Transaction::find`].

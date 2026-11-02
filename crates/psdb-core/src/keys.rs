@@ -1,7 +1,7 @@
 //! Order-preserving key encoding (ADR 0008).
 //!
-//! A **logical key** names one thing that has Versions: a Document, or a
-//! Catalog entry. A **physical key** is a logical key plus an inverted
+//! A **logical key** names one thing that has Versions: a Document, an
+//! Index entry, or a Catalog entry. A **physical key** is a logical key plus an inverted
 //! Commit Timestamp, so the newest Version of a key sorts first.
 
 use bson::Bson;
@@ -24,7 +24,13 @@ const COLLECTION_IDS_COLLECTION: u32 = 4;
 /// The largest encoded Document ID accepted, in bytes.
 pub const MAX_ID_BYTES: usize = 1024;
 
+/// Null and missing, in Index keys only: below every other type, as in
+/// MongoDB.
+const TAG_NULL: u8 = 0x05;
 const TAG_INTEGER: u8 = 0x10;
+/// A double, in Index keys only. A `double` Index holds only doubles, so the
+/// tag never has to order against [`TAG_INTEGER`].
+const TAG_DOUBLE: u8 = 0x11;
 const TAG_STRING: u8 = 0x20;
 const TAG_BINARY: u8 = 0x30;
 const TAG_OBJECT_ID: u8 = 0x40;
@@ -141,9 +147,43 @@ pub(crate) fn encode_id(id: &Bson, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn push_integer(out: &mut Vec<u8>, n: i64) {
+/// Append the Index key component for null or a missing field.
+pub(crate) fn push_null(out: &mut Vec<u8>) {
+    out.push(TAG_NULL);
+}
+
+/// Whether an Index key component is the one for null or missing.
+pub(crate) fn is_null(component: &[u8]) -> bool {
+    component == [TAG_NULL]
+}
+
+/// Append an integer component, as for a Document ID.
+pub(crate) fn push_integer(out: &mut Vec<u8>, n: i64) {
     out.push(TAG_INTEGER);
     out.extend_from_slice(&flip_sign(n));
+}
+
+/// Append a double Index key component that sorts in numeric order, with
+/// -0.0 and 0.0 the same. NaN has no place in the order; callers leave it
+/// out.
+pub(crate) fn push_double(out: &mut Vec<u8>, f: f64) {
+    debug_assert!(!f.is_nan());
+    let bits = if f == 0.0 { 0 } else { f.to_bits() };
+    // Positive: set the sign bit so they sort above negatives. Negative:
+    // invert everything so larger magnitudes sort lower.
+    let ordered = if bits >> 63 == 0 {
+        bits | (1 << 63)
+    } else {
+        !bits
+    };
+    out.push(TAG_DOUBLE);
+    out.extend_from_slice(&ordered.to_be_bytes());
+}
+
+/// The first byte of every component of the same type as `component`, so
+/// a range scan can stay within one type.
+pub(crate) fn type_tag(component: &[u8]) -> u8 {
+    component[0]
 }
 
 /// Big-endian bytes of `n` with the sign bit flipped, so negative numbers
@@ -288,6 +328,33 @@ mod tests {
             let physical = physical_key(&logical, ts);
             prop_assert_eq!(split_physical(&physical).unwrap(), (logical.as_slice(), ts));
         }
+    }
+
+    proptest! {
+        #[test]
+        fn double_components_sort_numerically(a: f64, b: f64) {
+            prop_assume!(!a.is_nan() && !b.is_nan());
+            let (mut ea, mut eb) = (Vec::new(), Vec::new());
+            push_double(&mut ea, a);
+            push_double(&mut eb, b);
+            prop_assert_eq!(ea.cmp(&eb), a.partial_cmp(&b).unwrap());
+        }
+    }
+
+    #[test]
+    fn null_sorts_below_every_other_type() {
+        let mut null = Vec::new();
+        push_null(&mut null);
+        for id in [
+            Bson::Int64(i64::MIN),
+            Bson::String(String::new()),
+            Bson::Boolean(false),
+        ] {
+            assert!(null < encode(&id));
+        }
+        let mut min_double = Vec::new();
+        push_double(&mut min_double, f64::NEG_INFINITY);
+        assert!(null < min_double);
     }
 
     #[test]

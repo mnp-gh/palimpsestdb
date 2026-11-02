@@ -9,7 +9,7 @@ use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 
 use bson::{Binary, Bson, Document, spec::BinarySubtype};
-use psdb_core::{Database, Transaction};
+use psdb_core::{Database, FieldType, IndexType, Transaction};
 use psdb_storage_memory::MemoryEngine;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -34,6 +34,17 @@ Documents (values are relaxed Extended JSON)
   replace <db>.<coll> <id> <doc>       replace the whole document
   delete <db>.<coll> <id>              delete the document
   find <db>.<coll> [filter]            print matching documents
+
+Schema and indexes (types: int double string date bool objectId binary)
+  schema <db>.<coll>                     list declared field types
+  set-type <db>.<coll> <path> <type> [strict]
+                                         declare a field's type; strict rejects other types
+  unset-type <db>.<coll> <path>          remove a field's declaration
+  indexes <db>.<coll>                    list indexes
+  create-index <db>.<coll> <path> [unique]
+                                         index a declared field (unique needs strict);
+                                         inside a transaction, only on an empty collection
+  drop-index <db>.<coll> <path>          drop the index on a field
 
 Transactions (without begin, every command commits on its own)
   begin                        start a transaction
@@ -252,6 +263,60 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
             println!("({} found)", docs.len());
         }
 
+        "schema" => {
+            let (d, c) = namespace(rest)?;
+            for (path, field) in with_txn(db, txn, |t| t.collection_schema(d, c))? {
+                let strict = if field.strict { " strict" } else { "" };
+                println!("{path}: {}{strict}", field.index_type);
+            }
+        }
+        "set-type" => {
+            let (ns, args) = split_namespace(rest)?;
+            let (path, index_type, strict) = match words(args)[..] {
+                [path, ty] => (path, ty, false),
+                [path, ty, "strict"] => (path, ty, true),
+                _ => return Err("usage: set-type <db>.<coll> <path> <type> [strict]".into()),
+            };
+            let index_type: IndexType = index_type.parse().map_err(message)?;
+            let field = FieldType { index_type, strict };
+            with_txn(db, txn, |t| t.set_field_type(ns.0, ns.1, path, field))?;
+        }
+        "unset-type" => {
+            let (ns, args) = split_namespace(rest)?;
+            let [path] = words(args)[..] else {
+                return Err("usage: unset-type <db>.<coll> <path>".into());
+            };
+            with_txn(db, txn, |t| t.remove_field_type(ns.0, ns.1, path))?;
+        }
+        "indexes" => {
+            let (d, c) = namespace(rest)?;
+            for index in with_txn(db, txn, |t| t.list_indexes(d, c))? {
+                let unique = if index.unique { " unique" } else { "" };
+                println!("{}{unique}", index.path);
+            }
+        }
+        "create-index" => {
+            let (ns, args) = split_namespace(rest)?;
+            let (path, unique) = match words(args)[..] {
+                [path] => (path, false),
+                [path, "unique"] => (path, true),
+                _ => return Err("usage: create-index <db>.<coll> <path> [unique]".into()),
+            };
+            match txn {
+                Some(open) => open.create_index(ns.0, ns.1, path, unique),
+                // Builds from existing Documents, committing on its own.
+                None => db.create_index(ns.0, ns.1, path, unique),
+            }
+            .map_err(message)?;
+        }
+        "drop-index" => {
+            let (ns, args) = split_namespace(rest)?;
+            let [path] = words(args)[..] else {
+                return Err("usage: drop-index <db>.<coll> <path>".into());
+            };
+            with_txn(db, txn, |t| t.drop_index(ns.0, ns.1, path))?;
+        }
+
         other => return Err(format!("unknown command {other:?}; type `help`")),
     }
     Ok(Outcome::Continue)
@@ -290,6 +355,10 @@ fn namespace(text: &str) -> Result<(&str, &str), String> {
 fn split_namespace(text: &str) -> Result<((&str, &str), &str), String> {
     let (ns, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
     Ok((namespace(ns)?, rest.trim()))
+}
+
+fn words(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
 }
 
 /// Parse exactly `N` whitespace-separated Extended JSON values.

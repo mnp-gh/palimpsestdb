@@ -7,6 +7,8 @@ $ cargo run -p psdb-cli -- --data-dir ./data
 psdb> create-db shop
 psdb> create-coll shop.orders
 psdb> insert shop.orders {"_id": 1, "item": "book", "qty": 2}
+psdb> set-type shop.orders qty int
+psdb> create-index shop.orders qty
 psdb> find shop.orders {"qty": {"$gt": 1}}
 psdb> begin
 psdb(txn)> delete shop.orders 1

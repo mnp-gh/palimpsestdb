@@ -37,6 +37,43 @@ pub enum Error {
     },
     /// A Document with this Document ID already exists in the Collection.
     DuplicateId(String),
+    /// Duplicate Value: the write would give two Documents the same value
+    /// in a unique Index. Not an Abort, and not retryable.
+    DuplicateValue(String),
+    /// Type Mismatch: the write gives a Strict Field a value of another
+    /// type. Not an Abort, and not retryable.
+    TypeMismatch(String),
+    /// A Collection Schema change or Index definition breaks a rule, such
+    /// as indexing a field whose type is not declared.
+    InvalidSchema(String),
+    /// The Collection already has an Index on this field.
+    IndexExists {
+        /// The Database name.
+        database: String,
+        /// The Collection name.
+        collection: String,
+        /// The field path.
+        path: String,
+    },
+    /// The Collection has no Index on this field.
+    NoSuchIndex {
+        /// The Database name.
+        database: String,
+        /// The Collection name.
+        collection: String,
+        /// The field path.
+        path: String,
+    },
+    /// An Index can only be created inside a Transaction while its
+    /// Collection is empty; otherwise use
+    /// [`Database::create_index`](crate::Database::create_index), which
+    /// builds it on its own (ADR 0010).
+    CollectionNotEmpty {
+        /// The Database name.
+        database: String,
+        /// The Collection name.
+        collection: String,
+    },
     /// A Database or Collection name breaks the naming rules.
     InvalidName(String),
     /// A value cannot be used as a Document ID.
@@ -54,8 +91,10 @@ pub enum Error {
     /// The WAL file has the wrong magic number or an unknown format
     /// version. It was left untouched.
     UnrecognisedWal(String),
-    /// The Transaction's WAL Record would exceed 4 GiB. Nothing was
-    /// written. Not retryable.
+    /// Transaction Too Large: the write would grow the Write Set past
+    /// [`Limits::max_write_set_bytes`](crate::Limits::max_write_set_bytes)
+    /// (the write is not made), or the WAL Record would exceed 4 GiB
+    /// (nothing is committed). Not an Abort, and not retryable.
     TransactionTooLarge,
     /// [`Database::open`](crate::Database::open) was given an engine that
     /// already holds data; the WAL is replayed into an empty engine.
@@ -101,6 +140,19 @@ impl fmt::Display for Error {
                 write!(f, "collection {database}.{collection} already exists")
             }
             Error::DuplicateId(id) => write!(f, "a document with _id {id} already exists"),
+            Error::DuplicateValue(msg) => write!(f, "duplicate value: {msg}"),
+            Error::TypeMismatch(msg) => write!(f, "type mismatch: {msg}"),
+            Error::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
+            Error::IndexExists { database, collection, path } => {
+                write!(f, "collection {database}.{collection} already has an index on {path}")
+            }
+            Error::NoSuchIndex { database, collection, path } => {
+                write!(f, "collection {database}.{collection} has no index on {path}")
+            }
+            Error::CollectionNotEmpty { database, collection } => write!(
+                f,
+                "collection {database}.{collection} holds documents, so its index must be built outside a transaction"
+            ),
             Error::InvalidName(msg) => write!(f, "invalid name: {msg}"),
             Error::InvalidId(msg) => write!(f, "invalid _id: {msg}"),
             Error::InvalidDocument(msg) => write!(f, "invalid document: {msg}"),
@@ -109,9 +161,9 @@ impl fmt::Display for Error {
             Error::Storage(e) => write!(f, "{e}"),
             Error::Io(e) => write!(f, "WAL I/O error: {e}"),
             Error::UnrecognisedWal(msg) => write!(f, "unrecognised WAL: {msg}"),
-            Error::TransactionTooLarge => {
-                f.write_str("transaction too large: its WAL record would exceed 4 GiB")
-            }
+            Error::TransactionTooLarge => f.write_str(
+                "transaction too large: its write set would exceed the configured limit or its WAL record 4 GiB",
+            ),
             Error::EngineNotEmpty => {
                 f.write_str("the storage engine already holds data; open a WAL into an empty engine")
             }

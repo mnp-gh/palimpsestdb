@@ -1,7 +1,7 @@
 //! Document and name rules: limits, Document IDs, Database and Collection
 //! names.
 
-use bson::{Binary, Bson, Document, spec::BinarySubtype};
+use bson::{Binary, Bson, Document, RawDocument, spec::BinarySubtype};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -21,6 +21,10 @@ pub struct Limits {
     /// The deepest nesting of documents and arrays accepted. A Document with
     /// no nested values has depth 1.
     pub max_nesting_depth: usize,
+    /// The largest Write Set a Transaction may build, counting the bytes of
+    /// every key and value written, Index entries included. A write that
+    /// would cross it fails with Transaction Too Large.
+    pub max_write_set_bytes: usize,
 }
 
 impl Default for Limits {
@@ -28,6 +32,7 @@ impl Default for Limits {
         Self {
             max_document_bytes: 16 * 1024 * 1024,
             max_nesting_depth: 100,
+            max_write_set_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -119,6 +124,11 @@ fn check_depth(doc: &Document, max: usize) -> Result<()> {
 
 fn too_deep(max: usize) -> Error {
     Error::InvalidDocument(format!("nesting is deeper than the limit of {max}"))
+}
+
+/// A stored Document, read in place.
+pub(crate) fn raw(bytes: &[u8]) -> Result<&RawDocument> {
+    RawDocument::from_bytes(bytes).map_err(|e| Error::Corruption(format!("stored document: {e}")))
 }
 
 /// Decode a stored Document.
