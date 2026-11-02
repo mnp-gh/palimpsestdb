@@ -5,7 +5,7 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | Version | Theme | Status |
 |---|---|---|
 | v0.1 | Embedded, in-memory | Done |
-| v0.2 | Durability | In review |
+| v0.2 | Durability | Done |
 | v0.3 | Indexes | Planned |
 | v0.4 | Concurrency | Planned |
 | v0.5 | Serializable | Planned |
@@ -41,14 +41,19 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## v0.3: Indexes
 
-- Single-field secondary Indexes, versioned and maintained in the same Write Set
-- Index-backed filters
+- Single-field secondary Indexes, at most one per field path, versioned and maintained in the same Write Set; each has its own never-reused ID as its key prefix
+- Collection Schema declaring each indexed field's Index Type (`int`, `float`, `string`, `date`, `bool`, `objectId`, `binary`) and whether it is a Strict Field ([ADR 0011](./adr/0011-index-types-live-in-collection-schema.md)). Values of other types are left out of the Index; `int` and `float` coerce the other kind of number into the key
+- Unique Indexes, on Strict Fields only, keyed by value alone so concurrent duplicates become Write Conflicts; missing and null never collide
+- Index builds streamed into the WAL as Index Build Records, outside the Write Set and its cap, made visible by one final commit ([ADR 0010](./adr/0010-index-builds-stream-into-wal.md))
+- Index-backed filters: an equality or range comparison at the top level or in a top-level `$and`, whose value is in the Index's type; equality preferred over range; the full filter is always rechecked
+- Exact comparison between integers and doubles in filters (today large integers lose precision when converted to double)
 - Evaluate filters on raw BSON (`RawDocument`) instead of decoding whole Documents
 - Configurable Write Set cap (default 16 MB)
 
 ## v0.4: Concurrency
 
 - Thread-safe Document Layer; single in-order applier; visibility watermark
+- Index builds that hold no Commit Timestamp while they run, so a long build no longer hides other commits ([ADR 0010](./adr/0010-index-builds-stream-into-wal.md))
 - In-RAM Catalog cache (v0.1 reads Catalog entries from the engine on every operation)
 - Garbage collection of old Versions below the oldest active Snapshot
 - `fjall` Storage Engine, passing the conformance suite, with block compression (LZ4 or zstd) enabled
@@ -78,7 +83,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Partial updates (`$set`, `$inc`), projections, sort
 - Compound and multikey Indexes
 - Rule-based query planner: equality Index, else range Index, else full scan
-- Optional per-Collection validation schemas (Collections stay schemaless by default); the planner uses their type, required and never-an-array facts as hints
+- Validation in the Collection Schema from v0.3, such as required fields (Collections stay schemaless by default); the planner uses their type, required and never-an-array facts as hints
 
 ## v0.9: Own Storage Engine
 
@@ -92,6 +97,8 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## Unscheduled
 
 - Query planner statistics (sampled per-path counts and histograms) and a cost model for choosing between Indexes
+- Index hints: the client names the Index a query should use
+- Range comparisons on binary values: filters only test binary for equality, so a `binary` Index answers equality only. Decide an order first (MongoDB: length, subtype, bytes; our key encoding: subtype, bytes)
 
 ## v2.x: Distribution
 

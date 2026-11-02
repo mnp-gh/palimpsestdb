@@ -25,8 +25,20 @@ The authoritative record of which Databases and Collections exist and how their 
 _Avoid_: Metadata store, schema registry
 
 **Index**:
-A secondary lookup over one field of a Collection's Documents, consistent with those Documents at every Snapshot.
+A secondary lookup over one field of a Collection's Documents, declared for one Index Type, consistent with those Documents at every Snapshot. A unique Index also forbids two Documents from sharing a value in that field.
 _Avoid_: Secondary key, lookup table
+
+**Collection Schema**:
+The optional declarations a Collection makes about its fields; for now, each field's Index Type and whether it is a Strict Field. A Collection without one is schemaless, and Documents are never changed to fit it.
+_Avoid_: Index schema, validator
+
+**Index Type**:
+The kind of value an Index covers, declared for its field in the Collection Schema rather than on the Index. Whether a Document is in the Index follows each of its Versions: while its field holds another kind of value it is left out, and a later write giving the field a value of the Index Type brings it in (and back out again if the type changes away). The Document itself is never changed.
+_Avoid_: Schema, column type
+
+**Strict Field**:
+A field whose Index Type the Collection Schema enforces: a write giving it a value of another type fails with Type Mismatch. Only a Strict Field can have a unique Index.
+_Avoid_: Required field (a Strict Field may be missing), typed column
 
 ## Access
 
@@ -99,6 +111,18 @@ An Abort because a Collection the Transaction used was dropped, renamed or re-in
 The result of a commit whose durability could not be confirmed: the Transaction may or may not survive a restart. Not an Abort, and not safely retryable.
 _Avoid_: Failed commit, I/O error
 
+**Transaction Too Large**:
+The failure of a Transaction whose Write Set grows past the configured cap. Not an Abort, and not retryable: the same Transaction would fail again.
+_Avoid_: Overflow, out of memory
+
+**Duplicate Value**:
+The failure of a write that would give two Documents the same value in a unique Index. Not an Abort, and not retryable.
+_Avoid_: Constraint violation, duplicate key
+
+**Type Mismatch**:
+The failure of a write that gives a Strict Field a value of another type. Not an Abort, and not retryable.
+_Avoid_: Schema violation, validation error
+
 **Node**:
 One running instance of PalimpsestDB. Until replication exists, PalimpsestDB runs as exactly one Node.
 _Avoid_: Server, instance, replica (until replication is designed)
@@ -106,12 +130,16 @@ _Avoid_: Server, instance, replica (until replication is designed)
 ## Commit lifecycle
 
 **WAL**:
-The append-only log of every committed Transaction's writes, in Commit Timestamp order. A Transaction is Durable once its WAL Record is on disk.
+The append-only log of every committed Transaction's writes and every Index build, in Commit Timestamp order. A Transaction is Durable once its WAL Record is on disk.
 _Avoid_: Journal, redo log, commit log
 
 **WAL Record**:
 One committed Transaction in the WAL: its Commit Timestamp and Write Set. Aborted and read-only Transactions have none.
 _Avoid_: Log entry, journal entry
+
+**Index Build Record**:
+One chunk of a new Index's entries in the WAL, tagged with the Commit Timestamp its build will commit at. It takes effect only if that commit follows.
+_Avoid_: Partial commit, WAL Record (that is one committed Transaction)
 
 **Recovery**:
 Replaying the WAL into the Storage Engine when a Node opens. A torn last WAL Record is cut off; damage anywhere else stops the Node from opening rather than lose Durable Transactions.
