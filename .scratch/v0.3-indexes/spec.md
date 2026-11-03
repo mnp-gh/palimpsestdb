@@ -39,6 +39,7 @@ Single-field secondary Indexes, typed by a Collection Schema, kept consistent wi
 
 - `find` uses an Index for an equality or range comparison that must hold for the filter to match (at the top level or inside `$and`), on an indexed field, against a value the Index's type compares with. `{f: null}` uses the null component. Other range comparisons on the chosen field narrow the range.
 - An `$or` whose every branch can use an Index reads the union of the branches' ranges, planned recursively; a Document found through several ranges is read once. One branch that cannot use an Index makes that `$or` unusable, since that branch's Documents would be missed.
+- A comparison on `_id` reads a range of the Collection's own keys, which are sorted by `_id` (integers as in an `int` Index, so a double bound works), with no Index lookup. It plans like an Index comparison, and an `_id` equality beats every other equality.
 - Choice: an equality, else an indexed `$or`, else the first range comparison; ties go to the first in the filter. `$ne`, binary ranges and everything else scan the whole Collection.
 - Bounds are inclusive, because coercion files different values under one key. Every candidate is fetched at the Snapshot, with own writes overlaid, and the whole filter is rechecked on raw BSON. Results stay in Document ID order.
 - Filters compare integers and doubles exactly, without converting the integer.

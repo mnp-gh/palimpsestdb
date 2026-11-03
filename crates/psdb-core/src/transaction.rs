@@ -13,7 +13,7 @@ use crate::database::{CommitState, Database};
 use crate::document;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
-use crate::index;
+use crate::index::{self, Source};
 use crate::keys;
 use crate::mvcc;
 
@@ -268,10 +268,10 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     }
 
     /// Every Document in the Collection that matches `filter`, in Document
-    /// ID order. Reads candidates from an Index when one fits the filter
-    /// (see [`Database::create_index`]), and the whole Collection
-    /// otherwise; either way every candidate is checked against the whole
-    /// filter.
+    /// ID order. Reads candidates from a range of `_id`s or from an Index
+    /// when one fits the filter (see [`Database::create_index`]), and the
+    /// whole Collection otherwise; either way every candidate is checked
+    /// against the whole filter.
     pub fn find(
         &mut self,
         database: &str,
@@ -281,19 +281,25 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         let filter = Filter::parse(filter)?;
         let (db_id, entry) = self.collection_entry(database, collection)?;
         let prefix = keys::collection_prefix(db_id, entry.id);
-        let candidates = match index::plan(&filter, db_id, &entry.schema, &entry.indexes) {
+        let candidates = match index::plan(&filter, db_id, entry.id, &entry.schema, &entry.indexes)
+        {
             None => self.scan(&prefix)?,
-            Some(ranges) => {
+            Some(sources) => {
                 // Keyed by Document key, so a Document found through several
                 // ranges is read once, and results stay in Document ID order.
                 let mut rows = BTreeMap::new();
-                for range in &ranges {
-                    for doc_id in self.scan_range(range)?.into_values() {
-                        let key = [prefix.as_slice(), &doc_id].concat();
-                        if !rows.contains_key(&key)
-                            && let Some(bytes) = self.read(&key)?
-                        {
-                            rows.insert(key, bytes);
+                for source in &sources {
+                    match source {
+                        Source::Documents(range) => rows.extend(self.scan_range(range)?),
+                        Source::Index(range) => {
+                            for doc_id in self.scan_range(range)?.into_values() {
+                                let key = [prefix.as_slice(), &doc_id].concat();
+                                if !rows.contains_key(&key)
+                                    && let Some(bytes) = self.read(&key)?
+                                {
+                                    rows.insert(key, bytes);
+                                }
+                            }
                         }
                     }
                 }

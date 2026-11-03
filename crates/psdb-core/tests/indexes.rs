@@ -53,7 +53,8 @@ fn value() -> impl Strategy<Value = Bson> {
 }
 
 fn op() -> impl Strategy<Value = Op> {
-    let id = 0..6i32;
+    // Negative too, so `_id` ranges cross zero.
+    let id = -3..4i32;
     prop_oneof![
         (id.clone(), prop::option::of(value())).prop_map(|(i, v)| Op::Insert(i, v)),
         (id.clone(), prop::option::of(value())).prop_map(|(i, v)| Op::Replace(i, v)),
@@ -66,9 +67,25 @@ fn comparison() -> impl Strategy<Value = Document> {
     (op, value()).prop_map(|(op, v)| doc! { "a.v": { op: v } })
 }
 
+fn id_comparison() -> impl Strategy<Value = Document> {
+    let op = prop::sample::select(vec!["$eq", "$gt", "$gte", "$lt", "$lte", "$ne"]);
+    let id = prop_oneof![
+        (-4i32..5).prop_map(Bson::Int32),
+        (-4i64..5).prop_map(Bson::Int64),
+        prop::sample::select(vec![-1.5, 0.5, 2.0, f64::NAN, f64::NEG_INFINITY])
+            .prop_map(Bson::Double),
+        Just(Bson::String("1".into())),
+        Just(Bson::Null),
+    ];
+    (op, id).prop_map(|(op, v)| doc! { "_id": { op: v } })
+}
+
 fn filter() -> impl Strategy<Value = Document> {
     prop_oneof![
         comparison(),
+        id_comparison(),
+        (id_comparison(), comparison()).prop_map(|(x, y)| doc! { "$and": [x, y] }),
+        (id_comparison(), comparison()).prop_map(|(x, y)| doc! { "$or": [x, y] }),
         (comparison(), comparison()).prop_map(|(x, y)| doc! { "$or": [x, y] }),
         (comparison(), comparison(), comparison())
             .prop_map(|(x, y, z)| doc! { "$and": [x, { "$or": [y, z] }] }),
