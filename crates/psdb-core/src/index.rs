@@ -1,5 +1,5 @@
 //! Indexes: Index Types, Strict Fields, Index entry keys, and choosing an
-//! Index for a filter (ADR 0010, ADR 0011).
+//! Index or a range of `_id`s for a filter (ADR 0010, ADR 0011).
 //!
 //! An Index entry's logical key is `database_id ‖ index_id ‖ component ‖
 //! document_id`, where the component encodes the Document's value in the
@@ -258,52 +258,83 @@ pub(crate) fn entry_key(
     key
 }
 
-/// The ranges of Index entries to read for `filter`, or `None` to scan the
-/// whole Collection. Every Document the filter can match has an entry in
-/// at least one range; ranges may overlap.
+/// A range of keys `find` reads candidates from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// Index entries, whose values are the encoded IDs of the Documents to
+    /// fetch.
+    Index(KeyRange),
+    /// The Documents themselves, which are keyed by `_id` and so sorted by
+    /// it: the Collection is its own `_id` Index.
+    Documents(KeyRange),
+}
+
+impl Source {
+    fn range_mut(&mut self) -> &mut KeyRange {
+        match self {
+            Source::Index(r) | Source::Documents(r) => r,
+        }
+    }
+}
+
+/// The ranges to read for `filter`, or `None` to scan the whole
+/// Collection. Every Document the filter can match is in at least one
+/// range; ranges may overlap.
 ///
-/// A comparison can use an Index when it must hold for the filter to match
-/// (it is at the top level or inside `$and`), its field is indexed, and its
-/// value is one the Index's type compares with. An equality wins; failing
-/// that, an `$or` whose every branch can use an Index reads the union of
-/// the branches' ranges; failing that, the first range comparison is used.
-/// Ties go to the first in the filter, and other range comparisons on the
-/// chosen field narrow the range. `$ne` never uses an Index, and neither
-/// does an `$or` with a branch that cannot: that branch's Documents would
-/// be missed.
+/// A comparison can use a range when it must hold for the filter to match
+/// (it is at the top level or inside `$and`), its field is `_id` or
+/// indexed, and its value is one the field's type compares with. An
+/// equality wins, `_id` first; failing that, an `$or` whose every branch
+/// can use a range reads the union of the branches' ranges; failing that,
+/// the first range comparison is used. Ties go to the first in the filter,
+/// and other range comparisons on the chosen field narrow the range. `$ne`
+/// never uses a range, and neither does an `$or` with a branch that
+/// cannot: that branch's Documents would be missed.
 pub(crate) fn plan(
     filter: &Filter,
     database_id: u32,
+    collection_id: u32,
     schema: &Schema,
     indexes: &[IndexDef],
-) -> Option<Vec<KeyRange>> {
+) -> Option<Vec<Source>> {
     let mut comparisons = Vec::new();
     let mut ors = Vec::new();
     collect_conjuncts(filter, &mut comparisons, &mut ors);
-    let candidates: Vec<(&IndexDef, bool, KeyRange)> = comparisons
+    let candidates: Vec<(String, bool, Source)> = comparisons
         .into_iter()
         .filter_map(|(path, op, value)| {
-            let index = indexes.iter().find(|i| i.path == path)?;
-            let ty = schema.get(&index.path)?.index_type;
-            let range = bounds(database_id, index, ty, op, value)?;
-            Some((index, op == CompareOp::Eq, range))
+            let source = if path == "_id" {
+                let base = keys::collection_prefix(database_id, collection_id);
+                Source::Documents(bounds(base, id_type(value)?, op, value)?)
+            } else {
+                let index = indexes.iter().find(|i| i.path == path)?;
+                let ty = schema.get(&index.path)?.index_type;
+                let base = keys::collection_prefix(database_id, index.id);
+                Source::Index(bounds(base, ty, op, value)?)
+            };
+            Some((path, op == CompareOp::Eq, source))
         })
         .collect();
-    let equality = candidates.iter().find(|(_, eq, _)| *eq);
+    let equality = candidates
+        .iter()
+        .find(|(path, eq, _)| *eq && path == "_id")
+        .or_else(|| candidates.iter().find(|(_, eq, _)| *eq));
     if equality.is_none() {
         let union = ors.iter().find_map(|branches| {
-            branches.iter().try_fold(Vec::new(), |mut ranges, branch| {
-                ranges.extend(plan(branch, database_id, schema, indexes)?);
-                Some(ranges)
+            branches.iter().try_fold(Vec::new(), |mut sources, branch| {
+                sources.extend(plan(branch, database_id, collection_id, schema, indexes)?);
+                Some(sources)
             })
         });
         if union.is_some() {
             return union;
         }
     }
-    let (chosen, _, mut range) = equality.or_else(|| candidates.first())?.clone();
-    for (index, _, other) in &candidates {
-        if index.id == chosen.id {
+    let (chosen, _, mut source) = equality.or_else(|| candidates.first())?.clone();
+    let range = source.range_mut();
+    for (path, _, other) in &candidates {
+        if *path == chosen {
+            let (Source::Index(other) | Source::Documents(other)) = other;
             if other.start > range.start {
                 range.start = other.start.clone();
             }
@@ -312,7 +343,23 @@ pub(crate) fn plan(
             }
         }
     }
-    Some(vec![range])
+    Some(vec![source])
+}
+
+/// The Index Type whose keys sort `_id` values the way filters compare them
+/// with `value`. Document IDs are encoded as Index keys are, integers as in
+/// an `int` Index; `_id` is never a double, so a double filter value works
+/// as it does against an `int` Index.
+fn id_type(value: &Bson) -> Option<IndexType> {
+    match value {
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => Some(IndexType::Int),
+        Bson::String(_) => Some(IndexType::String),
+        Bson::DateTime(_) => Some(IndexType::Date),
+        Bson::Boolean(_) => Some(IndexType::Bool),
+        Bson::ObjectId(_) => Some(IndexType::ObjectId),
+        Bson::Binary(_) => Some(IndexType::Binary),
+        _ => None,
+    }
 }
 
 /// Every comparison and every `$or` that must hold for `filter` to match:
@@ -331,23 +378,17 @@ fn collect_conjuncts<'f>(
     }
 }
 
-/// The entries of `index` that can hold a value satisfying `op value`.
-/// Bounds are inclusive even for `$gt` and `$lt`, because coercion files
-/// different values under one key; the recheck drops the extras.
-fn bounds(
-    database_id: u32,
-    index: &IndexDef,
-    ty: IndexType,
-    op: CompareOp,
-    value: &Bson,
-) -> Option<KeyRange> {
+/// The keys under `base` (an Index's prefix, or a Collection's for `_id`)
+/// that can hold a value satisfying `op value`. Bounds are inclusive even
+/// for `$gt` and `$lt`, because coercion files different values under one
+/// key; the recheck drops the extras.
+fn bounds(base: Vec<u8>, ty: IndexType, op: CompareOp, value: &Bson) -> Option<KeyRange> {
     let comp = match value {
         // `{f: null}` matches null and missing, which share one component.
         Bson::Null if op == CompareOp::Eq => component(None, ty)?,
         v if ty.compares_with(v) => component(Some(v), ty)?,
         _ => return None,
     };
-    let base = keys::collection_prefix(database_id, index.id);
     let at = |bytes: &[u8]| [base.as_slice(), bytes].concat();
     // Every key whose component starts with `comp`, then the whole type.
     let exact = KeyRange::prefix(&at(&comp));
@@ -390,8 +431,13 @@ mod tests {
         filter: bson::Document,
         schema: &Schema,
         indexes: &[IndexDef],
-    ) -> Option<Vec<KeyRange>> {
-        plan(&Filter::parse(&filter).unwrap(), 1, schema, indexes)
+    ) -> Option<Vec<Source>> {
+        plan(&Filter::parse(&filter).unwrap(), 1, 3, schema, indexes)
+    }
+
+    fn range(source: &Source) -> &KeyRange {
+        let (Source::Index(r) | Source::Documents(r)) = source;
+        r
     }
 
     fn comp(v: Bson, ty: IndexType) -> Vec<u8> {
@@ -465,8 +511,9 @@ mod tests {
             Some(status_range),
             "equality wins"
         );
-        let adults = &planned(doc! { "age": { "$gte": 18 } }, &s, &ix).unwrap()[0];
-        let working = &planned(doc! { "age": { "$gte": 18, "$lt": 65 } }, &s, &ix).unwrap()[0];
+        let adults = planned(doc! { "age": { "$gte": 18 } }, &s, &ix).unwrap();
+        let working = planned(doc! { "age": { "$gte": 18, "$lt": 65 } }, &s, &ix).unwrap();
+        let (adults, working) = (range(&adults[0]), range(&working[0]));
         assert_eq!(working.start, adults.start);
         assert!(
             working.end < adults.end,
@@ -549,6 +596,38 @@ mod tests {
             open,
             "an $or with an unindexed branch is skipped, not fatal"
         );
+    }
+
+    #[test]
+    fn id_comparisons_read_documents_directly() {
+        let s = schema("age", IndexType::Int);
+        let ix = [index("age", 7)];
+        let docs = |filter| match planned(filter, &s, &ix).as_deref() {
+            Some([Source::Documents(r)]) => Some(r.clone()),
+            _ => None,
+        };
+        let one = docs(doc! { "_id": 5 }).unwrap();
+        assert!(one.contains(&keys::document_key(1, 3, &Bson::Int32(5)).unwrap()));
+        assert!(!one.contains(&keys::document_key(1, 3, &Bson::Int32(6)).unwrap()));
+        assert_eq!(
+            docs(doc! { "age": 1, "_id": 5 }),
+            Some(one),
+            "an _id equality beats an Index equality"
+        );
+        let below = docs(doc! { "_id": { "$lt": -2 } }).unwrap();
+        assert!(below.contains(&keys::document_key(1, 3, &Bson::Int64(-7)).unwrap()));
+        assert!(!below.contains(&keys::document_key(1, 3, &Bson::Int64(3)).unwrap()));
+        assert!(
+            docs(doc! { "_id": { "$gt": 2.5 } })
+                .unwrap()
+                .contains(&keys::document_key(1, 3, &Bson::Int32(3)).unwrap()),
+            "a double bound works on integer IDs"
+        );
+        assert_eq!(
+            planned(doc! { "$or": [ { "_id": 1 }, { "age": 2 } ] }, &s, &ix).map(|r| r.len()),
+            Some(2)
+        );
+        assert_eq!(planned(doc! { "_id": null }, &s, &ix), None);
     }
 
     #[test]
