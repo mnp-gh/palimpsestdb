@@ -7,19 +7,24 @@
 //! ```text
 //! { name, id,
 //!   fields:  [ { path, type, strict } ],
-//!   indexes: [ { path, id, unique } ] }
+//!   indexes: [ { path, id, unique } ],
+//!   nextIndexId }
 //! ```
 //!
-//! Both lists are optional, so entries written before v0.3 read as having
-//! neither. Changing the schema or the Indexes rewrites the entry, so a
-//! concurrent writer to the Collection aborts with Collection Changed.
+//! All three are optional, so a Collection without them reads as having no
+//! schema, no Indexes and next Index ID 0. Changing the schema or the
+//! Indexes rewrites the entry, so a concurrent writer to the Collection
+//! aborts with Collection Changed.
 //!
-//! IDs are random, and creating one also writes its ID key, which dropping
-//! leaves in place, so an ID is never reused, even by a Database or
-//! Collection that holds no Documents. Indexes draw from the same IDs as
-//! Collections. Creating different names concurrently never conflicts;
-//! creating the same name, or drawing the same ID, does, because both
-//! Transactions write the same key.
+//! Database and Collection IDs are random, and creating one also writes its
+//! ID key, which dropping leaves in place, so an ID is never reused, even by
+//! a Database or Collection that holds no Documents. Creating different
+//! names concurrently never conflicts; creating the same name, or drawing
+//! the same ID, does, because both Transactions write the same key.
+//!
+//! Index IDs are counted per Collection by `nextIndexId`, which only grows,
+//! so they are never reused either. Creating an Index rewrites its
+//! Collection's entry anyway, so the counter adds no conflicts.
 
 use std::collections::BTreeMap;
 
@@ -41,6 +46,8 @@ pub(crate) struct CollectionEntry {
     pub(crate) id: u32,
     pub(crate) schema: Schema,
     pub(crate) indexes: Vec<IndexDef>,
+    /// The lowest Index ID never given out in this Collection.
+    next_index_id: u32,
     /// Each declared path split into segments once, rather than on every
     /// write.
     segments: BTreeMap<String, Vec<String>>,
@@ -95,6 +102,10 @@ impl CollectionEntry {
             id: read_u32(&doc, "id")?,
             schema,
             indexes,
+            next_index_id: match doc.get("nextIndexId") {
+                None => 0,
+                Some(_) => read_u32(&doc, "nextIndexId")?,
+            },
             segments,
         })
     }
@@ -139,6 +150,7 @@ impl CollectionEntry {
             "id": i64::from(self.id),
             "fields": fields,
             "indexes": indexes,
+            "nextIndexId": i64::from(self.next_index_id),
         })
     }
 
@@ -287,12 +299,13 @@ impl<E: StorageEngine> Transaction<'_, E> {
         }
         let already_enforced = old.is_some_and(|o| o.strict && o.field_type == field.field_type);
         if field.strict && !already_enforced {
-            let prefix = keys::collection_prefix(db_id, entry.id);
-            for bytes in self.scan(&prefix)?.values() {
+            let documents = keys::documents_range(db_id, entry.id);
+            for bytes in self.scan_range(&documents)?.values() {
                 schema::check_field(document::raw(bytes)?, path, &segments, field)?;
             }
             // A Document committed concurrently was not checked.
-            self.collection_reads.insert(prefix);
+            self.collection_reads
+                .insert(keys::collection_prefix(db_id, entry.id));
         }
         entry.schema.insert(path.to_owned(), field);
         self.write_collection_entry(db_id, &entry)
@@ -342,24 +355,23 @@ impl<E: StorageEngine> Transaction<'_, E> {
         path: &str,
         unique: bool,
     ) -> Result<()> {
-        // Checked before the ID is drawn, which writes, so a refusal leaves
-        // the Transaction untouched.
         let (db_id, entry) = self.collection_entry(database, collection)?;
-        let prefix = keys::collection_prefix(db_id, entry.id);
-        if self.any_live_under(&prefix)? {
+        if self.any_live_in(&keys::documents_range(db_id, entry.id))? {
             return Err(Error::CollectionNotEmpty {
                 database: database.to_owned(),
                 collection: collection.to_owned(),
             });
         }
         let (db_id, mut entry, index) = self.prepare_index(database, collection, path, unique)?;
-        self.collection_reads.insert(prefix);
+        self.collection_reads
+            .insert(keys::collection_prefix(db_id, entry.id));
         entry.indexes.push(index);
         self.write_collection_entry(db_id, &entry)
     }
 
-    /// Check that an Index may be created and draw its ID. The caller fills
-    /// the Index and adds it to the returned entry.
+    /// Check that an Index may be created and give it the Collection's next
+    /// Index ID. The caller fills the Index and adds it to the returned
+    /// entry, whose counter has moved past the ID.
     pub(crate) fn prepare_index(
         &mut self,
         database: &str,
@@ -367,7 +379,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         path: &str,
         unique: bool,
     ) -> Result<(u32, CollectionEntry, IndexDef)> {
-        let (db_id, entry) = self.collection_entry(database, collection)?;
+        let (db_id, mut entry) = self.collection_entry(database, collection)?;
         let Some(field) = entry.schema.get(path) else {
             return Err(Error::InvalidSchema(format!(
                 "declare the type of {path} in the collection schema before indexing it"
@@ -385,7 +397,13 @@ impl<E: StorageEngine> Transaction<'_, E> {
                 "a unique index needs a strict field; declare {path} strict first"
             )));
         }
-        let id = self.allocate_id(Some(db_id))?;
+        // Skip IDs holding entries from a build that never committed: the
+        // counter moves only when the Index is added (ADR 0010).
+        let mut id = entry.next_index_id;
+        while mvcc::any_version_under(&self.db.engine, &keys::index_prefix(db_id, entry.id, id))? {
+            id += 1;
+        }
+        entry.next_index_id = id + 1;
         Ok((
             db_id,
             entry,
@@ -428,7 +446,8 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// A random ID for a new Database (`database: None`) or for a new
-    /// Collection in `database`.
+    /// Collection in `database`. Indexes are numbered per Collection
+    /// instead.
     fn allocate_id(&mut self, database: Option<u32>) -> Result<u32> {
         self.allocate_id_from(std::iter::repeat_with(random_id), database)
     }
@@ -537,6 +556,28 @@ mod tests {
         let mut txn = db.begin();
         let (db_id, taken) = txn.resolve_collection("shop", "orders").unwrap();
         assert_eq!(txn.allocate_id_from([taken, 7], Some(db_id)).unwrap(), 7);
+    }
+
+    #[test]
+    fn index_ids_are_counted_per_collection_and_never_reused() {
+        let db = Database::new(MemoryEngine::new());
+        db.create_database("shop").unwrap();
+        db.create_collection("shop", "orders").unwrap();
+        let int = FieldSchema {
+            field_type: FieldType::Int,
+            strict: false,
+        };
+        db.set_field_type("shop", "orders", "n", int).unwrap();
+        let index_ids = || {
+            let (_, entry) = db.begin().collection_entry("shop", "orders").unwrap();
+            entry.indexes.iter().map(|ix| ix.id).collect::<Vec<_>>()
+        };
+        db.create_index("shop", "orders", "n", false).unwrap();
+        assert_eq!(index_ids(), [0]);
+        // Never held an entry, so only the counter keeps 0 from coming back.
+        db.drop_index("shop", "orders", "n").unwrap();
+        db.create_index("shop", "orders", "n", false).unwrap();
+        assert_eq!(index_ids(), [1]);
     }
 
     #[test]

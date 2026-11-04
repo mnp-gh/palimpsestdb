@@ -41,7 +41,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## v0.3: Indexes
 
-- Single-field secondary Indexes, at most one per field path, versioned and maintained in the same Write Set; each has its own never-reused ID as its key prefix
+- Single-field secondary Indexes, at most one per field path, versioned and maintained in the same Write Set; each has an ID, counted per Collection and never reused, in its key prefix
 - Collection Schema declaring a field's Field Type (`int`, `double`, `string`, `date`, `bool`, `objectId`, `binary`) and whether it is a Strict Field ([ADR 0011](./adr/0011-field-types-live-in-collection-schema.md)). Values of other types are left out of the Index; an `int` or `double` Index converts the other kind of number when building its key (the Document is unchanged)
 - Unique Indexes, on Strict Fields only, keyed by value alone so concurrent duplicates become Write Conflicts; missing and null never collide
 - Index builds in the foreground, committing their entries in chunks outside the Write Set and its cap, made visible by one final commit ([ADR 0010](./adr/0010-index-builds-commit-in-chunks.md))

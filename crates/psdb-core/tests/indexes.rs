@@ -610,3 +610,49 @@ fn deleting_the_last_document_lets_a_transaction_create_an_index() {
     })
     .unwrap();
 }
+
+#[test]
+fn orphaned_index_entries_do_not_make_a_collection_look_non_empty() {
+    let db = common::shop();
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, true))
+        .unwrap();
+    for i in 0..3000 {
+        db.insert("shop", "orders", doc! { "_id": i, "n": i % 2500 })
+            .unwrap();
+    }
+    assert!(db.create_index("shop", "orders", "n", true).is_err());
+    db.run(|t| {
+        for i in 0..3000 {
+            t.delete("shop", "orders", &Bson::Int32(i))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    // The failed build's entries share the Collection's range, below its
+    // Documents.
+    assert!(db.find("shop", "orders", &doc! {}).unwrap().is_empty());
+    db.run(|t| t.create_index("shop", "orders", "n", true))
+        .unwrap();
+}
+
+#[test]
+fn a_dropped_index_leaves_nothing_in_a_new_one() {
+    let db = indexed("n", FieldType::Int, true, true);
+    db.insert("shop", "orders", doc! { "_id": 1, "n": 5 })
+        .unwrap();
+    db.drop_index("shop", "orders", "n").unwrap();
+    // Unindexed now, so the dropped Index keeps its stale entry for 5.
+    db.delete("shop", "orders", &Bson::Int32(1)).unwrap();
+    db.create_index("shop", "orders", "n", true).unwrap();
+    db.insert("shop", "orders", doc! { "_id": 2, "n": 5 })
+        .unwrap();
+}
+
+#[test]
+fn making_a_field_strict_reads_only_documents_not_index_entries() {
+    let db = indexed("n", FieldType::Int, false, false);
+    db.insert("shop", "orders", doc! { "n": 1, "m": 2 })
+        .unwrap();
+    db.set_field_type("shop", "orders", "m", field(FieldType::Int, true))
+        .unwrap();
+}
