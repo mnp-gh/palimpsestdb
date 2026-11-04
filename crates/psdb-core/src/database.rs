@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use bson::{Bson, Document};
-use psdb_storage::{KeyRange, StorageEngine};
+use psdb_storage::StorageEngine;
 
 use crate::catalog::CollectionEntry;
 use crate::document::{self, Limits};
@@ -181,7 +181,7 @@ impl<E: StorageEngine> Database<E> {
     /// commit adds the Index to the Catalog. If the build fails, for
     /// example with [`Error::DuplicateValue`], or the Node crashes, the
     /// committed chunks are left behind under an Index ID that is never
-    /// reused, until garbage collection exists.
+    /// reused in the Collection, until garbage collection exists.
     ///
     /// ```
     /// use bson::doc;
@@ -231,7 +231,7 @@ impl<E: StorageEngine> Database<E> {
         let ty = entry.schema[&index.path].field_type;
         let segments = entry.segments(&index.path)?;
         let prefix = keys::collection_prefix(db_id, entry.id);
-        let mut range = KeyRange::prefix(&prefix);
+        let mut range = keys::documents_range(db_id, entry.id);
         loop {
             let mut page = Vec::new();
             let mut page_bytes = 0;
@@ -252,7 +252,7 @@ impl<E: StorageEngine> Database<E> {
                     continue;
                 };
                 let doc_id = &key[prefix.len()..];
-                let entry_key = index::entry_key(db_id, index, &c, doc_id);
+                let entry_key = index::entry_key(db_id, entry.id, index, &c, doc_id);
                 if index.unique
                     && !keys::is_null(&c)
                     && (chunk.contains_key(&entry_key)

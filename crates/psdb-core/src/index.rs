@@ -7,8 +7,9 @@
 //! double under its floor and a `double` Index files an integer as the
 //! nearest double, because filters compare integers and doubles as numbers.
 //!
-//! An Index entry's logical key is `database_id ‖ index_id ‖ component ‖
-//! document_id`, where the component encodes the Document's value in the
+//! An Index entry's logical key is `database_id ‖ collection_id ‖ 0x00 ‖
+//! index_id ‖ component ‖ document_id`, inside its Collection's range but
+//! below every Document, where the component encodes the Document's value in the
 //! indexed field (see [`crate::keys`]). A unique Index leaves the Document
 //! ID out, so two Transactions writing the same value write the same key
 //! and the second to commit gets a Write Conflict; null and missing keep
@@ -42,7 +43,7 @@ pub struct IndexInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexDef {
     pub(crate) path: String,
-    /// Drawn from the same never-reused ID space as Collections (ADR 0006).
+    /// Unique within its Collection and never reused there (ADR 0006).
     pub(crate) id: u32,
     pub(crate) unique: bool,
 }
@@ -88,11 +89,12 @@ pub(crate) fn component_of(
 /// under `component`.
 pub(crate) fn entry_key(
     database_id: u32,
+    collection_id: u32,
     index: &IndexDef,
     component: &[u8],
     doc_id: &[u8],
 ) -> Vec<u8> {
-    let mut key = keys::collection_prefix(database_id, index.id);
+    let mut key = keys::index_prefix(database_id, collection_id, index.id);
     key.extend_from_slice(component);
     if !index.unique || keys::is_null(component) {
         key.extend_from_slice(doc_id);
@@ -151,7 +153,7 @@ pub(crate) fn plan(
             } else {
                 let index = indexes.iter().find(|i| i.path == path)?;
                 let ty = schema.get(&index.path)?.field_type;
-                let base = keys::collection_prefix(database_id, index.id);
+                let base = keys::index_prefix(database_id, collection_id, index.id);
                 Source::Index(bounds(base, ty, op, value)?)
             };
             Some((path, op == CompareOp::Eq, source))

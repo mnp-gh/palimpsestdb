@@ -5,6 +5,7 @@
 //! Commit Timestamp, so the newest Version of a key sorts first.
 
 use bson::Bson;
+use psdb_storage::KeyRange;
 
 use crate::error::{Error, Result};
 
@@ -20,6 +21,11 @@ const DATABASES_COLLECTION: u32 = 1;
 const COLLECTIONS_COLLECTION: u32 = 2;
 const DATABASE_IDS_COLLECTION: u32 = 3;
 const COLLECTION_IDS_COLLECTION: u32 = 4;
+
+/// The component that starts every Index entry key in a Collection. It
+/// sorts below every Document ID tag, so a Collection's Index entries and
+/// its Documents never share a range.
+const INDEX_ENTRIES: u8 = 0x00;
 
 /// The largest encoded Document ID accepted, in bytes.
 pub const MAX_ID_BYTES: usize = 1024;
@@ -44,6 +50,25 @@ pub(crate) fn collection_prefix(database_id: u32, collection_id: u32) -> Vec<u8>
     let mut key = Vec::with_capacity(8);
     key.extend_from_slice(&database_id.to_be_bytes());
     key.extend_from_slice(&collection_id.to_be_bytes());
+    key
+}
+
+/// Every Document of a Collection, without its Index entries.
+pub(crate) fn documents_range(database_id: u32, collection_id: u32) -> KeyRange {
+    let prefix = collection_prefix(database_id, collection_id);
+    let all = KeyRange::prefix(&prefix);
+    let start = [prefix.as_slice(), &[INDEX_ENTRIES + 1]].concat();
+    KeyRange::new(
+        start,
+        all.end.expect("a Collection prefix has an upper bound"),
+    )
+}
+
+/// The key prefix shared by every entry of one Index.
+pub(crate) fn index_prefix(database_id: u32, collection_id: u32, index_id: u32) -> Vec<u8> {
+    let mut key = collection_prefix(database_id, collection_id);
+    key.push(INDEX_ENTRIES);
+    key.extend_from_slice(&index_id.to_be_bytes());
     key
 }
 

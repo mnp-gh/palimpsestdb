@@ -101,30 +101,25 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         Ok(())
     }
 
-    /// Whether any live value exists under `prefix`, in the Snapshot with own
+    /// Whether any live value exists in `range`, in the Snapshot with own
     /// writes overlaid. Stops at the first one.
-    pub(crate) fn any_live_under(&self, prefix: &[u8]) -> Result<bool> {
+    pub(crate) fn any_live_in(&self, range: &KeyRange) -> Result<bool> {
         let own = self
             .write_set
-            .range(prefix.to_vec()..)
-            .take_while(|(k, _)| k.starts_with(prefix));
+            .range(range.start.clone()..)
+            .take_while(|(k, _)| range.contains(k));
         if own.clone().any(|(_, v)| v.is_some()) {
             return Ok(true);
         }
         let mut found = false;
-        mvcc::scan_range_at(
-            &self.db.engine,
-            &KeyRange::prefix(prefix),
-            self.snapshot_ts,
-            &mut |key, _| {
-                // Skip a value this Transaction deleted.
-                if self.write_set.get(key) == Some(&None) {
-                    return ControlFlow::Continue(());
-                }
-                found = true;
-                ControlFlow::Break(())
-            },
-        )?;
+        mvcc::scan_range_at(&self.db.engine, range, self.snapshot_ts, &mut |key, _| {
+            // Skip a value this Transaction deleted.
+            if self.write_set.get(key) == Some(&None) {
+                return ControlFlow::Continue(());
+            }
+            found = true;
+            ControlFlow::Break(())
+        })?;
         Ok(found)
     }
 
@@ -246,10 +241,10 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
                 continue;
             }
             if let Some(c) = before {
-                writes.push((index::entry_key(db_id, ix, &c, doc_id), None));
+                writes.push((index::entry_key(db_id, entry.id, ix, &c, doc_id), None));
             }
             if let Some(c) = after {
-                let entry_key = index::entry_key(db_id, ix, &c, doc_id);
+                let entry_key = index::entry_key(db_id, entry.id, ix, &c, doc_id);
                 if ix.unique
                     && !keys::is_null(&c)
                     && let Some(owner) = self.read(&entry_key)?
@@ -283,7 +278,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         let prefix = keys::collection_prefix(db_id, entry.id);
         let candidates = match index::plan(&filter, db_id, entry.id, &entry.schema, &entry.indexes)
         {
-            None => self.scan(&prefix)?,
+            None => self.scan_range(&keys::documents_range(db_id, entry.id))?,
             Some(sources) => {
                 // Keyed by Document key, so a Document found through several
                 // ranges is read once, and results stay in Document ID order.
