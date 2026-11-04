@@ -1,5 +1,11 @@
-//! Indexes: Index Types, Strict Fields, Index entry keys, and choosing an
-//! Index or a range of `_id`s for a filter (ADR 0010, ADR 0011).
+//! Indexes: Index entry keys, and choosing an Index or a range of `_id`s
+//! for a filter (ADR 0010, ADR 0011).
+//!
+//! An Index has no type of its own: it covers values of its field's Field
+//! Type, read from the Collection Schema (see [`crate::schema`]). Values of
+//! other types are left out of it, except that an `int` Index files a
+//! double under its floor and a `double` Index files an integer as the
+//! nearest double, because filters compare integers and doubles as numbers.
 //!
 //! An Index entry's logical key is `database_id ‖ index_id ‖ component ‖
 //! document_id`, where the component encodes the Document's value in the
@@ -15,116 +21,13 @@
 //! the whole filter, which also makes coerced keys safe: an `int` Index
 //! files `30.5` under `30`, and range scans include their bounds.
 
-use std::collections::BTreeMap;
-use std::fmt;
-use std::str::FromStr;
-
 use bson::{Bson, RawDocument};
 use psdb_storage::KeyRange;
 
-use crate::error::{Error, Result};
-use crate::filter::{CompareOp, Filter, TWO_63, lookup_raw};
+use crate::error::Result;
+use crate::filter::{CompareOp, Filter, lookup_raw};
 use crate::keys;
-
-/// The kind of value an Index covers, declared per field in the Collection
-/// Schema.
-///
-/// Values of other types are left out of the Index. The two number types
-/// coerce the other kind of number into the key instead, because filters
-/// compare integers and doubles as numbers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexType {
-    /// Integers; doubles are filed under their floor.
-    Int,
-    /// Doubles; integers are filed as the nearest double.
-    Double,
-    /// Strings.
-    String,
-    /// BSON dates.
-    Date,
-    /// Booleans.
-    Bool,
-    /// ObjectIds.
-    ObjectId,
-    /// Binary values. Filters only test binary for equality, so the Index
-    /// only answers equality.
-    Binary,
-}
-
-impl IndexType {
-    /// Every Index Type, in the order of [`IndexType::name`]'s list.
-    pub const ALL: [IndexType; 7] = [
-        IndexType::Int,
-        IndexType::Double,
-        IndexType::String,
-        IndexType::Date,
-        IndexType::Bool,
-        IndexType::ObjectId,
-        IndexType::Binary,
-    ];
-
-    /// The name used in the Catalog and by clients: `int`, `double`,
-    /// `string`, `date`, `bool`, `objectId` or `binary`.
-    pub fn name(self) -> &'static str {
-        match self {
-            IndexType::Int => "int",
-            IndexType::Double => "double",
-            IndexType::String => "string",
-            IndexType::Date => "date",
-            IndexType::Bool => "bool",
-            IndexType::ObjectId => "objectId",
-            IndexType::Binary => "binary",
-        }
-    }
-
-    /// Whether a filter value can be compared with values of this type, so
-    /// an Index of this type can narrow a comparison against it.
-    fn compares_with(self, value: &Bson) -> bool {
-        matches!(
-            (self, value),
-            (
-                IndexType::Int | IndexType::Double,
-                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)
-            ) | (IndexType::String, Bson::String(_))
-                | (IndexType::Date, Bson::DateTime(_))
-                | (IndexType::Bool, Bson::Boolean(_))
-                | (IndexType::ObjectId, Bson::ObjectId(_))
-                | (IndexType::Binary, Bson::Binary(_))
-        )
-    }
-}
-
-impl fmt::Display for IndexType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-impl FromStr for IndexType {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        IndexType::ALL
-            .into_iter()
-            .find(|t| t.name() == s)
-            .ok_or_else(|| {
-                Error::InvalidSchema(format!(
-                    "unknown Index Type {s:?}; use int, double, string, date, bool, objectId or binary"
-                ))
-            })
-    }
-}
-
-/// A field's declaration in a Collection Schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FieldType {
-    /// The Index Type of the field.
-    pub index_type: IndexType,
-    /// Whether this is a Strict Field: writes giving it a value of another
-    /// type fail with [`Error::TypeMismatch`]. Missing and null are always
-    /// allowed.
-    pub strict: bool,
-}
+use crate::schema::{FieldType, Schema};
 
 /// An Index as clients see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,53 +47,26 @@ pub(crate) struct IndexDef {
     pub(crate) unique: bool,
 }
 
-/// A Collection Schema: field path → its declaration.
-pub(crate) type Schema = BTreeMap<String, FieldType>;
-
-/// Split and check a field path for the Collection Schema: non-empty
-/// segments, none starting with `$`, and not `_id`, which is already the
-/// key of every Document.
-pub(crate) fn split_path(path: &str) -> Result<Vec<String>> {
-    let segments = segments(path);
-    if segments.iter().any(|s| s.is_empty() || s.starts_with('$')) {
-        return Err(Error::InvalidSchema(format!(
-            "{path:?} is not a field path"
-        )));
-    }
-    if segments[0] == "_id" {
-        return Err(Error::InvalidSchema(
-            "_id cannot be declared or indexed; Documents are already keyed by it".into(),
-        ));
-    }
-    Ok(segments)
-}
-
-/// A declared path's segments, without checking them: the Catalog only
-/// holds paths that passed [`split_path`].
-pub(crate) fn segments(path: &str) -> Vec<String> {
-    path.split('.').map(str::to_owned).collect()
-}
-
 /// The Index key component for `value` (`None` when the field is missing),
 /// or `None` if the value is left out of an Index of type `ty`.
-pub(crate) fn component(value: Option<&Bson>, ty: IndexType) -> Option<Vec<u8>> {
+pub(crate) fn component(value: Option<&Bson>, ty: FieldType) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match (value, ty) {
         (None | Some(Bson::Null), _) => keys::push_null(&mut out),
         (Some(Bson::Double(f)), _) if f.is_nan() => return None,
-        (Some(Bson::Int32(n)), IndexType::Int) => keys::push_integer(&mut out, i64::from(*n)),
-        (Some(Bson::Int64(n)), IndexType::Int) => keys::push_integer(&mut out, *n),
+        (Some(Bson::Int32(n)), FieldType::Int) => keys::push_integer(&mut out, i64::from(*n)),
+        (Some(Bson::Int64(n)), FieldType::Int) => keys::push_integer(&mut out, *n),
         // Saturates beyond the i64 range; floor keeps the order.
-        (Some(Bson::Double(f)), IndexType::Int) => keys::push_integer(&mut out, f.floor() as i64),
-        (Some(Bson::Int32(n)), IndexType::Double) => keys::push_double(&mut out, f64::from(*n)),
+        (Some(Bson::Double(f)), FieldType::Int) => keys::push_integer(&mut out, f.floor() as i64),
+        (Some(Bson::Int32(n)), FieldType::Double) => keys::push_double(&mut out, f64::from(*n)),
         // Rounds to the nearest double, which keeps the order.
-        (Some(Bson::Int64(n)), IndexType::Double) => keys::push_double(&mut out, *n as f64),
-        (Some(Bson::Double(f)), IndexType::Double) => keys::push_double(&mut out, *f),
-        (Some(v @ Bson::String(_)), IndexType::String)
-        | (Some(v @ Bson::DateTime(_)), IndexType::Date)
-        | (Some(v @ Bson::Boolean(_)), IndexType::Bool)
-        | (Some(v @ Bson::ObjectId(_)), IndexType::ObjectId)
-        | (Some(v @ Bson::Binary(_)), IndexType::Binary) => {
+        (Some(Bson::Int64(n)), FieldType::Double) => keys::push_double(&mut out, *n as f64),
+        (Some(Bson::Double(f)), FieldType::Double) => keys::push_double(&mut out, *f),
+        (Some(v @ Bson::String(_)), FieldType::String)
+        | (Some(v @ Bson::DateTime(_)), FieldType::Date)
+        | (Some(v @ Bson::Boolean(_)), FieldType::Bool)
+        | (Some(v @ Bson::ObjectId(_)), FieldType::ObjectId)
+        | (Some(v @ Bson::Binary(_)), FieldType::Binary) => {
             keys::encode_id(v, &mut out).expect("every Document ID type encodes")
         }
         _ => return None,
@@ -203,43 +79,9 @@ pub(crate) fn component(value: Option<&Bson>, ty: IndexType) -> Option<Vec<u8>> 
 pub(crate) fn component_of(
     doc: &RawDocument,
     segments: &[String],
-    ty: IndexType,
+    ty: FieldType,
 ) -> Result<Option<Vec<u8>>> {
     Ok(component(lookup_raw(doc, segments)?.as_ref(), ty))
-}
-
-/// Fail with [`Error::TypeMismatch`] unless the value at `path` (split into
-/// `segments`) is missing, null, or converts exactly to the field's Index
-/// Type.
-pub(crate) fn check_field(
-    doc: &RawDocument,
-    path: &str,
-    segments: &[String],
-    field: FieldType,
-) -> Result<()> {
-    match lookup_raw(doc, segments)? {
-        None | Some(Bson::Null) => Ok(()),
-        Some(v) if fits_exactly(&v, field.index_type) => Ok(()),
-        Some(v) => Err(Error::TypeMismatch(format!(
-            "{path} is a strict {} field, but this document has {v}",
-            field.index_type
-        ))),
-    }
-}
-
-/// Whether `value` belongs in a Strict Field of type `ty` without losing
-/// anything: an `int` accepts `30.0` (which JavaScript sends for `30`) but
-/// not `30.5`; a `double` accepts integers up to 2⁵³ but not NaN.
-fn fits_exactly(value: &Bson, ty: IndexType) -> bool {
-    const TWO_53: u64 = 1 << 53;
-    match (value, ty) {
-        (Bson::Int32(_) | Bson::Int64(_), IndexType::Int) => true,
-        (Bson::Double(f), IndexType::Int) => f.fract() == 0.0 && *f >= -TWO_63 && *f < TWO_63,
-        (Bson::Int32(_), IndexType::Double) => true,
-        (Bson::Int64(n), IndexType::Double) => n.unsigned_abs() <= TWO_53,
-        (Bson::Double(f), IndexType::Double) => !f.is_nan(),
-        (v, ty) => component(Some(v), ty).is_some(),
-    }
 }
 
 /// The logical key of the entry for the Document with encoded ID `doc_id`
@@ -308,7 +150,7 @@ pub(crate) fn plan(
                 Source::Documents(bounds(base, id_type(value)?, op, value)?)
             } else {
                 let index = indexes.iter().find(|i| i.path == path)?;
-                let ty = schema.get(&index.path)?.index_type;
+                let ty = schema.get(&index.path)?.field_type;
                 let base = keys::collection_prefix(database_id, index.id);
                 Source::Index(bounds(base, ty, op, value)?)
             };
@@ -346,18 +188,18 @@ pub(crate) fn plan(
     Some(vec![source])
 }
 
-/// The Index Type whose keys sort `_id` values the way filters compare them
+/// The Field Type whose Index keys sort `_id` values the way filters compare them
 /// with `value`. Document IDs are encoded as Index keys are, integers as in
 /// an `int` Index; `_id` is never a double, so a double filter value works
 /// as it does against an `int` Index.
-fn id_type(value: &Bson) -> Option<IndexType> {
+fn id_type(value: &Bson) -> Option<FieldType> {
     match value {
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => Some(IndexType::Int),
-        Bson::String(_) => Some(IndexType::String),
-        Bson::DateTime(_) => Some(IndexType::Date),
-        Bson::Boolean(_) => Some(IndexType::Bool),
-        Bson::ObjectId(_) => Some(IndexType::ObjectId),
-        Bson::Binary(_) => Some(IndexType::Binary),
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => Some(FieldType::Int),
+        Bson::String(_) => Some(FieldType::String),
+        Bson::DateTime(_) => Some(FieldType::Date),
+        Bson::Boolean(_) => Some(FieldType::Bool),
+        Bson::ObjectId(_) => Some(FieldType::ObjectId),
+        Bson::Binary(_) => Some(FieldType::Binary),
         _ => None,
     }
 }
@@ -382,7 +224,7 @@ fn collect_conjuncts<'f>(
 /// that can hold a value satisfying `op value`. Bounds are inclusive even
 /// for `$gt` and `$lt`, because coercion files different values under one
 /// key; the recheck drops the extras.
-fn bounds(base: Vec<u8>, ty: IndexType, op: CompareOp, value: &Bson) -> Option<KeyRange> {
+fn bounds(base: Vec<u8>, ty: FieldType, op: CompareOp, value: &Bson) -> Option<KeyRange> {
     let comp = match value {
         // `{f: null}` matches null and missing, which share one component.
         Bson::Null if op == CompareOp::Eq => component(None, ty)?,
@@ -397,7 +239,7 @@ fn bounds(base: Vec<u8>, ty: IndexType, op: CompareOp, value: &Bson) -> Option<K
     match op {
         CompareOp::Eq => Some(exact),
         CompareOp::Ne => None,
-        _ if ty == IndexType::Binary || value == &Bson::Null => None,
+        _ if ty == FieldType::Binary || value == &Bson::Null => None,
         CompareOp::Gt | CompareOp::Gte => Some(KeyRange::new(exact.start, end(whole_type))),
         CompareOp::Lt | CompareOp::Lte => Some(KeyRange::new(whole_type.start, end(exact))),
     }
@@ -408,12 +250,13 @@ mod tests {
     use bson::doc;
 
     use super::*;
+    use crate::schema::FieldSchema;
 
-    fn schema(path: &str, index_type: IndexType) -> Schema {
+    fn schema(path: &str, field_type: FieldType) -> Schema {
         Schema::from([(
             path.to_owned(),
-            FieldType {
-                index_type,
+            FieldSchema {
+                field_type,
                 strict: false,
             },
         )])
@@ -440,13 +283,13 @@ mod tests {
         r
     }
 
-    fn comp(v: Bson, ty: IndexType) -> Vec<u8> {
+    fn comp(v: Bson, ty: FieldType) -> Vec<u8> {
         component(Some(&v), ty).unwrap()
     }
 
     #[test]
     fn number_indexes_coerce_the_other_kind() {
-        use IndexType::*;
+        use FieldType::*;
         assert_eq!(comp(Bson::Double(30.5), Int), comp(Bson::Int32(30), Int));
         assert_eq!(
             comp(Bson::Double(-0.5), Int),
@@ -473,33 +316,19 @@ mod tests {
     }
 
     #[test]
-    fn strict_fields_accept_only_exact_values() {
-        use IndexType::*;
-        assert!(fits_exactly(&Bson::Double(30.0), Int));
-        assert!(!fits_exactly(&Bson::Double(30.5), Int));
-        assert!(!fits_exactly(&Bson::Double(1e300), Int));
-        assert!(fits_exactly(&Bson::Int64(1 << 53), Double));
-        assert!(!fits_exactly(&Bson::Int64((1 << 53) + 1), Double));
-        assert!(!fits_exactly(&Bson::Double(f64::NAN), Double));
-        assert!(fits_exactly(&Bson::Double(f64::INFINITY), Double));
-        assert!(!fits_exactly(&Bson::String("x".into()), Int));
-        assert!(fits_exactly(&Bson::String("x".into()), String));
-    }
-
-    #[test]
     fn plan_prefers_equality_and_narrows_ranges() {
         let s = Schema::from([
             (
                 "age".to_owned(),
-                FieldType {
-                    index_type: IndexType::Int,
+                FieldSchema {
+                    field_type: FieldType::Int,
                     strict: false,
                 },
             ),
             (
                 "status".to_owned(),
-                FieldType {
-                    index_type: IndexType::String,
+                FieldSchema {
+                    field_type: FieldType::String,
                     strict: false,
                 },
             ),
@@ -523,7 +352,7 @@ mod tests {
 
     #[test]
     fn plan_falls_back_to_a_scan() {
-        let s = schema("age", IndexType::Int);
+        let s = schema("age", FieldType::Int);
         let ix = [index("age", 7)];
         for filter in [
             doc! { "age": { "$ne": 3 } },
@@ -547,15 +376,15 @@ mod tests {
         let s = Schema::from([
             (
                 "age".to_owned(),
-                FieldType {
-                    index_type: IndexType::Int,
+                FieldSchema {
+                    field_type: FieldType::Int,
                     strict: false,
                 },
             ),
             (
                 "status".to_owned(),
-                FieldType {
-                    index_type: IndexType::String,
+                FieldSchema {
+                    field_type: FieldType::String,
                     strict: false,
                 },
             ),
@@ -600,7 +429,7 @@ mod tests {
 
     #[test]
     fn id_comparisons_read_documents_directly() {
-        let s = schema("age", IndexType::Int);
+        let s = schema("age", FieldType::Int);
         let ix = [index("age", 7)];
         let docs = |filter| match planned(filter, &s, &ix).as_deref() {
             Some([Source::Documents(r)]) => Some(r.clone()),
@@ -632,7 +461,7 @@ mod tests {
 
     #[test]
     fn binary_indexes_answer_equality_only() {
-        let s = schema("b", IndexType::Binary);
+        let s = schema("b", FieldType::Binary);
         let ix = [index("b", 7)];
         let bin = Bson::Binary(bson::Binary {
             subtype: bson::spec::BinarySubtype::Generic,
@@ -640,16 +469,5 @@ mod tests {
         });
         assert!(planned(doc! { "b": bin.clone() }, &s, &ix).is_some());
         assert_eq!(planned(doc! { "b": { "$gt": bin } }, &s, &ix), None);
-    }
-
-    #[test]
-    fn paths() {
-        assert_eq!(split_path("a.b").unwrap(), ["a", "b"]);
-        for bad in ["", "a..b", "$a", "a.$b", "_id", "_id.x"] {
-            assert!(
-                matches!(split_path(bad), Err(Error::InvalidSchema(_))),
-                "{bad:?}"
-            );
-        }
     }
 }

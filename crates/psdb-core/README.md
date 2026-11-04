@@ -22,7 +22,8 @@ txn.commit()?;
 | `database` | `Database`: begin Transactions, autocommit helpers |
 | `transaction` | Snapshot reads, Write Set, commit-time conflict checks |
 | `catalog` | Databases, Collections, Collection Schemas and Indexes as versioned Catalog entries |
-| `index` | Index Types, Strict Fields, Index entry keys, choosing an Index or `_id` range for a filter |
+| `schema` | The Collection Schema: Field Types and Strict Fields |
+| `index` | Index entry keys, choosing an Index or `_id` range for a filter |
 | `mvcc` | Which Version of a key a Snapshot sees |
 | `keys` | Order-preserving key encoding |
 | `document` | Limits, Document IDs, name rules |

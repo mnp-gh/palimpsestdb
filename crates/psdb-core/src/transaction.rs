@@ -234,7 +234,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         let mut writes = Vec::new();
         for ix in &entry.indexes {
             let segments = entry.segments(&ix.path)?;
-            let ty = entry.schema[&ix.path].index_type;
+            let ty = entry.schema[&ix.path].field_type;
             let component = |doc: Option<&bson::RawDocument>| match doc {
                 Some(doc) => index::component_of(doc, segments, ty),
                 None => Ok(None),

@@ -42,7 +42,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.3: Indexes
 
 - Single-field secondary Indexes, at most one per field path, versioned and maintained in the same Write Set; each has its own never-reused ID as its key prefix
-- Collection Schema declaring each indexed field's Index Type (`int`, `double`, `string`, `date`, `bool`, `objectId`, `binary`) and whether it is a Strict Field ([ADR 0011](./adr/0011-index-types-live-in-collection-schema.md)). Values of other types are left out of the Index; `int` and `double` coerce the other kind of number into the key
+- Collection Schema declaring a field's Field Type (`int`, `double`, `string`, `date`, `bool`, `objectId`, `binary`) and whether it is a Strict Field ([ADR 0011](./adr/0011-field-types-live-in-collection-schema.md)). Values of other types are left out of the Index; an `int` or `double` Index converts the other kind of number when building its key (the Document is unchanged)
 - Unique Indexes, on Strict Fields only, keyed by value alone so concurrent duplicates become Write Conflicts; missing and null never collide
 - Index builds in the foreground, committing their entries in chunks outside the Write Set and its cap, made visible by one final commit ([ADR 0010](./adr/0010-index-builds-commit-in-chunks.md))
 - Index-backed filters: an equality or range comparison at the top level or in `$and`, whose value is in the Index's type, or an `$or` whose every branch can use an Index (the union of their ranges); equality first, then `$or`, then range; the full filter is always rechecked
@@ -101,7 +101,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Query planner statistics (sampled per-path counts and histograms) and a cost model for choosing between Indexes
 - Index hints: the client names the Index a query should use
 - Sparse Indexes, as an opt-in: leave out Documents whose field is null or missing, so an Index on a rarely set field stays small; `{field: null}` then scans the whole Collection. Indexes keep null and missing by default
-- A `decimal128` Index Type, with exact decimal comparison against integers and doubles in filters (today Decimal128 compares only for equality)
+- A `decimal128` Field Type, with exact decimal comparison against integers and doubles in filters (today Decimal128 compares only for equality)
 - Range comparisons on binary values: filters only test binary for equality, so a `binary` Index answers equality only. Decide an order first (MongoDB: length, subtype, bytes; our key encoding: subtype, bytes)
 
 ## v2.x: Distribution

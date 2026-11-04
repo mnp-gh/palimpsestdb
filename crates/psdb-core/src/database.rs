@@ -11,9 +11,10 @@ use psdb_storage::{KeyRange, StorageEngine};
 use crate::catalog::CollectionEntry;
 use crate::document::{self, Limits};
 use crate::error::{Error, Result};
-use crate::index::{self, FieldType, IndexDef, IndexInfo};
+use crate::index::{self, IndexDef, IndexInfo};
 use crate::keys;
 use crate::mvcc;
+use crate::schema::FieldSchema;
 use crate::transaction::{self, Transaction, WriteSet};
 use crate::wal::{self, OsWalFile, Wal, WalFile};
 
@@ -184,14 +185,14 @@ impl<E: StorageEngine> Database<E> {
     ///
     /// ```
     /// use bson::doc;
-    /// use psdb_core::{Database, FieldType, IndexType};
+    /// use psdb_core::{Database, FieldSchema, FieldType};
     /// use psdb_storage_memory::MemoryEngine;
     ///
     /// let db = Database::new(MemoryEngine::new());
     /// db.create_database("shop")?;
     /// db.create_collection("shop", "orders")?;
     /// db.insert("shop", "orders", doc! { "total": 30 })?;
-    /// let total = FieldType { index_type: IndexType::Int, strict: false };
+    /// let total = FieldSchema { field_type: FieldType::Int, strict: false };
     /// db.set_field_type("shop", "orders", "total", total)?;
     /// db.create_index("shop", "orders", "total", false)?;
     /// assert_eq!(db.find("shop", "orders", &doc! { "total": { "$gt": 10 } })?.len(), 1);
@@ -227,7 +228,7 @@ impl<E: StorageEngine> Database<E> {
         index: &IndexDef,
         snapshot_ts: u64,
     ) -> Result<()> {
-        let ty = entry.schema[&index.path].index_type;
+        let ty = entry.schema[&index.path].field_type;
         let segments = entry.segments(&index.path)?;
         let prefix = keys::collection_prefix(db_id, entry.id);
         let mut range = KeyRange::prefix(&prefix);
@@ -353,7 +354,7 @@ impl<E: StorageEngine> Database<E> {
         database: &str,
         collection: &str,
         path: &str,
-        field: FieldType,
+        field: FieldSchema,
     ) -> Result<()> {
         self.run(|t| t.set_field_type(database, collection, path, field))
     }
@@ -368,7 +369,7 @@ impl<E: StorageEngine> Database<E> {
         &self,
         database: &str,
         collection: &str,
-    ) -> Result<BTreeMap<String, FieldType>> {
+    ) -> Result<BTreeMap<String, FieldSchema>> {
         self.run(|t| t.collection_schema(database, collection))
     }
 
