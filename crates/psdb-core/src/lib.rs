@@ -21,6 +21,7 @@ mod filter;
 mod index;
 mod keys;
 mod mvcc;
+mod schema;
 mod transaction;
 pub mod wal;
 
@@ -28,6 +29,7 @@ pub use database::Database;
 pub use document::{Limits, MAX_NAME_BYTES};
 pub use error::{Error, Result};
 pub use filter::{CompareOp, Filter};
-pub use index::{FieldType, IndexInfo, IndexType};
+pub use index::IndexInfo;
 pub use keys::MAX_ID_BYTES;
+pub use schema::{FieldSchema, FieldType};
 pub use transaction::Transaction;

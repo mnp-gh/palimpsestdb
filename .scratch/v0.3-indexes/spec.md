@@ -2,7 +2,7 @@
 
 Status: ready-for-human (implemented on `v0.3-indexes`)
 
-Single-field secondary Indexes, typed by a Collection Schema, kept consistent with their Documents at every Snapshot, and used by `find` when they fit the filter. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0010](../../docs/adr/0010-index-builds-commit-in-chunks.md) and [ADR 0011](../../docs/adr/0011-index-types-live-in-collection-schema.md).
+Single-field secondary Indexes, typed by a Collection Schema, kept consistent with their Documents at every Snapshot, and used by `find` when they fit the filter. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0010](../../docs/adr/0010-index-builds-commit-in-chunks.md) and [ADR 0011](../../docs/adr/0011-field-types-live-in-collection-schema.md).
 
 ## Out of scope
 
@@ -15,7 +15,7 @@ Single-field secondary Indexes, typed by a Collection Schema, kept consistent wi
 ## Collection Schema
 
 - Lives in the Collection's Catalog entry as `fields: [{ path, type, strict }]`. Entries written before v0.3 read as having none.
-- Index Types: `int`, `double`, `string`, `date`, `bool`, `objectId`, `binary`.
+- Field Types: `int`, `double`, `string`, `date`, `bool`, `objectId`, `binary`.
 - Paths are dotted, with non-empty segments, none starting with `$`, and not `_id`.
 - A Strict Field rejects a write whose value does not convert exactly to its type with Type Mismatch; missing and null are allowed. A strict `int` accepts `30.0` and rejects `30.5`; a strict `double` rejects NaN and integers beyond 2⁵³.
 - Making a field strict reads every Document and fails with Type Mismatch if any breaks the rule. A Document committed concurrently makes the change abort with Collection Changed.

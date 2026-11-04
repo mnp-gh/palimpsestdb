@@ -9,7 +9,7 @@ use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 
 use bson::{Binary, Bson, Document, spec::BinarySubtype};
-use psdb_core::{Database, FieldType, IndexType, Transaction};
+use psdb_core::{Database, FieldSchema, FieldType, Transaction};
 use psdb_storage_memory::MemoryEngine;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -267,18 +267,18 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
             let (d, c) = namespace(rest)?;
             for (path, field) in with_txn(db, txn, |t| t.collection_schema(d, c))? {
                 let strict = if field.strict { " strict" } else { "" };
-                println!("{path}: {}{strict}", field.index_type);
+                println!("{path}: {}{strict}", field.field_type);
             }
         }
         "set-type" => {
             let (ns, args) = split_namespace(rest)?;
-            let (path, index_type, strict) = match words(args)[..] {
+            let (path, field_type, strict) = match words(args)[..] {
                 [path, ty] => (path, ty, false),
                 [path, ty, "strict"] => (path, ty, true),
                 _ => return Err("usage: set-type <db>.<coll> <path> <type> [strict]".into()),
             };
-            let index_type: IndexType = index_type.parse().map_err(message)?;
-            let field = FieldType { index_type, strict };
+            let field_type: FieldType = field_type.parse().map_err(message)?;
+            let field = FieldSchema { field_type, strict };
             with_txn(db, txn, |t| t.set_field_type(ns.0, ns.1, path, field))?;
         }
         "unset-type" => {

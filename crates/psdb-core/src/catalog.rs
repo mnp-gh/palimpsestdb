@@ -28,9 +28,10 @@ use psdb_storage::StorageEngine;
 
 use crate::document::{self, validate_name};
 use crate::error::{Error, Result};
-use crate::index::{self, FieldType, IndexDef, IndexInfo, IndexType, Schema};
+use crate::index::{IndexDef, IndexInfo};
 use crate::keys;
 use crate::mvcc;
+use crate::schema::{self, FieldSchema, FieldType, Schema};
 use crate::transaction::Transaction;
 
 /// A Collection's Catalog entry.
@@ -62,15 +63,15 @@ impl CollectionEntry {
         let mut schema = Schema::new();
         for field in list("fields")? {
             let path = field.get_str("path").map_err(|_| corrupt("field path"))?;
-            let index_type = field
+            let field_type = field
                 .get_str("type")
                 .ok()
-                .and_then(|t| t.parse::<IndexType>().ok())
+                .and_then(|t| t.parse::<FieldType>().ok())
                 .ok_or_else(|| corrupt("field type"))?;
             let strict = field
                 .get_bool("strict")
                 .map_err(|_| corrupt("field strict"))?;
-            schema.insert(path.to_owned(), FieldType { index_type, strict });
+            schema.insert(path.to_owned(), FieldSchema { field_type, strict });
         }
         let indexes = list("indexes")?
             .iter()
@@ -87,7 +88,7 @@ impl CollectionEntry {
             .collect::<Result<_>>()?;
         let segments = schema
             .keys()
-            .map(|path| (path.clone(), index::segments(path)))
+            .map(|path| (path.clone(), schema::segments(path)))
             .collect();
         Ok(Self {
             name: doc.get_str("name").map_err(|_| corrupt("name"))?.to_owned(),
@@ -109,7 +110,7 @@ impl CollectionEntry {
     /// Fail with [`Error::TypeMismatch`] if `doc` breaks any Strict Field.
     pub(crate) fn check_strict(&self, doc: &bson::RawDocument) -> Result<()> {
         for (path, field) in self.schema.iter().filter(|(_, f)| f.strict) {
-            index::check_field(doc, path, self.segments(path)?, *field)?;
+            schema::check_field(doc, path, self.segments(path)?, *field)?;
         }
         Ok(())
     }
@@ -120,7 +121,7 @@ impl CollectionEntry {
             .iter()
             .map(|(path, f)| {
                 Bson::Document(
-                    doc! { "path": path, "type": f.index_type.name(), "strict": f.strict },
+                    doc! { "path": path, "type": f.field_type.name(), "strict": f.strict },
                 )
             })
             .collect();
@@ -255,7 +256,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         )
     }
 
-    /// Declare a field's Index Type in the Collection Schema, or change its
+    /// Declare a field's Field Type in the Collection Schema, or change its
     /// declaration.
     ///
     /// While an Index on the field exists, its type cannot change, and a
@@ -267,13 +268,13 @@ impl<E: StorageEngine> Transaction<'_, E> {
         database: &str,
         collection: &str,
         path: &str,
-        field: FieldType,
+        field: FieldSchema,
     ) -> Result<()> {
-        let segments = index::split_path(path)?;
+        let segments = schema::split_path(path)?;
         let (db_id, mut entry) = self.collection_entry(database, collection)?;
         let old = entry.schema.get(path).copied();
         if let (Some(ix), Some(old)) = (entry.index_on(path), old) {
-            if old.index_type != field.index_type {
+            if old.field_type != field.field_type {
                 return Err(Error::InvalidSchema(format!(
                     "{path} has an index; drop it before changing the field's type"
                 )));
@@ -284,11 +285,11 @@ impl<E: StorageEngine> Transaction<'_, E> {
                 )));
             }
         }
-        let already_enforced = old.is_some_and(|o| o.strict && o.index_type == field.index_type);
+        let already_enforced = old.is_some_and(|o| o.strict && o.field_type == field.field_type);
         if field.strict && !already_enforced {
             let prefix = keys::collection_prefix(db_id, entry.id);
             for bytes in self.scan(&prefix)?.values() {
-                index::check_field(document::raw(bytes)?, path, &segments, field)?;
+                schema::check_field(document::raw(bytes)?, path, &segments, field)?;
             }
             // A Document committed concurrently was not checked.
             self.collection_reads.insert(prefix);
@@ -322,7 +323,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         &mut self,
         database: &str,
         collection: &str,
-    ) -> Result<BTreeMap<String, FieldType>> {
+    ) -> Result<BTreeMap<String, FieldSchema>> {
         Ok(self.collection_entry(database, collection)?.1.schema)
     }
 

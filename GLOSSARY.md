@@ -25,19 +25,19 @@ The authoritative record of which Databases and Collections exist and how their 
 _Avoid_: Metadata store, schema registry
 
 **Index**:
-A secondary lookup over one field of a Collection's Documents, declared for one Index Type, consistent with those Documents at every Snapshot. A unique Index also forbids two Documents from sharing a value in that field.
+A secondary lookup over one field of a Collection's Documents, covering values of its field's Field Type, consistent with those Documents at every Snapshot. A unique Index also forbids two Documents from sharing a value in that field.
 _Avoid_: Secondary key, lookup table
 
 **Collection Schema**:
-The optional declarations a Collection makes about its fields; for now, each field's Index Type and whether it is a Strict Field. A Collection without one is schemaless, and Documents are never changed to fit it.
+The optional declarations a Collection makes about its fields; for now, each field's Field Type and whether it is a Strict Field. Collections are schemaless, so it exists mainly to give Indexes their types: an Index reads its field's type from it, and it knows nothing about Indexes. A Collection without one accepts any Document, and Documents are never changed to fit it.
 _Avoid_: Index schema, validator
 
-**Index Type**:
-The kind of value an Index covers, declared for its field in the Collection Schema rather than on the Index. Whether a Document is in the Index follows each of its Versions: while its field holds another kind of value it is left out, and a later write giving the field a value of the Index Type brings it in (and back out again if the type changes away). The Document itself is never changed.
-_Avoid_: Schema, column type
+**Field Type**:
+The kind of value a field holds, declared in the Collection Schema. An Index has no type of its own: it covers values of its field's Field Type. Whether a Document is in the Index follows each of its Versions: while its field holds another kind of value it is left out, and a later write giving the field a value of the Field Type brings it in (and back out again if the type changes away). The Document itself is never changed.
+_Avoid_: Index Type, column type
 
 **Strict Field**:
-A field whose Index Type the Collection Schema enforces: a write giving it a value of another type fails with Type Mismatch. Only a Strict Field can have a unique Index.
+A field whose Field Type the Collection Schema enforces: a write giving it a value of another type fails with Type Mismatch. Only a Strict Field can have a unique Index.
 _Avoid_: Required field (a Strict Field may be missing), typed column
 
 ## Access

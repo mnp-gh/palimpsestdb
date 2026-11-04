@@ -6,11 +6,11 @@ mod common;
 use bson::{Bson, Document, doc};
 use proptest::prelude::*;
 use psdb_core::wal::SimDisk;
-use psdb_core::{Database, Error, FieldType, IndexInfo, IndexType, Limits};
+use psdb_core::{Database, Error, FieldSchema, FieldType, IndexInfo, Limits};
 use psdb_storage_memory::MemoryEngine;
 
-fn field(index_type: IndexType, strict: bool) -> FieldType {
-    FieldType { index_type, strict }
+fn field(field_type: FieldType, strict: bool) -> FieldSchema {
+    FieldSchema { field_type, strict }
 }
 
 fn ids(docs: &[Document]) -> Vec<Bson> {
@@ -20,12 +20,12 @@ fn ids(docs: &[Document]) -> Vec<Bson> {
 /// `shop.orders` with `path` declared and indexed.
 fn indexed(
     path: &str,
-    index_type: IndexType,
+    field_type: FieldType,
     strict: bool,
     unique: bool,
 ) -> Database<MemoryEngine> {
     let db = common::shop();
-    db.set_field_type("shop", "orders", path, field(index_type, strict))
+    db.set_field_type("shop", "orders", path, field(field_type, strict))
         .unwrap();
     db.create_index("shop", "orders", path, unique).unwrap();
     db
@@ -120,14 +120,14 @@ proptest! {
     /// a full scan of an unindexed Collection returns.
     #[test]
     fn index_backed_find_matches_a_full_scan(
-        index_type in prop::sample::select(vec![IndexType::Int, IndexType::Double, IndexType::String]),
+        field_type in prop::sample::select(vec![FieldType::Int, FieldType::Double, FieldType::String]),
         ops in prop::collection::vec(op(), 0..30),
         build_after in 0..30usize,
         filters in prop::collection::vec(filter(), 1..8),
     ) {
         let db = common::shop();
         db.create_collection("shop", "plain").unwrap();
-        db.set_field_type("shop", "orders", "a.v", field(index_type, false)).unwrap();
+        db.set_field_type("shop", "orders", "a.v", field(field_type, false)).unwrap();
         for (n, op) in ops.iter().enumerate() {
             if n == build_after {
                 db.create_index("shop", "orders", "a.v", false).unwrap();
@@ -148,7 +148,7 @@ proptest! {
 
 #[test]
 fn numbers_compare_exactly_through_an_int_index() {
-    let db = indexed("n", IndexType::Int, false, false);
+    let db = indexed("n", FieldType::Int, false, false);
     let big = 9_007_199_254_740_993i64; // 2⁵³ + 1
     db.insert("shop", "orders", doc! { "_id": 1, "n": big })
         .unwrap();
@@ -174,7 +174,7 @@ fn numbers_compare_exactly_through_an_int_index() {
 
 #[test]
 fn membership_follows_the_documents_current_type() {
-    let db = indexed("age", IndexType::Int, false, false);
+    let db = indexed("age", FieldType::Int, false, false);
     db.insert("shop", "orders", doc! { "_id": 7, "age": "30" })
         .unwrap();
     let find30 = || ids(&db.find("shop", "orders", &doc! { "age": 30 }).unwrap());
@@ -189,7 +189,7 @@ fn membership_follows_the_documents_current_type() {
 
 #[test]
 fn snapshots_see_the_index_as_of_their_timestamp() {
-    let db = indexed("age", IndexType::Int, false, false);
+    let db = indexed("age", FieldType::Int, false, false);
     db.insert("shop", "orders", doc! { "_id": 7, "age": 30 })
         .unwrap();
     let mut old = db.begin();
@@ -212,7 +212,7 @@ fn snapshots_see_the_index_as_of_their_timestamp() {
 
 #[test]
 fn own_writes_are_found_through_the_index() {
-    let db = indexed("age", IndexType::Int, false, false);
+    let db = indexed("age", FieldType::Int, false, false);
     db.insert("shop", "orders", doc! { "_id": 1, "age": 5 })
         .unwrap();
     let mut txn = db.begin();
@@ -227,7 +227,7 @@ fn own_writes_are_found_through_the_index() {
 
 #[test]
 fn unique_index_rejects_duplicates_but_not_missing_or_null() {
-    let db = indexed("email", IndexType::String, true, true);
+    let db = indexed("email", FieldType::String, true, true);
     db.insert("shop", "orders", doc! { "_id": 1, "email": "a@x" })
         .unwrap();
     assert!(matches!(
@@ -257,7 +257,7 @@ fn unique_index_rejects_duplicates_but_not_missing_or_null() {
 
 #[test]
 fn unique_int_index_treats_30_and_30_0_as_the_same_value() {
-    let db = indexed("n", IndexType::Int, true, true);
+    let db = indexed("n", FieldType::Int, true, true);
     db.insert("shop", "orders", doc! { "_id": 1, "n": 30 })
         .unwrap();
     assert!(matches!(
@@ -272,7 +272,7 @@ fn unique_int_index_treats_30_and_30_0_as_the_same_value() {
 
 #[test]
 fn concurrent_duplicates_conflict() {
-    let db = indexed("email", IndexType::String, true, true);
+    let db = indexed("email", FieldType::String, true, true);
     let (mut t1, mut t2) = (db.begin(), db.begin());
     t1.insert("shop", "orders", doc! { "_id": 1, "email": "a@x" })
         .unwrap();
@@ -285,9 +285,9 @@ fn concurrent_duplicates_conflict() {
 #[test]
 fn failed_write_leaves_nothing_behind() {
     let db = common::shop();
-    db.set_field_type("shop", "orders", "a", field(IndexType::Int, false))
+    db.set_field_type("shop", "orders", "a", field(FieldType::Int, false))
         .unwrap();
-    db.set_field_type("shop", "orders", "b", field(IndexType::Int, true))
+    db.set_field_type("shop", "orders", "b", field(FieldType::Int, true))
         .unwrap();
     db.create_index("shop", "orders", "a", false).unwrap();
     db.create_index("shop", "orders", "b", true).unwrap();
@@ -307,7 +307,7 @@ fn failed_write_leaves_nothing_behind() {
 #[test]
 fn strict_fields_reject_other_types() {
     let db = common::shop();
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, true))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, true))
         .unwrap();
     assert!(matches!(
         db.insert("shop", "orders", doc! { "n": "thirty" }),
@@ -316,7 +316,7 @@ fn strict_fields_reject_other_types() {
     db.insert("shop", "orders", doc! { "n": 30.0 }).unwrap();
     db.insert("shop", "orders", doc! { "n": null }).unwrap();
     db.insert("shop", "orders", doc! {}).unwrap();
-    db.set_field_type("shop", "orders", "f", field(IndexType::Double, true))
+    db.set_field_type("shop", "orders", "f", field(FieldType::Double, true))
         .unwrap();
     assert!(matches!(
         db.insert("shop", "orders", doc! { "f": f64::NAN }),
@@ -334,17 +334,17 @@ fn making_a_field_strict_checks_existing_documents() {
     db.insert("shop", "orders", doc! { "_id": 1, "n": "thirty" })
         .unwrap();
     assert!(matches!(
-        db.set_field_type("shop", "orders", "n", field(IndexType::Int, true)),
+        db.set_field_type("shop", "orders", "n", field(FieldType::Int, true)),
         Err(Error::TypeMismatch(_))
     ));
     assert!(
         db.collection_schema("shop", "orders").unwrap().is_empty(),
         "nothing changed"
     );
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, false))
         .unwrap();
     db.delete("shop", "orders", &Bson::Int32(1)).unwrap();
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, true))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, true))
         .unwrap();
 }
 
@@ -358,7 +358,7 @@ fn schema_rules_around_indexes() {
         ),
         "type not declared"
     );
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, false))
         .unwrap();
     assert!(
         matches!(
@@ -374,7 +374,7 @@ fn schema_rules_around_indexes() {
     ));
     assert!(
         matches!(
-            db.set_field_type("shop", "orders", "n", field(IndexType::Double, false)),
+            db.set_field_type("shop", "orders", "n", field(FieldType::Double, false)),
             Err(Error::InvalidSchema(_))
         ),
         "no type change while indexed"
@@ -383,13 +383,13 @@ fn schema_rules_around_indexes() {
         db.remove_field_type("shop", "orders", "n"),
         Err(Error::InvalidSchema(_))
     ));
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, true))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, true))
         .unwrap();
     db.drop_index("shop", "orders", "n").unwrap();
     db.create_index("shop", "orders", "n", true).unwrap();
     assert!(
         matches!(
-            db.set_field_type("shop", "orders", "n", field(IndexType::Int, false)),
+            db.set_field_type("shop", "orders", "n", field(FieldType::Int, false)),
             Err(Error::InvalidSchema(_))
         ),
         "unique index keeps the field strict"
@@ -408,7 +408,7 @@ fn schema_rules_around_indexes() {
     ));
     db.remove_field_type("shop", "orders", "n").unwrap();
     assert!(matches!(
-        db.set_field_type("shop", "orders", "_id", field(IndexType::Int, false)),
+        db.set_field_type("shop", "orders", "_id", field(FieldType::Int, false)),
         Err(Error::InvalidSchema(_))
     ));
 }
@@ -416,7 +416,7 @@ fn schema_rules_around_indexes() {
 #[test]
 fn index_inside_a_transaction_needs_an_empty_collection() {
     let db = common::shop();
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, false))
         .unwrap();
     db.insert("shop", "orders", doc! { "n": 1 }).unwrap();
     let mut txn = db.begin();
@@ -429,7 +429,7 @@ fn index_inside_a_transaction_needs_an_empty_collection() {
     // A Collection created, typed, indexed and filled in one Transaction.
     db.run(|t| {
         t.create_collection("shop", "users")?;
-        t.set_field_type("shop", "users", "age", field(IndexType::Int, false))?;
+        t.set_field_type("shop", "users", "age", field(FieldType::Int, false))?;
         t.create_index("shop", "users", "age", false)?;
         t.insert("shop", "users", doc! { "_id": 1, "age": 40 })
     })
@@ -445,7 +445,7 @@ fn index_inside_a_transaction_needs_an_empty_collection() {
 #[test]
 fn concurrent_insert_aborts_an_index_created_on_an_empty_collection() {
     let db = common::shop();
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, false))
         .unwrap();
     let mut txn = db.begin();
     txn.create_index("shop", "orders", "n", false).unwrap();
@@ -457,7 +457,7 @@ fn concurrent_insert_aborts_an_index_created_on_an_empty_collection() {
 fn concurrent_insert_aborts_making_a_field_strict() {
     let db = common::shop();
     let mut txn = db.begin();
-    txn.set_field_type("shop", "orders", "n", field(IndexType::Int, true))
+    txn.set_field_type("shop", "orders", "n", field(FieldType::Int, true))
         .unwrap();
     db.insert("shop", "orders", doc! { "n": "thirty" }).unwrap();
     assert!(matches!(txn.commit(), Err(Error::CollectionChanged)));
@@ -466,7 +466,7 @@ fn concurrent_insert_aborts_making_a_field_strict() {
 #[test]
 fn writer_aborts_when_indexes_change_under_it() {
     let db = common::shop();
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, false))
         .unwrap();
     let mut txn = db.begin();
     txn.insert("shop", "orders", doc! { "n": 1 }).unwrap();
@@ -477,7 +477,7 @@ fn writer_aborts_when_indexes_change_under_it() {
 #[test]
 fn building_a_unique_index_over_duplicates_fails_and_leaves_no_index() {
     let db = common::shop();
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, true))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, true))
         .unwrap();
     // Past the first chunk, so some entries are committed before the build fails.
     for i in 0..3000 {
@@ -508,7 +508,7 @@ fn built_index_survives_reopen() {
             db.insert("shop", "orders", doc! { "_id": i, "n": i % 100 })
                 .unwrap();
         }
-        db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+        db.set_field_type("shop", "orders", "n", field(FieldType::Int, false))
             .unwrap();
         db.create_index("shop", "orders", "n", false).unwrap();
     }
@@ -548,7 +548,7 @@ fn write_set_cap_fails_the_write_that_crosses_it() {
 
 #[test]
 fn largest_document_fits_the_default_write_set_cap() {
-    let db = indexed("s", IndexType::String, false, false);
+    let db = indexed("s", FieldType::String, false, false);
     let max = db.limits().max_document_bytes;
     // An indexed string almost as large as the Document: the entry key
     // carries the whole value, doubling what the write adds.
@@ -572,7 +572,7 @@ fn build_over_large_documents_reads_them_in_byte_bounded_chunks() {
         db.insert("shop", "orders", doc! { "_id": i, "n": i % 4, "pad": &pad })
             .unwrap();
     }
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, false))
         .unwrap();
     db.create_index("shop", "orders", "n", false).unwrap();
     assert_eq!(
@@ -584,7 +584,7 @@ fn build_over_large_documents_reads_them_in_byte_bounded_chunks() {
 #[test]
 fn refused_index_in_a_transaction_writes_nothing() {
     let db = common::shop();
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, false))
         .unwrap();
     db.insert("shop", "orders", doc! { "n": 1 }).unwrap();
     let mut txn = db.begin();
@@ -600,7 +600,7 @@ fn refused_index_in_a_transaction_writes_nothing() {
 #[test]
 fn deleting_the_last_document_lets_a_transaction_create_an_index() {
     let db = common::shop();
-    db.set_field_type("shop", "orders", "n", field(IndexType::Int, false))
+    db.set_field_type("shop", "orders", "n", field(FieldType::Int, false))
         .unwrap();
     db.insert("shop", "orders", doc! { "_id": 1, "n": 1 })
         .unwrap();
