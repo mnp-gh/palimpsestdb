@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::index::{self, IndexDef, IndexInfo};
 use crate::keys;
 use crate::mvcc;
-use crate::schema::FieldSchema;
+use crate::schema::{self, FieldSchema};
 use crate::transaction::{self, Transaction, WriteSet};
 use crate::wal::{self, OsWalFile, Wal, WalFile};
 
@@ -229,7 +229,7 @@ impl<E: StorageEngine> Database<E> {
         snapshot_ts: u64,
     ) -> Result<()> {
         let ty = entry.schema[&index.path].field_type;
-        let segments = entry.segments(&index.path)?;
+        let segments = schema::segments(&index.path);
         let prefix = keys::collection_prefix(db_id, entry.id);
         let mut range = keys::documents_range(db_id, entry.id);
         loop {
@@ -248,7 +248,7 @@ impl<E: StorageEngine> Database<E> {
             })?;
             let mut chunk = WriteSet::new();
             for (key, bytes) in &page {
-                let Some(c) = index::component_of(document::raw(bytes)?, segments, ty)? else {
+                let Some(c) = index::component_of(document::raw(bytes)?, &segments, ty)? else {
                     continue;
                 };
                 let doc_id = &key[prefix.len()..];
