@@ -3,19 +3,24 @@
 //!
 //! Collections are schemaless, so the schema exists mainly to give
 //! indexed fields their Field Types: an Index has no type of its own and
-//! reads its field's from here (see [`crate::index`]). The schema itself knows nothing about Indexes, and
-//! alone decides which writes a Strict Field rejects, whether or not the
-//! field is indexed.
+//! reads its field's from here (see [`crate::index`]). The schema alone
+//! decides which writes a Strict Field rejects, whether or not the field is
+//! indexed; an Index only stops its field's declaration from changing.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
 use bson::{Bson, RawDocument};
+use psdb_storage::StorageEngine;
 
+use crate::catalog::CollectionEntry;
+use crate::collection_path::CollectionPath;
+use crate::document::{self, lookup_raw};
 use crate::error::{Error, Result};
 use crate::field_path::FieldPath;
-use crate::filter::{TWO_63, lookup_raw};
+use crate::filter::TWO_63;
+use crate::transaction::Transaction;
 
 /// The kind of value a field holds, declared in the Collection Schema.
 ///
@@ -152,6 +157,84 @@ fn fits_exactly(value: &Bson, ty: FieldType) -> bool {
         (Bson::Int64(n), FieldType::Double) => n.unsigned_abs() <= TWO_53,
         (Bson::Double(f), FieldType::Double) => !f.is_nan(),
         _ => FieldType::of(value) == Some(ty),
+    }
+}
+
+impl CollectionEntry {
+    /// Fail with [`Error::TypeMismatch`] if `doc` breaks any Strict Field.
+    pub(crate) fn check_strict(&self, doc: &bson::RawDocument) -> Result<()> {
+        for (path, field) in self.schema.iter().filter(|(_, f)| f.strict) {
+            check_field(doc, path, *field)?;
+        }
+        Ok(())
+    }
+}
+
+impl<E: StorageEngine> Transaction<'_, E> {
+    /// Declare a field's Field Type in the Collection Schema, or change its
+    /// declaration.
+    ///
+    /// While an Index on the field exists, its type cannot change, and a
+    /// field with a unique Index cannot stop being strict: drop the Index
+    /// first. Making a field strict reads every Document and fails with
+    /// [`Error::TypeMismatch`] if any breaks the rule.
+    pub fn set_field_type(
+        &mut self,
+        collection: &CollectionPath,
+        path: &FieldPath,
+        field: FieldSchema,
+    ) -> Result<()> {
+        let mut entry = self.collection_entry(collection)?;
+        let old = entry.schema.get(path).copied();
+        if let (Some(ix), Some(old)) = (entry.index_on(path.as_str()), old) {
+            if old.field_type != field.field_type {
+                return Err(Error::InvalidSchema(format!(
+                    "{path} has an index; drop it before changing the field's type"
+                )));
+            }
+            if ix.unique && !field.strict {
+                return Err(Error::InvalidSchema(format!(
+                    "{path} has a unique index, which needs a strict field; drop it first"
+                )));
+            }
+        }
+        let already_enforced = old.is_some_and(|o| o.strict && o.field_type == field.field_type);
+        if field.strict && !already_enforced {
+            for bytes in self.scan_range(&entry.documents())?.values() {
+                check_field(document::raw(bytes)?, path, field)?;
+            }
+            // A Document committed concurrently was not checked.
+            self.collection_reads.insert(entry.prefix());
+        }
+        entry.schema.insert(path.clone(), field);
+        self.write_collection_entry(&entry)
+    }
+
+    /// Remove a field's declaration from the Collection Schema. Refused
+    /// while an Index on the field exists.
+    pub fn remove_field_type(
+        &mut self,
+        collection: &CollectionPath,
+        path: &FieldPath,
+    ) -> Result<()> {
+        let mut entry = self.collection_entry(collection)?;
+        if entry.index_on(path.as_str()).is_some() {
+            return Err(Error::InvalidSchema(format!(
+                "{path} has an index; drop it before removing the field's type"
+            )));
+        }
+        if entry.schema.remove(path).is_none() {
+            return Err(Error::InvalidSchema(format!("{path} is not declared")));
+        }
+        self.write_collection_entry(&entry)
+    }
+
+    /// The Collection Schema: every declared field path and its type.
+    pub fn collection_schema(
+        &mut self,
+        collection: &CollectionPath,
+    ) -> Result<BTreeMap<FieldPath, FieldSchema>> {
+        Ok(self.collection_entry(collection)?.schema)
     }
 }
 

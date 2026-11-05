@@ -22,24 +22,25 @@
 //! names concurrently never conflicts; creating the same name, or drawing
 //! the same ID, does, because both Transactions write the same key.
 //!
+//! This module owns the entries and the Namespace and Collection changes.
+//! Schema and Index changes rewrite a Collection's entry too, but live with
+//! their rules in [`crate::schema`] and [`crate::index`].
+//!
 //! Index IDs are counted per Collection by `nextIndexId`, which only grows,
 //! so they are never reused either. Creating an Index rewrites its
 //! Collection's entry anyway, so the counter adds no conflicts.
 
-use std::collections::BTreeMap;
-
-use bson::{Bson, Document, RawDocument, doc};
+use bson::{Bson, Document, doc};
 use psdb_storage::{KeyRange, StorageEngine};
 
 use crate::collection_path::CollectionPath;
 use crate::document::{self, validate_name};
 use crate::error::{Error, Result};
 use crate::field_path::FieldPath;
-use crate::filter::lookup_raw;
-use crate::index::{self, IndexDef, IndexEntry, IndexInfo};
+use crate::index::IndexDef;
 use crate::keys;
 use crate::mvcc;
-use crate::schema::{self, FieldSchema, FieldType, Schema};
+use crate::schema::{FieldSchema, FieldType, Schema};
 use crate::transaction::Transaction;
 
 /// A Collection's Catalog entry.
@@ -118,14 +119,6 @@ impl CollectionEntry {
         })
     }
 
-    /// Fail with [`Error::TypeMismatch`] if `doc` breaks any Strict Field.
-    pub(crate) fn check_strict(&self, doc: &bson::RawDocument) -> Result<()> {
-        for (path, field) in self.schema.iter().filter(|(_, f)| f.strict) {
-            schema::check_field(doc, path, *field)?;
-        }
-        Ok(())
-    }
-
     fn encode(&self) -> Vec<u8> {
         let fields: Vec<Bson> = self
             .schema
@@ -154,12 +147,6 @@ impl CollectionEntry {
         })
     }
 
-    /// The Index on the field at `path`, which may come from a filter and
-    /// so is not always a valid Field path.
-    pub(crate) fn index_on(&self, path: &str) -> Option<&IndexDef> {
-        self.indexes.iter().find(|ix| ix.path.as_str() == path)
-    }
-
     /// The prefix of every key the Collection owns.
     pub(crate) fn prefix(&self) -> Vec<u8> {
         keys::collection_prefix(self.namespace_id, self.id)
@@ -168,25 +155,6 @@ impl CollectionEntry {
     /// The Collection's Documents, without its Index entries.
     pub(crate) fn documents(&self) -> KeyRange {
         keys::documents_range(self.namespace_id, self.id)
-    }
-
-    /// The prefix of every entry in `index`.
-    pub(crate) fn index_prefix(&self, index: &IndexDef) -> Vec<u8> {
-        keys::index_prefix(self.namespace_id, self.id, index.id)
-    }
-
-    /// The entry the stored Document `doc`, with encoded ID `doc_id`, has in
-    /// `index`, or `None` if the Index leaves its value out.
-    pub(crate) fn index_entry(
-        &self,
-        index: &IndexDef,
-        doc: &RawDocument,
-        doc_id: &[u8],
-    ) -> Result<Option<IndexEntry>> {
-        let ty = self.schema[&index.path].field_type;
-        let value = lookup_raw(doc, &index.path.segments())?;
-        Ok(index::key_component(value.as_ref(), ty)
-            .map(|component| IndexEntry::new(self.index_prefix(index), index, &component, doc_id)))
     }
 }
 
@@ -287,163 +255,6 @@ impl<E: StorageEngine> Transaction<'_, E> {
             keys::collection_entry_key(entry.namespace_id, &entry.name),
             Some(entry.encode()),
         )
-    }
-
-    /// Declare a field's Field Type in the Collection Schema, or change its
-    /// declaration.
-    ///
-    /// While an Index on the field exists, its type cannot change, and a
-    /// field with a unique Index cannot stop being strict: drop the Index
-    /// first. Making a field strict reads every Document and fails with
-    /// [`Error::TypeMismatch`] if any breaks the rule.
-    pub fn set_field_type(
-        &mut self,
-        collection: &CollectionPath,
-        path: &FieldPath,
-        field: FieldSchema,
-    ) -> Result<()> {
-        let mut entry = self.collection_entry(collection)?;
-        let old = entry.schema.get(path).copied();
-        if let (Some(ix), Some(old)) = (entry.index_on(path.as_str()), old) {
-            if old.field_type != field.field_type {
-                return Err(Error::InvalidSchema(format!(
-                    "{path} has an index; drop it before changing the field's type"
-                )));
-            }
-            if ix.unique && !field.strict {
-                return Err(Error::InvalidSchema(format!(
-                    "{path} has a unique index, which needs a strict field; drop it first"
-                )));
-            }
-        }
-        let already_enforced = old.is_some_and(|o| o.strict && o.field_type == field.field_type);
-        if field.strict && !already_enforced {
-            for bytes in self.scan_range(&entry.documents())?.values() {
-                schema::check_field(document::raw(bytes)?, path, field)?;
-            }
-            // A Document committed concurrently was not checked.
-            self.collection_reads.insert(entry.prefix());
-        }
-        entry.schema.insert(path.clone(), field);
-        self.write_collection_entry(&entry)
-    }
-
-    /// Remove a field's declaration from the Collection Schema. Refused
-    /// while an Index on the field exists.
-    pub fn remove_field_type(
-        &mut self,
-        collection: &CollectionPath,
-        path: &FieldPath,
-    ) -> Result<()> {
-        let mut entry = self.collection_entry(collection)?;
-        if entry.index_on(path.as_str()).is_some() {
-            return Err(Error::InvalidSchema(format!(
-                "{path} has an index; drop it before removing the field's type"
-            )));
-        }
-        if entry.schema.remove(path).is_none() {
-            return Err(Error::InvalidSchema(format!("{path} is not declared")));
-        }
-        self.write_collection_entry(&entry)
-    }
-
-    /// The Collection Schema: every declared field path and its type.
-    pub fn collection_schema(
-        &mut self,
-        collection: &CollectionPath,
-    ) -> Result<BTreeMap<FieldPath, FieldSchema>> {
-        Ok(self.collection_entry(collection)?.schema)
-    }
-
-    /// Create an Index on a field of an empty Collection, as part of this
-    /// Transaction (ADR 0010). There is nothing to build, so it commits or
-    /// aborts with the rest of the Transaction.
-    ///
-    /// Fails with [`Error::CollectionNotEmpty`] if the Collection holds
-    /// Documents: use [`Node::create_index`](crate::Node::create_index),
-    /// which builds the Index on its own. A Document committed concurrently
-    /// makes this Transaction abort with Collection Changed.
-    pub fn create_index(
-        &mut self,
-        collection: &CollectionPath,
-        path: &FieldPath,
-        unique: bool,
-    ) -> Result<()> {
-        let (mut entry, index) = self.prepare_index(collection, path, unique)?;
-        if self.any_live_in(&entry.documents())? {
-            return Err(Error::CollectionNotEmpty(collection.clone()));
-        }
-        self.collection_reads.insert(entry.prefix());
-        entry.indexes.push(index);
-        self.write_collection_entry(&entry)
-    }
-
-    /// Check that an Index may be created and give it the Collection's next
-    /// Index ID. The caller fills the Index and adds it to the returned
-    /// entry, whose counter has moved past the ID.
-    pub(crate) fn prepare_index(
-        &mut self,
-        collection: &CollectionPath,
-        path: &FieldPath,
-        unique: bool,
-    ) -> Result<(CollectionEntry, IndexDef)> {
-        let mut entry = self.collection_entry(collection)?;
-        let Some(field) = entry.schema.get(path) else {
-            return Err(Error::InvalidSchema(format!(
-                "declare the type of {path} in the collection schema before indexing it"
-            )));
-        };
-        if entry.index_on(path.as_str()).is_some() {
-            return Err(Error::IndexExists {
-                collection: collection.clone(),
-                path: path.clone(),
-            });
-        }
-        if unique && !field.strict {
-            return Err(Error::InvalidSchema(format!(
-                "a unique index needs a strict field; declare {path} strict first"
-            )));
-        }
-        // Skip IDs holding entries from a build that never committed: the
-        // counter moves only when the Index is added (ADR 0010).
-        let mut index = IndexDef {
-            path: path.clone(),
-            id: entry.next_index_id,
-            unique,
-        };
-        while mvcc::any_version_under(&self.node.engine, &entry.index_prefix(&index))? {
-            index.id += 1;
-        }
-        entry.next_index_id = index.id + 1;
-        Ok((entry, index))
-    }
-
-    /// Drop the Index on a field. Its entries become unreachable and stay
-    /// behind until garbage collection exists.
-    pub fn drop_index(&mut self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
-        let mut entry = self.collection_entry(collection)?;
-        let before = entry.indexes.len();
-        entry.indexes.retain(|ix| ix.path != *path);
-        if entry.indexes.len() == before {
-            return Err(Error::NoSuchIndex {
-                collection: collection.clone(),
-                path: path.clone(),
-            });
-        }
-        self.write_collection_entry(&entry)
-    }
-
-    /// The Collection's Indexes, in the order they were created.
-    pub fn list_indexes(&mut self, collection: &CollectionPath) -> Result<Vec<IndexInfo>> {
-        Ok(self
-            .collection_entry(collection)?
-            .indexes
-            .into_iter()
-            .map(|ix| IndexInfo {
-                path: ix.path,
-                unique: ix.unique,
-            })
-            .collect())
     }
 
     /// A random ID for a new Namespace (`namespace_id: None`) or for a new

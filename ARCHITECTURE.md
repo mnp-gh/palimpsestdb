@@ -27,6 +27,8 @@ Node, Transaction                         public API; commits
 wal (beside the stack)                    the log every commit goes through first
 ```
 
+Modules are cut by concept, not by type. `Node`, `Transaction` and `CollectionEntry` are defined in `node`, `transaction` and `catalog`, but their methods about one concept live in that concept's module, in an `impl` block there: `Transaction::create_index` and `Node::create_index` are in `index`, `Transaction::set_field_type` in `schema`. So `catalog` holds only Catalog entries and Namespace and Collection changes.
+
 ## Where to look
 
 | Question | Module |
@@ -35,6 +37,8 @@ wal (beside the stack)                    the log every commit goes through firs
 | Which Version does a Snapshot see? | `mvcc` |
 | How does a commit get checked and logged? | `transaction` (`commit`), `node` (`apply_commit`) |
 | What does a Catalog entry hold? | `catalog` (`CollectionEntry`) |
+| What may change in a Collection Schema? | `schema` |
+| How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `build_index`) |
 | Which Index or `_id` range does `find` use? | `index` (`plan`) |
 | What is a valid name, `_id` or Document? | `document`, `collection_path`, `field_path` |
 | How does recovery work? | `node` (`open_with`), `wal` |
