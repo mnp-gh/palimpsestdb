@@ -83,7 +83,8 @@ impl Limits {
 }
 
 /// Check a Namespace or Collection name: 1 to [`MAX_NAME_BYTES`] bytes, with
-/// no `.` (it separates Namespace from Collection) and no NUL.
+/// no `.` (it separates Namespace from Collection), no NUL and no
+/// whitespace (the CLI separates arguments with it).
 pub(crate) fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidName("names must not be empty".into()));
@@ -93,8 +94,10 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
             "{name:?} is longer than {MAX_NAME_BYTES} bytes"
         )));
     }
-    if name.contains(['.', '\0']) {
-        return Err(Error::InvalidName(format!("{name:?} contains '.' or NUL")));
+    if name.contains(['.', '\0']) || name.contains(char::is_whitespace) {
+        return Err(Error::InvalidName(format!(
+            "{name:?} contains '.', NUL or whitespace"
+        )));
     }
     Ok(())
 }
@@ -285,7 +288,14 @@ mod tests {
     fn names() {
         assert!(validate_name("orders").is_ok());
         assert!(validate_name(&"n".repeat(MAX_NAME_BYTES)).is_ok());
-        for bad in ["", "a.b", "a\0b", &"n".repeat(MAX_NAME_BYTES + 1)] {
+        for bad in [
+            "",
+            "a.b",
+            "a\0b",
+            "a b",
+            "a\tb",
+            &"n".repeat(MAX_NAME_BYTES + 1),
+        ] {
             assert!(
                 matches!(validate_name(bad), Err(Error::InvalidName(_))),
                 "{bad:?}"

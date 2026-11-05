@@ -55,7 +55,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 ## Flows
 
-**Opening.** `Node::open` opens the WAL file. `Wal::open` reads every record and truncates a torn one at the end. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch`, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
+**Opening.** `Node::open` opens the WAL file and locks it, so a second Node on the same directory fails to open. `Wal::open` reads every record, truncates a torn one at the end, and fsyncs the file, so no record it returns can be lost to a later power cut. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch`, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
 
 **A write** (`Transaction::insert`, `replace`, `delete`) touches only the Transaction's private Write Set:
 

@@ -66,6 +66,8 @@ fn put_then_get<E: StorageEngine>(engine: &E) {
         b.put("k", "v");
     });
     assert_eq!(engine.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    engine.flush().expect("flush failed");
+    assert_eq!(engine.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
 }
 
 fn later_batch_overwrites<E: StorageEngine>(engine: &E) {
@@ -148,10 +150,12 @@ fn scan_respects_range_bounds<E: StorageEngine>(engine: &E) {
         "start is inclusive, end exclusive"
     );
     assert!(collect(engine, &KeyRange::new("x", "z")).is_empty());
-    assert!(
-        collect(engine, &KeyRange::new("d", "b")).is_empty(),
-        "an empty range (end <= start) visits nothing"
-    );
+    for empty in [KeyRange::new("d", "b"), KeyRange::new("b", "b")] {
+        assert!(
+            collect(engine, &empty).is_empty(),
+            "an empty range (end <= start) visits nothing: {empty:?}"
+        );
+    }
 }
 
 fn scan_prefix<E: StorageEngine>(engine: &E) {

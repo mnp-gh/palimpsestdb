@@ -56,6 +56,20 @@ fn reopen_replays_every_commit() {
 }
 
 #[test]
+fn a_data_directory_is_open_in_one_node_at_a_time() {
+    let dir = std::env::temp_dir().join(format!("psdb-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let node = Node::open(MemoryEngine::new(), &dir).unwrap();
+    assert!(matches!(
+        Node::open(MemoryEngine::new(), &dir),
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    drop(node);
+    Node::open(MemoryEngine::new(), &dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn engine_with_data_is_refused() {
     let with_data = || {
         let engine = MemoryEngine::new();
@@ -110,8 +124,12 @@ fn failed_fsync_poisons_and_leaves_the_outcome_unknown() {
             .collect()
     };
     assert_eq!(ids(&open(&disk).unwrap()), [Bson::Int32(1), Bson::Int32(2)]);
+    // Opening synced what it replayed, so a power loss now keeps it: what
+    // a Node serves is always Durable.
+    disk.power_loss(0);
+    assert_eq!(ids(&open(&disk).unwrap()), [Bson::Int32(1), Bson::Int32(2)]);
 
-    // After a power loss it is gone.
+    // A power loss before any reopen loses it.
     let disk = SimDisk::new();
     let node = durable_shop(&disk);
     node.insert(&collection("shop.orders"), doc! { "_id": 1 })

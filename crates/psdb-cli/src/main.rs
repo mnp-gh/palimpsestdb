@@ -114,6 +114,13 @@ fn main() {
             }
         }
     }
+    if txn.is_some() {
+        eprintln!("warning: the open transaction was aborted; `commit` it to keep its writes");
+        // A script that forgot to commit did not do its job.
+        if matches!(input, Input::Piped(_)) {
+            std::process::exit(1);
+        }
+    }
 }
 
 /// The `--data-dir` path, if given.
@@ -124,6 +131,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<PathBuf>,
             "--data-dir" => {
                 let dir = args.next().ok_or("--data-dir needs a path")?;
                 data_dir = Some(PathBuf::from(dir));
+            }
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -176,8 +187,10 @@ impl Input {
                     Ok(0) => None,
                     Ok(_) => Some(line),
                     Err(e) => {
+                        // Not the end of the script, so stop as any failed
+                        // step does.
                         eprintln!("error: reading input: {e}");
-                        None
+                        std::process::exit(1);
                     }
                 }
             }
@@ -397,6 +410,7 @@ fn values<const N: usize>(text: &str) -> Result<[Bson; N], String> {
                  hint: quote strings (\"abc\"); write UUIDs as {{\"$uuid\": \"0192f3a8-...\"}}"
             )
         })?;
+        too_large_integers(&json).map_err(|e| format!("argument {argument}: {e}"))?;
         let value = Bson::try_from(json)
             .map_err(|e| format!("argument {argument} is not valid Extended JSON: {e}"))?;
         parsed.push(value);
@@ -405,6 +419,22 @@ fn values<const N: usize>(text: &str) -> Result<[Bson; N], String> {
     parsed
         .try_into()
         .map_err(|_| format!("expected {N} JSON value(s), got {count}"))
+}
+
+/// Refuse integers above `i64::MAX`, which BSON would silently store as
+/// rounded doubles.
+// shortcut: serde_json already parses integers above u64::MAX as doubles,
+// so those still round silently; catching them needs its
+// `arbitrary_precision` feature.
+fn too_large_integers(json: &Value) -> Result<(), String> {
+    match json {
+        Value::Number(n) if n.is_u64() && !n.is_i64() => Err(format!(
+            "{n} does not fit a 64-bit integer; write {n}.0 to store it as a rounded double"
+        )),
+        Value::Array(items) => items.iter().try_for_each(too_large_integers),
+        Value::Object(fields) => fields.values().try_for_each(too_large_integers),
+        _ => Ok(()),
+    }
 }
 
 fn as_document(value: Bson) -> Result<Document, String> {

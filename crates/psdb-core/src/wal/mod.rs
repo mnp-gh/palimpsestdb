@@ -47,6 +47,8 @@ const HEADER_LEN: usize = MAGIC.len() + 4;
 const FRAME_LEN: usize = 8;
 /// Commit Timestamp and write count.
 const MIN_BODY_LEN: usize = 12;
+/// Key length and value tag: a deletion of the empty key.
+const MIN_WRITE_LEN: usize = 5;
 
 // The WAL's own tags, independent of the Version value encoding in `mvcc`
 // although the bytes happen to match.
@@ -70,7 +72,9 @@ impl Wal {
     /// committed Transaction in it in Commit Timestamp order.
     ///
     /// - A file shorter than the header whose bytes start the expected
-    ///   header was cut off while being created, before any commit, and is
+    ///   header, or a file no longer than the header holding only zeros
+    ///   (a filesystem may keep the size of an unsynced write but not its
+    ///   data), was cut off while being created, before any commit, and is
     ///   reinitialised. Any other short file is refused.
     /// - A wrong magic number or format version is refused and the file is
     ///   left untouched.
@@ -82,18 +86,22 @@ impl Wal {
     pub(crate) fn open(mut file: Box<dyn WalFile>) -> Result<(Self, Vec<Record>)> {
         let bytes = file.read_all()?;
         let header = header();
-        if bytes.len() < HEADER_LEN {
-            if !header.starts_with(&bytes) {
-                return Err(Error::UnrecognisedWal(format!(
-                    "{} bytes long, shorter than a WAL header",
-                    bytes.len()
-                )));
-            }
+        // The header is synced before any record is appended, so a header
+        // that never fully reached disk means no commit was acknowledged.
+        let cut_off = (bytes.len() < HEADER_LEN && header.starts_with(&bytes))
+            || (bytes.len() <= HEADER_LEN && bytes.iter().all(|&b| b == 0));
+        if cut_off {
             file.truncate(0)?;
             file.append(&header)?;
             file.sync()?;
             file.sync_dir()?;
             return Ok((Self { file }, Vec::new()));
+        }
+        if bytes.len() < HEADER_LEN {
+            return Err(Error::UnrecognisedWal(format!(
+                "{} bytes long, shorter than a WAL header",
+                bytes.len()
+            )));
         }
         if bytes[..MAGIC.len()] != MAGIC {
             return Err(Error::UnrecognisedWal(
@@ -114,19 +122,36 @@ impl Wal {
             let Some(body) = body_at(&bytes, pos) else {
                 // Every commit is synced before the next is appended, so a
                 // torn write is always the last record. Any intact record
-                // after this one, wherever it starts and whatever its
-                // Commit Timestamp, means the damage is mid-log. Searching
-                // every offset, rather than trusting this record's possibly
-                // damaged length, prefers refusing to open over dropping a
-                // Durable commit; a Document holding the bytes of a WAL
-                // record inside a torn write can make it refuse needlessly.
-                if (pos + 1..bytes.len()).any(|p| body_at(&bytes, p).is_some()) {
+                // after this one, wherever it starts, means the damage is
+                // mid-log. Searching every offset, rather than trusting this
+                // record's possibly damaged length, prefers refusing to open
+                // over dropping a Durable commit; a Document holding the
+                // bytes of a WAL record inside a torn write can make it
+                // refuse needlessly.
+                //
+                // Two cheap checks first skip the CRC32C at almost every
+                // offset, which would otherwise make the search quadratic
+                // in the size of a torn record. Commit Timestamps go up by
+                // one per record, so a Durable record after this one has a
+                // timestamp of at most `max_ts`; and its writes fit in its
+                // length.
+                let max_ts = last_ts + ((bytes.len() - pos) / (FRAME_LEN + MIN_BODY_LEN)) as u64;
+                let plausible = |p: usize| {
+                    let Some(head) = bytes.get(p..p + FRAME_LEN + MIN_BODY_LEN) else {
+                        return false;
+                    };
+                    let len = read_u32(head) as usize;
+                    let ts = read_u64(&head[FRAME_LEN..]);
+                    let count = read_u32(&head[FRAME_LEN + 8..]) as usize;
+                    (1..=max_ts).contains(&ts)
+                        && count * MIN_WRITE_LEN <= len.saturating_sub(MIN_BODY_LEN)
+                };
+                if (pos + 1..bytes.len()).any(|p| plausible(p) && body_at(&bytes, p).is_some()) {
                     return Err(Error::Corruption(format!(
                         "bad WAL record at byte {pos} is followed by valid records"
                     )));
                 }
                 file.truncate(pos as u64)?;
-                file.sync()?;
                 break;
             };
             let record = decode_body(body)?;
@@ -140,8 +165,12 @@ impl Wal {
             records.push(record);
             pos += FRAME_LEN + body.len();
         }
-        // The file may have been created by a run that crashed before
-        // syncing its directory entry.
+        // A record may have been written by a run that crashed before
+        // syncing it. Sync before replaying, so the Node never serves a
+        // commit that a later power loss could take back. The file may also
+        // have been created by a run that crashed before syncing its
+        // directory entry.
+        file.sync()?;
         file.sync_dir()?;
         Ok((Self { file }, records))
     }
@@ -378,6 +407,21 @@ mod tests {
     }
 
     #[test]
+    fn a_large_torn_record_is_truncated_quickly() {
+        // Small integers in arrays: BSON full of bytes that read as lengths
+        // of about 320 KB, and (for int64s) as small Commit Timestamps.
+        let int32s: Vec<i32> = vec![5; 150_000];
+        let int64s: Vec<i64> = vec![5; 100_000];
+        let document = bson::doc! { "a": int32s, "b": int64s }.to_vec().unwrap();
+        let whole = record(2, &[(b"k", Some(&document))]);
+        let torn = whole[..whole.len() / 2].to_vec();
+        let disk = disk_with(&[record(1, &[]), torn]);
+        let started = std::time::Instant::now();
+        assert_eq!(open(&disk).unwrap().len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
     fn non_increasing_commit_timestamp_is_corruption() {
         for second in [1, 0] {
             let disk = disk_with(&[record(1, &[]), record(second, &[])]);
@@ -406,6 +450,13 @@ mod tests {
             let disk = SimDisk::new();
             disk.set_contents(header()[..cut].to_vec());
             assert!(open(&disk).unwrap().is_empty(), "cut at {cut}");
+            assert_eq!(disk.contents(), header());
+        }
+        // The size reached disk but the data did not.
+        for len in 1..=HEADER_LEN {
+            let disk = SimDisk::new();
+            disk.set_contents(vec![0; len]);
+            assert!(open(&disk).unwrap().is_empty(), "{len} zeros");
             assert_eq!(disk.contents(), header());
         }
     }

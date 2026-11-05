@@ -149,16 +149,6 @@ impl WriteBatch {
     pub fn into_ops(self) -> Vec<WriteOp> {
         self.ops
     }
-
-    /// Number of ops in the batch.
-    pub fn len(&self) -> usize {
-        self.ops.len()
-    }
-
-    /// Whether the batch has no ops.
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
-    }
 }
 
 /// A failure inside a Storage Engine.

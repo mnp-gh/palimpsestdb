@@ -5,6 +5,8 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.2.1"
 edition = "2024"
+# std `File::try_lock`, used to keep a WAL open in one Node at a time.
+rust-version = "1.89"
 repository = "https://github.com/mnp-gh/palimpsestdb"
 
 [workspace.dependencies]

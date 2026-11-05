@@ -1,8 +1,9 @@
 [package]
 name = "psdb-cli"
-description = "An interactive shell for an embedded, in-memory PalimpsestDB."
+description = "An interactive shell for an embedded PalimpsestDB, in memory or durable with --data-dir."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 
 [[bin]]

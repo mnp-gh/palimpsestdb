@@ -3,6 +3,7 @@ name = "psdb-core"
 description = "The PalimpsestDB Database Layer: Documents, Catalog, MVCC and Snapshot Isolation over any Storage Engine."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 
 [features]
