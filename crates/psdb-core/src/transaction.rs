@@ -3,16 +3,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bson::{Bson, Document};
-use psdb_storage::StorageEngine;
+use std::ops::ControlFlow;
 
+use bson::{Bson, Document, RawDocument};
+use psdb_storage::{KeyRange, StorageEngine};
+
+use crate::catalog::CollectionEntry;
+use crate::collection_path::CollectionPath;
 use crate::document;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
+use crate::index::{self, CandidateRange};
 use crate::keys;
 use crate::mvcc;
-use crate::node::Node;
-use crate::wal;
+use crate::node::{CommitState, Node};
 
 /// One entry of a Write Set: a logical key and its new value (`None`
 /// deletes).
@@ -33,13 +37,21 @@ pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
 /// Dropping a Transaction without committing aborts it.
 pub struct Transaction<'node, E: StorageEngine> {
     pub(crate) node: &'node Node<E>,
-    pub(crate) snapshot_ts: u64,
+    snapshot_ts: u64,
     /// Logical key → new value (`None` deletes). Ordered so scans can
     /// overlay it on the Snapshot.
-    pub(crate) write_set: WriteSet,
+    write_set: WriteSet,
+    /// Bytes of every key and value in the Write Set, checked against
+    /// [`Limits::max_write_set_bytes`](crate::Limits::max_write_set_bytes).
+    write_set_bytes: usize,
     /// Catalog entries this Transaction depended on; checked at commit
-    /// (ADR 0006).
-    pub(crate) catalog_reads: BTreeSet<Vec<u8>>,
+    /// (ADR 0006). Added only through
+    /// [`depend_on_catalog_entry`](Self::depend_on_catalog_entry).
+    catalog_reads: BTreeSet<Vec<u8>>,
+    /// Collections whose every Document a schema change or Index creation
+    /// depended on (by key prefix). Added only through
+    /// [`depend_on_whole_collection`](Self::depend_on_whole_collection).
+    collection_reads: BTreeSet<Vec<u8>>,
 }
 
 impl<'node, E: StorageEngine> Transaction<'node, E> {
@@ -48,13 +60,29 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             node,
             snapshot_ts,
             write_set: WriteSet::new(),
+            write_set_bytes: 0,
             catalog_reads: BTreeSet::new(),
+            collection_reads: BTreeSet::new(),
         }
     }
 
     /// The Commit Timestamp this Transaction's Snapshot was taken at.
     pub fn snapshot_ts(&self) -> u64 {
         self.snapshot_ts
+    }
+
+    /// Record that this Transaction used the Catalog entry at `key`, so the
+    /// commit aborts with Collection Changed if another commit changes it
+    /// after the Snapshot (ADR 0006).
+    pub(crate) fn depend_on_catalog_entry(&mut self, key: Vec<u8>) {
+        self.catalog_reads.insert(key);
+    }
+
+    /// Record that this Transaction relied on every Document under
+    /// `prefix`, so the commit aborts with Collection Changed if any
+    /// Document there is committed after the Snapshot.
+    pub(crate) fn depend_on_whole_collection(&mut self, prefix: Vec<u8>) {
+        self.collection_reads.insert(prefix);
     }
 
     /// Read a logical key: own writes first, then the Snapshot.
@@ -65,56 +93,100 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         }
     }
 
-    pub(crate) fn write(&mut self, logical: Vec<u8>, value: Option<Vec<u8>>) {
-        self.write_set.insert(logical, value);
+    pub(crate) fn write(&mut self, logical: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
+        self.write_all(vec![(logical, value)])
+    }
+
+    /// Add every write to the Write Set, or none of them if together they
+    /// would cross the Write Set cap.
+    fn write_all(&mut self, writes: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Result<()> {
+        let size =
+            |key: &[u8], value: &Option<Vec<u8>>| key.len() + value.as_ref().map_or(0, Vec::len);
+        let mut total = self.write_set_bytes;
+        for (key, value) in &writes {
+            total += size(key, value);
+            if let Some(old) = self.write_set.get(key) {
+                total -= size(key, old);
+            }
+        }
+        if total > self.node.limits.max_write_set_bytes {
+            return Err(Error::TransactionTooLarge);
+        }
+        self.write_set.extend(writes);
+        self.write_set_bytes = total;
+        Ok(())
+    }
+
+    /// Whether any live value exists in `range`, in the Snapshot with own
+    /// writes overlaid. Stops at the first one.
+    pub(crate) fn any_live_in(&self, range: &KeyRange) -> Result<bool> {
+        let own = self
+            .write_set
+            .range(range.start.clone()..)
+            .take_while(|(k, _)| range.contains(k));
+        if own.clone().any(|(_, v)| v.is_some()) {
+            return Ok(true);
+        }
+        let mut found = false;
+        mvcc::scan_range_at(&self.node.engine, range, self.snapshot_ts, &mut |key, _| {
+            // Skip a value this Transaction deleted.
+            if self.write_set.get(key) == Some(&None) {
+                return ControlFlow::Continue(());
+            }
+            found = true;
+            ControlFlow::Break(())
+        })?;
+        Ok(found)
     }
 
     /// Every live value under `prefix`: the Snapshot with own writes
     /// overlaid, in key order.
     pub(crate) fn scan(&self, prefix: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        let mut rows = BTreeMap::new();
-        mvcc::scan_at(
+        self.scan_range(&KeyRange::prefix(prefix))
+    }
+
+    /// Every live value whose logical key is in `range`: the Snapshot with
+    /// own writes overlaid, in key order.
+    pub(crate) fn scan_range(&self, range: &KeyRange) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+        let mut live = BTreeMap::new();
+        mvcc::scan_range_at(
             &self.node.engine,
-            prefix,
+            range,
             self.snapshot_ts,
             &mut |key, value| {
-                rows.insert(key.to_vec(), value);
+                live.insert(key.to_vec(), value);
+                ControlFlow::Continue(())
             },
         )?;
         let own = self
             .write_set
-            .range(prefix.to_vec()..)
-            .take_while(|(k, _)| k.starts_with(prefix));
+            .range(range.start.clone()..)
+            .take_while(|(k, _)| range.contains(k));
         for (key, value) in own {
             match value {
-                Some(v) => rows.insert(key.clone(), v.clone()),
-                None => rows.remove(key),
+                Some(v) => live.insert(key.clone(), v.clone()),
+                None => live.remove(key),
             };
         }
-        Ok(rows)
+        Ok(live)
     }
 
     /// Insert a Document. If it has no `_id`, a UUIDv7 is generated.
     /// Returns the Document ID.
-    pub fn insert(&mut self, namespace: &str, collection: &str, doc: Document) -> Result<Bson> {
-        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
+    pub fn insert(&mut self, collection: &CollectionPath, doc: Document) -> Result<Bson> {
+        let entry = self.collection_entry(collection)?;
         let (id, bytes) = document::prepare(doc, None, &self.node.limits)?;
-        let key = keys::document_key(ns_id, coll_id, &id)?;
+        let key = keys::document_key(entry.namespace_id, entry.id, &id)?;
         if self.read(&key)?.is_some() {
-            return Err(Error::DuplicateId(id.to_string()));
+            return Err(Error::DuplicateId(id));
         }
-        self.write(key, Some(bytes));
+        self.write_document(&entry, key, None, Some(bytes))?;
         Ok(id)
     }
 
     /// The Document with this Document ID, if it exists.
-    pub fn get(
-        &mut self,
-        namespace: &str,
-        collection: &str,
-        id: &Bson,
-    ) -> Result<Option<Document>> {
-        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
+    pub fn get(&mut self, collection: &CollectionPath, id: &Bson) -> Result<Option<Document>> {
+        let (ns_id, coll_id) = self.resolve_collection(collection)?;
         let key = keys::document_key(ns_id, coll_id, id)?;
         self.read(&key)?
             .map(|bytes| document::decode(&bytes))
@@ -126,51 +198,121 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// Document exists (nothing is written).
     pub fn replace(
         &mut self,
-        namespace: &str,
-        collection: &str,
+        collection: &CollectionPath,
         id: &Bson,
         doc: Document,
     ) -> Result<bool> {
-        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
-        let key = keys::document_key(ns_id, coll_id, id)?;
-        if self.read(&key)?.is_none() {
+        let entry = self.collection_entry(collection)?;
+        let key = keys::document_key(entry.namespace_id, entry.id, id)?;
+        let Some(old) = self.read(&key)? else {
             return Ok(false);
-        }
+        };
         let (_, bytes) = document::prepare(doc, Some(id), &self.node.limits)?;
-        self.write(key, Some(bytes));
+        self.write_document(&entry, key, Some(&old), Some(bytes))?;
         Ok(true)
     }
 
     /// Delete the Document with this Document ID. Returns `false` if no such
     /// Document exists.
-    pub fn delete(&mut self, namespace: &str, collection: &str, id: &Bson) -> Result<bool> {
-        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
-        let key = keys::document_key(ns_id, coll_id, id)?;
-        if self.read(&key)?.is_none() {
+    pub fn delete(&mut self, collection: &CollectionPath, id: &Bson) -> Result<bool> {
+        let entry = self.collection_entry(collection)?;
+        let key = keys::document_key(entry.namespace_id, entry.id, id)?;
+        let Some(old) = self.read(&key)? else {
             return Ok(false);
-        }
-        self.write(key, None);
+        };
+        self.write_document(&entry, key, Some(&old), None)?;
         Ok(true)
     }
 
+    /// Write a Document's new Version (`None` deletes) together with the
+    /// changes to every Index of its Collection, after checking Strict
+    /// Fields and unique Indexes. Nothing is written if any check fails.
+    fn write_document(
+        &mut self,
+        entry: &CollectionEntry,
+        key: Vec<u8>,
+        old: Option<&[u8]>,
+        new: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let old = old.map(document::raw).transpose()?;
+        let new_doc = new.as_deref().map(document::raw).transpose()?;
+        if let Some(doc) = new_doc {
+            entry.check_strict(doc)?;
+        }
+        let doc_id = &key[entry.prefix().len()..];
+        let mut writes = Vec::new();
+        for ix in &entry.indexes {
+            let index_entry = |doc: Option<&RawDocument>| match doc {
+                Some(doc) => entry.index_entry(ix, doc, doc_id),
+                None => Ok(None),
+            };
+            let (before, after) = (index_entry(old)?, index_entry(new_doc)?);
+            // An unchanged value keeps its entry: it points to the Document
+            // ID, not to a Version (ADR 0011).
+            if before == after {
+                continue;
+            }
+            if let Some(before) = before {
+                writes.push((before.key, None));
+            }
+            if let Some(after) = after {
+                if after.unique
+                    && let Some(owner) = self.read(&after.key)?
+                    && owner != doc_id
+                {
+                    return Err(Error::DuplicateValue(format!(
+                        "another document already has this {} in the unique index on it",
+                        ix.path
+                    )));
+                }
+                writes.push((after.key, Some(doc_id.to_vec())));
+            }
+        }
+        writes.push((key, new));
+        self.write_all(writes)
+    }
+
     /// Every Document in the Collection that matches `filter`, in Document
-    /// ID order. Scans the whole Collection.
+    /// ID order. Reads candidates from a range of `_id`s or from an Index
+    /// when one fits the filter (see [`Node::create_index`]), and the
+    /// whole Collection otherwise; either way every candidate is checked
+    /// against the whole filter.
     pub fn find(
         &mut self,
-        namespace: &str,
-        collection: &str,
+        collection: &CollectionPath,
         filter: &Document,
     ) -> Result<Vec<Document>> {
         let filter = Filter::parse(filter)?;
-        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
+        let entry = self.collection_entry(collection)?;
+        let prefix = entry.prefix();
+        let candidates = match index::plan(&filter, &entry) {
+            None => self.scan_range(&entry.documents())?,
+            Some(ranges) => {
+                // Keyed by Document key, so a Document found through several
+                // ranges is read once, and results stay in Document ID order.
+                let mut docs = BTreeMap::new();
+                for range in &ranges {
+                    match range {
+                        CandidateRange::Documents(range) => docs.extend(self.scan_range(range)?),
+                        CandidateRange::Index(range) => {
+                            for doc_id in self.scan_range(range)?.into_values() {
+                                let key = [prefix.as_slice(), &doc_id].concat();
+                                if !docs.contains_key(&key)
+                                    && let Some(bytes) = self.read(&key)?
+                                {
+                                    docs.insert(key, bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+                docs
+            }
+        };
         let mut out = Vec::new();
-        for bytes in self
-            .scan(&keys::collection_prefix(ns_id, coll_id))?
-            .values()
-        {
-            let doc = document::decode(bytes)?;
-            if filter.matches(&doc) {
-                out.push(doc);
+        for bytes in candidates.values() {
+            if filter.matches_raw(document::raw(bytes)?)? {
+                out.push(document::decode(bytes)?);
             }
         }
         Ok(out)
@@ -191,7 +333,14 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// partway, which poisons the Node: every later commit, read-only
     /// or not, fails with [`Error::Poisoned`].
     pub fn commit(self) -> Result<u64> {
-        let mut commits = self.node.commits.lock().expect("lock poisoned");
+        let node = self.node;
+        let mut commits = node.commits.lock().expect("lock poisoned");
+        self.commit_locked(&mut commits)
+    }
+
+    /// [`commit`](Self::commit), for a caller already holding the commit
+    /// lock.
+    pub(crate) fn commit_locked(self, commits: &mut CommitState) -> Result<u64> {
         if commits.poisoned {
             return Err(Error::Poisoned);
         }
@@ -212,30 +361,21 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 return Err(Error::CollectionChanged);
             }
         }
+        // Reads every Version ever written under the Collection, while
+        // holding the commit lock: rare (strict-field changes and Index
+        // creation on empty Collections) and bounded once garbage
+        // collection exists (v0.4).
+        for prefix in &self.collection_reads {
+            if mvcc::changed_since(engine, prefix, self.snapshot_ts)? {
+                return Err(Error::CollectionChanged);
+            }
+        }
         for key in self.write_set.keys() {
             if changed_since_snapshot(key)? {
                 return Err(Error::WriteConflict);
             }
         }
-        let commit_ts = commits.last + 1;
-        let Some(wal) = &mut commits.wal else {
-            engine.write_batch(mvcc::commit_batch(commit_ts, writes(&self.write_set)))?;
-            commits.last = commit_ts;
-            return Ok(commit_ts);
-        };
-        let record = wal::encode_record(commit_ts, writes(&self.write_set))?;
-        // Once the record may be in the WAL, any failure leaves the outcome
-        // unknown, and retrying fsync is unsafe (ADR 0004).
-        let outcome = wal.append(&record).map_err(Error::Io).and_then(|()| {
-            let batch = mvcc::commit_batch(commit_ts, writes(&self.write_set));
-            Ok(engine.write_batch(batch)?)
-        });
-        if let Err(cause) = outcome {
-            commits.poisoned = true;
-            return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
-        }
-        commits.last = commit_ts;
-        Ok(commit_ts)
+        self.node.apply_commit(commits, &self.write_set)
     }
 
     /// Abort, discarding the Write Set. Same as dropping the Transaction.

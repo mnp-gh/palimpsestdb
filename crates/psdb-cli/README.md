@@ -7,6 +7,8 @@ $ cargo run -p psdb-cli -- --data-dir ./data
 psdb> create-ns shop
 psdb> create-coll shop.orders
 psdb> insert shop.orders {"_id": 1, "item": "book", "qty": 2}
+psdb> set-type shop.orders qty int
+psdb> create-index shop.orders qty
 psdb> find shop.orders {"qty": {"$gt": 1}}
 psdb> begin
 psdb(txn)> delete shop.orders 1
@@ -14,5 +16,9 @@ psdb(txn)> abort
 ```
 
 Type `help` for every command.
+
+Commands piped in on stdin run as a script: the first error stops it with exit status 1, so an open Transaction is never committed. A script that ends with a Transaction still open also exits with status 1, and the Transaction is aborted.
+
+Only one `psdb` (or other Node) can have a `--data-dir` open at a time; a second one fails to start.
 
 **Depends on:** `psdb-core`, `psdb-storage-memory`. This is where the Storage Engine is chosen.

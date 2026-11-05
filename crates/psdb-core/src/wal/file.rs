@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 /// The one file the WAL lives in, and the directory that holds it.
 ///
 /// The WAL does all its I/O through this trait so tests can substitute
-/// [`SimDisk`](super::SimDisk), which simulates power loss.
+/// `SimDisk` (feature `testing`), which simulates power loss.
 ///
 /// Contract:
 ///
@@ -39,7 +39,8 @@ pub trait WalFile: Send {
     fn sync_dir(&mut self) -> io::Result<()>;
 }
 
-/// The WAL file `wal` in a directory on the real filesystem.
+/// The WAL file `wal` in a directory on the real filesystem, locked so
+/// only one Node at a time appends to it.
 pub struct OsWalFile {
     file: File,
     dir: PathBuf,
@@ -47,7 +48,10 @@ pub struct OsWalFile {
 
 impl OsWalFile {
     /// Open `dir/wal`, creating the file and, if needed, `dir` itself (but
-    /// not `dir`'s parents).
+    /// not `dir`'s parents). Fails with [`io::ErrorKind::WouldBlock`] if
+    /// another Node, in this process or another, has it open: two writers
+    /// would give out the same Commit Timestamps. The lock is released when
+    /// this is dropped.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         if !dir.exists() {
@@ -69,6 +73,13 @@ impl OsWalFile {
             .append(true)
             .create(true)
             .open(dir.join("wal"))?;
+        file.try_lock().map_err(|e| match e {
+            fs::TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("{} is already open in another Node", dir.display()),
+            ),
+            fs::TryLockError::Error(e) => e,
+        })?;
         Ok(Self { file, dir })
     }
 }

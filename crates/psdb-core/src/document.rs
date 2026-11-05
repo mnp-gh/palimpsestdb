@@ -1,10 +1,12 @@
 //! Document and name rules: limits, Document IDs, Namespace and Collection
-//! names.
+//! names, and reading a field of a stored Document.
 
-use bson::{Binary, Bson, Document, spec::BinarySubtype};
+use bson::{Binary, Bson, Document, RawBsonRef, RawDocument, spec::BinarySubtype};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
+use crate::field_path::FieldPath;
+use crate::keys;
 
 /// The largest Namespace or Collection name accepted, in bytes. Fixed by the
 /// key format.
@@ -14,13 +16,31 @@ pub const MAX_NAME_BYTES: usize = 64;
 ///
 /// Limits fixed by the on-disk format, such as [`MAX_NAME_BYTES`] and
 /// [`MAX_ID_BYTES`](crate::MAX_ID_BYTES), are constants instead.
+///
+/// New limits will be added, so start from the defaults and change what
+/// you need:
+///
+/// ```
+/// use psdb_core::Limits;
+///
+/// let limits = Limits::default().with_max_document_bytes(1024);
+/// assert_eq!(limits.max_document_bytes, 1024);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Limits {
     /// The largest Document accepted, in encoded BSON bytes.
     pub max_document_bytes: usize,
     /// The deepest nesting of documents and arrays accepted. A Document with
     /// no nested values has depth 1.
     pub max_nesting_depth: usize,
+    /// The largest Write Set a Transaction may build, counting the bytes of
+    /// every key and value written, Index entries included. A write that
+    /// would cross it fails with Transaction Too Large. The default leaves
+    /// room to replace a Document of the largest default size: the
+    /// Document, plus the old and new Index entries on its large fields,
+    /// each up to twice the field's size once NUL bytes are escaped.
+    pub max_write_set_bytes: usize,
 }
 
 impl Default for Limits {
@@ -28,12 +48,43 @@ impl Default for Limits {
         Self {
             max_document_bytes: 16 * 1024 * 1024,
             max_nesting_depth: 100,
+            max_write_set_bytes: 96 * 1024 * 1024,
+        }
+    }
+}
+
+impl Limits {
+    /// These limits with [`max_document_bytes`](Self::max_document_bytes)
+    /// set to `bytes`.
+    pub fn with_max_document_bytes(self, bytes: usize) -> Self {
+        Self {
+            max_document_bytes: bytes,
+            ..self
+        }
+    }
+
+    /// These limits with [`max_nesting_depth`](Self::max_nesting_depth)
+    /// set to `depth`.
+    pub fn with_max_nesting_depth(self, depth: usize) -> Self {
+        Self {
+            max_nesting_depth: depth,
+            ..self
+        }
+    }
+
+    /// These limits with [`max_write_set_bytes`](Self::max_write_set_bytes)
+    /// set to `bytes`.
+    pub fn with_max_write_set_bytes(self, bytes: usize) -> Self {
+        Self {
+            max_write_set_bytes: bytes,
+            ..self
         }
     }
 }
 
 /// Check a Namespace or Collection name: 1 to [`MAX_NAME_BYTES`] bytes, with
-/// no `.` (it separates Namespace from Collection) and no NUL.
+/// no `.` (it separates Namespace from Collection), no NUL and no
+/// whitespace (the CLI separates arguments with it).
 pub(crate) fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidName("names must not be empty".into()));
@@ -43,28 +94,40 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
             "{name:?} is longer than {MAX_NAME_BYTES} bytes"
         )));
     }
-    if name.contains(['.', '\0']) {
-        return Err(Error::InvalidName(format!("{name:?} contains '.' or NUL")));
+    if name.contains(['.', '\0']) || name.contains(char::is_whitespace) {
+        return Err(Error::InvalidName(format!(
+            "{name:?} contains '.', NUL or whitespace"
+        )));
     }
     Ok(())
 }
 
 /// Validate `doc` against `limits` and return it with its Document ID as
 /// the first field. If `doc` has no `_id`, `id` is used, or a new UUIDv7
-/// (BSON Binary subtype 4) is generated when `id` is `None`. If both are present they must be equal.
+/// (BSON Binary subtype 4) is generated when `id` is `None`. If both are
+/// present they must be the same Document ID: an int32 and an int64 of one
+/// value are, as their keys are equal.
 pub(crate) fn prepare(
     doc: Document,
     id: Option<&Bson>,
     limits: &Limits,
 ) -> Result<(Bson, Vec<u8>)> {
     let mut doc = doc;
+    let id_key = |id: &Bson| -> Result<Vec<u8>> {
+        let mut key = Vec::new();
+        keys::encode_id(id, &mut key)?;
+        Ok(key)
+    };
     let id = match (doc.remove("_id"), id) {
-        (Some(own), Some(given)) if own != *given => {
-            return Err(Error::InvalidDocument(format!(
-                "document _id {own} does not match the _id being replaced, {given}"
-            )));
+        (Some(own), Some(given)) => {
+            if id_key(&own)? != id_key(given)? {
+                return Err(Error::InvalidDocument(format!(
+                    "document _id {own} does not match the _id being replaced, {given}"
+                )));
+            }
+            own
         }
-        (Some(own), _) => own,
+        (Some(own), None) => own,
         (None, Some(given)) => given.clone(),
         (None, None) => generate_id(),
     };
@@ -121,9 +184,32 @@ fn too_deep(max: usize) -> Error {
     Error::InvalidDocument(format!("nesting is deeper than the limit of {max}"))
 }
 
+/// A stored Document, read in place.
+pub(crate) fn raw(bytes: &[u8]) -> Result<&RawDocument> {
+    RawDocument::from_bytes(bytes).map_err(|e| Error::Corruption(format!("stored document: {e}")))
+}
+
 /// Decode a stored Document.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Document> {
     Document::from_reader(bytes).map_err(|e| Error::Corruption(format!("stored document: {e}")))
+}
+
+/// The value at `path` in a stored Document, descending through nested
+/// documents only.
+pub(crate) fn lookup_raw(doc: &RawDocument, path: &FieldPath) -> Result<Option<Bson>> {
+    let corrupt = |e: bson::error::Error| Error::Corruption(format!("stored document: {e}"));
+    let (first, rest) = path
+        .segments()
+        .split_first()
+        .expect("a Field path has at least one segment");
+    let mut current = doc.get(first).map_err(corrupt)?;
+    for segment in rest {
+        current = match current {
+            Some(RawBsonRef::Document(d)) => d.get(segment).map_err(corrupt)?,
+            _ => return Ok(None),
+        };
+    }
+    current.map(Bson::try_from).transpose().map_err(corrupt)
 }
 
 #[cfg(test)]
@@ -159,6 +245,14 @@ mod tests {
     fn mismatched_id_is_rejected() {
         let err = prepare(doc! { "_id": 1 }, Some(&Bson::Int32(2)), &Limits::default());
         assert!(matches!(err, Err(Error::InvalidDocument(_))));
+        // One Document ID whatever the integer's width.
+        let (id, _) = prepare(
+            doc! { "_id": 1i64 },
+            Some(&Bson::Int32(1)),
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(id, Bson::Int64(1));
     }
 
     #[test]
@@ -194,7 +288,14 @@ mod tests {
     fn names() {
         assert!(validate_name("orders").is_ok());
         assert!(validate_name(&"n".repeat(MAX_NAME_BYTES)).is_ok());
-        for bad in ["", "a.b", "a\0b", &"n".repeat(MAX_NAME_BYTES + 1)] {
+        for bad in [
+            "",
+            "a.b",
+            "a\0b",
+            "a b",
+            "a\tb",
+            &"n".repeat(MAX_NAME_BYTES + 1),
+        ] {
             assert!(
                 matches!(validate_name(bad), Err(Error::InvalidName(_))),
                 "{bad:?}"

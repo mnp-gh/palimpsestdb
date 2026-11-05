@@ -2,13 +2,21 @@
 
 use std::fmt;
 
+use bson::Bson;
 use psdb_storage::StorageError;
+
+use crate::collection_path::CollectionPath;
+use crate::field_path::FieldPath;
 
 /// Result type for Database Layer operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Everything that can go wrong in the Database Layer.
+///
+/// New kinds of failure arrive with new features, so a `match` on it needs
+/// a `_` arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Abort: a concurrent Transaction committed a write to the same key
     /// first (first-committer-wins). Retryable.
@@ -20,23 +28,41 @@ pub enum Error {
     NoSuchNamespace(String),
     /// No Collection with this name exists in the Namespace at the
     /// Transaction's Snapshot.
-    NoSuchCollection {
-        /// The Namespace name.
-        namespace: String,
-        /// The Collection name.
-        collection: String,
-    },
+    NoSuchCollection(CollectionPath),
     /// A Namespace with this name already exists.
     NamespaceExists(String),
     /// A Collection with this name already exists in the Namespace.
-    CollectionExists {
-        /// The Namespace name.
-        namespace: String,
-        /// The Collection name.
-        collection: String,
-    },
+    CollectionExists(CollectionPath),
     /// A Document with this Document ID already exists in the Collection.
-    DuplicateId(String),
+    DuplicateId(Bson),
+    /// Duplicate Value: the write would give two Documents the same value
+    /// in a unique Index. Not an Abort, and not retryable.
+    DuplicateValue(String),
+    /// Type Mismatch: the write gives a Strict Field a value of another
+    /// type. Not an Abort, and not retryable.
+    TypeMismatch(String),
+    /// A Collection Schema change or Index definition breaks a rule, such
+    /// as indexing a field whose type is not declared.
+    InvalidSchema(String),
+    /// The Collection already has an Index on this field.
+    IndexExists {
+        /// The Collection.
+        collection: CollectionPath,
+        /// The Field path.
+        path: FieldPath,
+    },
+    /// The Collection has no Index on this field.
+    NoSuchIndex {
+        /// The Collection.
+        collection: CollectionPath,
+        /// The Field path.
+        path: FieldPath,
+    },
+    /// An Index can only be created inside a Transaction while its
+    /// Collection is empty; otherwise use
+    /// [`Node::create_index`](crate::Node::create_index), which
+    /// builds it on its own (ADR 0010).
+    CollectionNotEmpty(CollectionPath),
     /// A Namespace or Collection name breaks the naming rules.
     InvalidName(String),
     /// A value cannot be used as a Document ID.
@@ -47,18 +73,28 @@ pub enum Error {
     InvalidFilter(String),
     /// Stored data could not be decoded.
     Corruption(String),
+    /// No unused Namespace or Collection ID turned up in a bounded number
+    /// of random draws (ADR 0006): almost every ID has been used.
+    IdsExhausted,
     /// The Storage Engine failed.
     Storage(StorageError),
-    /// Reading or writing the WAL failed while opening a Node.
+    /// Reading or writing the WAL failed. While opening a Node this is
+    /// returned as is; during a commit it is the cause inside
+    /// [`Error::CommitOutcomeUnknown`].
     Io(std::io::Error),
     /// The WAL file has the wrong magic number or an unknown format
     /// version. It was left untouched.
     UnrecognisedWal(String),
-    /// The Transaction's WAL Record would exceed 4 GiB. Nothing was
-    /// written. Not retryable.
+    /// Transaction Too Large: the write would grow the Write Set past
+    /// [`Limits::max_write_set_bytes`](crate::Limits::max_write_set_bytes)
+    /// (the write is not made), or the WAL Record would exceed 4 GiB
+    /// (nothing is committed). Not an Abort, and not retryable.
     TransactionTooLarge,
-    /// [`Node::open`](crate::Node::open) was given an engine that
-    /// already holds data; the WAL is replayed into an empty engine.
+    /// A Node was opened over an engine that already holds data. Every
+    /// way of opening one starts from an empty engine: [`Node::open`]
+    /// replays its WAL into it.
+    ///
+    /// [`Node::open`]: crate::Node::open
     EngineNotEmpty,
     /// The commit could not be confirmed Durable, or was Durable but could
     /// not be Applied: the Transaction may or may not be present after the
@@ -93,27 +129,43 @@ impl fmt::Display for Error {
                 f.write_str("collection changed: a collection used by this transaction was dropped or altered; retry")
             }
             Error::NoSuchNamespace(namespace) => write!(f, "namespace {namespace:?} does not exist"),
-            Error::NoSuchCollection { namespace, collection } => {
-                write!(f, "collection {namespace}.{collection} does not exist")
+            Error::NoSuchCollection(collection) => {
+                write!(f, "collection {collection} does not exist")
             }
             Error::NamespaceExists(namespace) => write!(f, "namespace {namespace:?} already exists"),
-            Error::CollectionExists { namespace, collection } => {
-                write!(f, "collection {namespace}.{collection} already exists")
+            Error::CollectionExists(collection) => {
+                write!(f, "collection {collection} already exists")
             }
             Error::DuplicateId(id) => write!(f, "a document with _id {id} already exists"),
+            Error::DuplicateValue(msg) => write!(f, "duplicate value: {msg}"),
+            Error::TypeMismatch(msg) => write!(f, "type mismatch: {msg}"),
+            Error::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
+            Error::IndexExists { collection, path } => {
+                write!(f, "collection {collection} already has an index on {path}")
+            }
+            Error::NoSuchIndex { collection, path } => {
+                write!(f, "collection {collection} has no index on {path}")
+            }
+            Error::CollectionNotEmpty(collection) => write!(
+                f,
+                "collection {collection} holds documents, so its index must be built outside a transaction"
+            ),
             Error::InvalidName(msg) => write!(f, "invalid name: {msg}"),
             Error::InvalidId(msg) => write!(f, "invalid _id: {msg}"),
             Error::InvalidDocument(msg) => write!(f, "invalid document: {msg}"),
             Error::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Error::Corruption(msg) => write!(f, "corrupted data: {msg}"),
+            Error::IdsExhausted => f.write_str(
+                "no unused namespace or collection ID found; almost every ID has been used",
+            ),
             Error::Storage(e) => write!(f, "{e}"),
             Error::Io(e) => write!(f, "WAL I/O error: {e}"),
             Error::UnrecognisedWal(msg) => write!(f, "unrecognised WAL: {msg}"),
-            Error::TransactionTooLarge => {
-                f.write_str("transaction too large: its WAL record would exceed 4 GiB")
-            }
+            Error::TransactionTooLarge => f.write_str(
+                "transaction too large: its write set would exceed the configured limit or its WAL record 4 GiB",
+            ),
             Error::EngineNotEmpty => {
-                f.write_str("the storage engine already holds data; open a WAL into an empty engine")
+                f.write_str("the storage engine already holds data; open a node over an empty engine")
             }
             Error::CommitOutcomeUnknown(cause) => write!(
                 f,
