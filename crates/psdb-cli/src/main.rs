@@ -273,7 +273,7 @@ fn with_txn<'node, T>(
     .map_err(message)
 }
 
-/// The error as a message to print. Exits instead if the node can no
+/// The error as a message to print. Exits instead if the Node can no
 /// longer commit, so a script fed to `psdb` stops with a non-zero status.
 fn message(e: psdb_core::Error) -> String {
     if e.requires_reopen() {

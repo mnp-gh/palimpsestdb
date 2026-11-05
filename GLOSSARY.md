@@ -20,6 +20,10 @@ _Avoid_: Table, bucket
 A named group of Collections, and the unit to which permissions are granted.
 _Avoid_: Database (the Database Layer is the software, not a group of Collections), Schema, keyspace, tenant
 
+**Collection path**:
+The name of a Collection together with the name of its Namespace, written `<namespace>.<collection>` (e.g. `shop.orders`); it identifies one Collection on the Node.
+_Avoid_: Namespace (MongoDB's word for it, but a Namespace here is only the first part), full name, qualified name
+
 **Catalog**:
 The authoritative record of which Namespaces and Collections exist and how their names map to their identities.
 _Avoid_: Metadata store, schema registry
