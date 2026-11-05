@@ -34,8 +34,8 @@ pub const MAX_ID_BYTES: usize = 1024;
 /// MongoDB.
 const TAG_NULL: u8 = 0x05;
 const TAG_INTEGER: u8 = 0x10;
-/// A double, in Index keys only. A `double` Index holds only doubles, so the
-/// tag never has to order against [`TAG_INTEGER`].
+/// A double, in Index keys only. An Index on a `double` field keys only
+/// doubles, so the tag never has to order against [`TAG_INTEGER`].
 const TAG_DOUBLE: u8 = 0x11;
 const TAG_STRING: u8 = 0x20;
 const TAG_BINARY: u8 = 0x30;

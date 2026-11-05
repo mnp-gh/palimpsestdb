@@ -9,20 +9,24 @@ use bson::{Bson, Document};
 use psdb_storage::StorageEngine;
 
 use crate::catalog::CollectionEntry;
+use crate::collection_path::CollectionPath;
 use crate::document::{self, Limits};
 use crate::error::{Error, Result};
-use crate::index::{self, IndexDef, IndexInfo};
+use crate::field_path::FieldPath;
+use crate::index::{IndexDef, IndexInfo};
 use crate::keys;
 use crate::mvcc;
-use crate::schema::{self, FieldSchema};
+use crate::schema::FieldSchema;
 use crate::transaction::{self, Transaction, WriteSet};
 use crate::wal::{self, OsWalFile, Wal, WalFile};
 
 /// An Index build commits the entries for at most this many Documents at a
 /// time...
 const BUILD_CHUNK_DOCUMENTS: usize = 1024;
-/// ...and stops reading a chunk once its Documents reach this many bytes,
-/// so neither its memory nor its WAL Record grows with Document size.
+/// ...and of at most this many bytes of Documents, so neither its memory
+/// nor its WAL Record grows with Document size. A chunk always holds at
+/// least one Document, so one larger than this, allowed by raising
+/// [`Limits::max_document_bytes`], is a chunk of its own.
 const BUILD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// An embedded PalimpsestDB Node over the Storage Engine `E`.
@@ -38,9 +42,10 @@ const BUILD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 ///
 /// let node = Node::new(MemoryEngine::new());
 /// node.create_namespace("shop")?;
-/// node.create_collection("shop", "orders")?;
-/// let id = node.insert("shop", "orders", doc! { "item": "book" })?;
-/// assert_eq!(node.get("shop", "orders", &id)?.unwrap().get_str("item")?, "book");
+/// let orders = "shop.orders".parse()?;
+/// node.create_collection(&orders)?;
+/// let id = node.insert(&orders, doc! { "item": "book" })?;
+/// assert_eq!(node.get(&orders, &id)?.unwrap().get_str("item")?, "book");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct Node<E: StorageEngine> {
@@ -190,19 +195,20 @@ impl<E: StorageEngine> Node<E> {
     ///
     /// let node = Node::new(MemoryEngine::new());
     /// node.create_namespace("shop")?;
-    /// node.create_collection("shop", "orders")?;
-    /// node.insert("shop", "orders", doc! { "total": 30 })?;
+    /// let orders = "shop.orders".parse()?;
+    /// node.create_collection(&orders)?;
+    /// node.insert(&orders, doc! { "total": 30 })?;
     /// let total = FieldSchema { field_type: FieldType::Int, strict: false };
-    /// node.set_field_type("shop", "orders", "total", total)?;
-    /// node.create_index("shop", "orders", "total", false)?;
-    /// assert_eq!(node.find("shop", "orders", &doc! { "total": { "$gt": 10 } })?.len(), 1);
+    /// let total_path = "total".parse()?;
+    /// node.set_field_type(&orders, &total_path, total)?;
+    /// node.create_index(&orders, &total_path, false)?;
+    /// assert_eq!(node.find(&orders, &doc! { "total": { "$gt": 10 } })?.len(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn create_index(
         &self,
-        namespace: &str,
-        collection: &str,
-        path: &str,
+        collection: &CollectionPath,
+        path: &FieldPath,
         unique: bool,
     ) -> Result<()> {
         let mut commits = self.commits.lock().expect("lock poisoned");
@@ -210,10 +216,10 @@ impl<E: StorageEngine> Node<E> {
             return Err(Error::Poisoned);
         }
         let mut txn = Transaction::new(self, commits.last);
-        let (ns_id, mut entry, index) = txn.prepare_index(namespace, collection, path, unique)?;
-        self.build_index(&mut commits, ns_id, &entry, &index, txn.snapshot_ts())?;
+        let (mut entry, index) = txn.prepare_index(collection, path, unique)?;
+        self.build_index(&mut commits, &entry, &index, txn.snapshot_ts())?;
         entry.indexes.push(index);
-        txn.write_collection_entry(ns_id, &entry)?;
+        txn.write_collection_entry(&entry)?;
         txn.commit_locked(&mut commits)?;
         Ok(())
     }
@@ -223,57 +229,55 @@ impl<E: StorageEngine> Node<E> {
     fn build_index(
         &self,
         commits: &mut CommitState,
-        ns_id: u32,
         entry: &CollectionEntry,
         index: &IndexDef,
         snapshot_ts: u64,
     ) -> Result<()> {
-        let ty = entry.schema[&index.path].field_type;
-        let segments = schema::segments(&index.path);
-        let prefix = keys::collection_prefix(ns_id, entry.id);
-        let mut range = keys::documents_range(ns_id, entry.id);
+        let prefix_len = entry.prefix().len();
+        let mut range = entry.documents();
         loop {
-            let mut page = Vec::new();
-            let mut page_bytes = 0;
-            let mut more = false;
+            let mut docs = Vec::new();
+            let mut docs_bytes = 0;
+            // The first Document of the next chunk, if this one filled up
+            // before the Collection ended.
+            let mut next_chunk_start = None;
             mvcc::scan_range_at(&self.engine, &range, snapshot_ts, &mut |key, value| {
-                page_bytes += value.len();
-                page.push((key.to_vec(), value));
-                more = page.len() == BUILD_CHUNK_DOCUMENTS || page_bytes >= BUILD_CHUNK_BYTES;
-                if more {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
+                let full = docs.len() == BUILD_CHUNK_DOCUMENTS
+                    || (!docs.is_empty() && docs_bytes + value.len() > BUILD_CHUNK_BYTES);
+                if full {
+                    next_chunk_start = Some(key.to_vec());
+                    return ControlFlow::Break(());
                 }
+                docs_bytes += value.len();
+                docs.push((key.to_vec(), value));
+                ControlFlow::Continue(())
             })?;
             let mut chunk = WriteSet::new();
-            for (key, bytes) in &page {
-                let Some(c) = index::component_of(document::raw(bytes)?, &segments, ty)? else {
+            for (key, bytes) in &docs {
+                let doc_id = &key[prefix_len..];
+                let Some(index_entry) = entry.index_entry(index, document::raw(bytes)?, doc_id)?
+                else {
                     continue;
                 };
-                let doc_id = &key[prefix.len()..];
-                let entry_key = index::entry_key(ns_id, entry.id, index, &c, doc_id);
-                if index.unique
-                    && !keys::is_null(&c)
-                    && (chunk.contains_key(&entry_key)
-                        || mvcc::read_at(&self.engine, &entry_key, commits.last)?.is_some())
+                if index_entry.unique
+                    && (chunk.contains_key(&index_entry.key)
+                        || mvcc::read_at(&self.engine, &index_entry.key, commits.last)?.is_some())
                 {
                     return Err(Error::DuplicateValue(format!(
                         "two documents share a value of {}, so it cannot have a unique index",
                         index.path
                     )));
                 }
-                chunk.insert(entry_key, Some(doc_id.to_vec()));
+                chunk.insert(index_entry.key, Some(doc_id.to_vec()));
             }
             if !chunk.is_empty() {
                 self.apply_commit(commits, &chunk)?;
             }
-            // `more` means the chunk filled up, not that the Collection ended.
-            let (true, Some((last, _))) = (more, page.last()) else {
+            let Some(start) = next_chunk_start else {
                 return Ok(());
             };
-            // Past every Version of the last Document read.
-            range.start = [keys::physical_key(last, 0).as_slice(), &[0]].concat();
+            // The newest Version of a key sorts first, at timestamp u64::MAX.
+            range.start = keys::physical_key(&start, u64::MAX);
         }
     }
 
@@ -308,13 +312,13 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::create_collection`].
-    pub fn create_collection(&self, namespace: &str, name: &str) -> Result<()> {
-        self.run(|t| t.create_collection(namespace, name))
+    pub fn create_collection(&self, collection: &CollectionPath) -> Result<()> {
+        self.run(|t| t.create_collection(collection))
     }
 
     /// Autocommit [`Transaction::drop_collection`].
-    pub fn drop_collection(&self, namespace: &str, name: &str) -> Result<()> {
-        self.run(|t| t.drop_collection(namespace, name))
+    pub fn drop_collection(&self, collection: &CollectionPath) -> Result<()> {
+        self.run(|t| t.drop_collection(collection))
     }
 
     /// Autocommit [`Transaction::list_collections`].
@@ -323,73 +327,60 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::insert`].
-    pub fn insert(&self, namespace: &str, collection: &str, doc: Document) -> Result<Bson> {
-        self.run(|t| t.insert(namespace, collection, doc))
+    pub fn insert(&self, collection: &CollectionPath, doc: Document) -> Result<Bson> {
+        self.run(|t| t.insert(collection, doc))
     }
 
     /// Autocommit [`Transaction::get`].
-    pub fn get(&self, namespace: &str, collection: &str, id: &Bson) -> Result<Option<Document>> {
-        self.run(|t| t.get(namespace, collection, id))
+    pub fn get(&self, collection: &CollectionPath, id: &Bson) -> Result<Option<Document>> {
+        self.run(|t| t.get(collection, id))
     }
 
     /// Autocommit [`Transaction::replace`].
-    pub fn replace(
-        &self,
-        namespace: &str,
-        collection: &str,
-        id: &Bson,
-        doc: Document,
-    ) -> Result<bool> {
-        self.run(|t| t.replace(namespace, collection, id, doc))
+    pub fn replace(&self, collection: &CollectionPath, id: &Bson, doc: Document) -> Result<bool> {
+        self.run(|t| t.replace(collection, id, doc))
     }
 
     /// Autocommit [`Transaction::delete`].
-    pub fn delete(&self, namespace: &str, collection: &str, id: &Bson) -> Result<bool> {
-        self.run(|t| t.delete(namespace, collection, id))
+    pub fn delete(&self, collection: &CollectionPath, id: &Bson) -> Result<bool> {
+        self.run(|t| t.delete(collection, id))
     }
 
     /// Autocommit [`Transaction::set_field_type`].
     pub fn set_field_type(
         &self,
-        namespace: &str,
-        collection: &str,
-        path: &str,
+        collection: &CollectionPath,
+        path: &FieldPath,
         field: FieldSchema,
     ) -> Result<()> {
-        self.run(|t| t.set_field_type(namespace, collection, path, field))
+        self.run(|t| t.set_field_type(collection, path, field))
     }
 
     /// Autocommit [`Transaction::remove_field_type`].
-    pub fn remove_field_type(&self, namespace: &str, collection: &str, path: &str) -> Result<()> {
-        self.run(|t| t.remove_field_type(namespace, collection, path))
+    pub fn remove_field_type(&self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
+        self.run(|t| t.remove_field_type(collection, path))
     }
 
     /// Autocommit [`Transaction::collection_schema`].
     pub fn collection_schema(
         &self,
-        namespace: &str,
-        collection: &str,
-    ) -> Result<BTreeMap<String, FieldSchema>> {
-        self.run(|t| t.collection_schema(namespace, collection))
+        collection: &CollectionPath,
+    ) -> Result<BTreeMap<FieldPath, FieldSchema>> {
+        self.run(|t| t.collection_schema(collection))
     }
 
     /// Autocommit [`Transaction::drop_index`].
-    pub fn drop_index(&self, namespace: &str, collection: &str, path: &str) -> Result<()> {
-        self.run(|t| t.drop_index(namespace, collection, path))
+    pub fn drop_index(&self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
+        self.run(|t| t.drop_index(collection, path))
     }
 
     /// Autocommit [`Transaction::list_indexes`].
-    pub fn list_indexes(&self, namespace: &str, collection: &str) -> Result<Vec<IndexInfo>> {
-        self.run(|t| t.list_indexes(namespace, collection))
+    pub fn list_indexes(&self, collection: &CollectionPath) -> Result<Vec<IndexInfo>> {
+        self.run(|t| t.list_indexes(collection))
     }
 
     /// Autocommit [`Transaction::find`].
-    pub fn find(
-        &self,
-        namespace: &str,
-        collection: &str,
-        filter: &Document,
-    ) -> Result<Vec<Document>> {
-        self.run(|t| t.find(namespace, collection, filter))
+    pub fn find(&self, collection: &CollectionPath, filter: &Document) -> Result<Vec<Document>> {
+        self.run(|t| t.find(collection, filter))
     }
 }

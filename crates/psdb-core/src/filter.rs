@@ -13,7 +13,7 @@
 
 use std::cmp::Ordering;
 
-use bson::{Bson, Document, RawBsonRef, RawDocument};
+use bson::{Bson, Document, RawBsonRef, RawDocument, RawDocumentBuf};
 
 use crate::error::{Error, Result};
 
@@ -59,9 +59,10 @@ impl Filter {
     /// use bson::doc;
     /// use psdb_core::Filter;
     ///
-    /// let filter = Filter::parse(&doc! { "age": { "$gte": 18 }, "address.city": "Paris" }).unwrap();
-    /// assert!(filter.matches(&doc! { "age": 30, "address": { "city": "Paris" } }));
-    /// assert!(!filter.matches(&doc! { "age": 12, "address": { "city": "Paris" } }));
+    /// let filter = Filter::parse(&doc! { "age": { "$gte": 18 }, "address.city": "Paris" })?;
+    /// assert!(filter.matches(&doc! { "age": 30, "address": { "city": "Paris" } })?);
+    /// assert!(!filter.matches(&doc! { "age": 12, "address": { "city": "Paris" } })?);
+    /// # Ok::<(), psdb_core::Error>(())
     /// ```
     pub fn parse(filter: &Document) -> Result<Filter> {
         let mut clauses = Vec::new();
@@ -84,13 +85,12 @@ impl Filter {
         })
     }
 
-    /// Whether `doc` matches this filter.
-    pub fn matches(&self, doc: &Document) -> bool {
-        match self {
-            Filter::And(fs) => fs.iter().all(|f| f.matches(doc)),
-            Filter::Or(fs) => fs.iter().any(|f| f.matches(doc)),
-            Filter::Compare { path, op, value } => compare_at(lookup(doc, path), *op, value),
-        }
+    /// Whether `doc` matches this filter. Fails with
+    /// [`Error::InvalidDocument`] if `doc` cannot be encoded as BSON.
+    pub fn matches(&self, doc: &Document) -> Result<bool> {
+        let raw = RawDocumentBuf::try_from(doc)
+            .map_err(|e| Error::InvalidDocument(format!("cannot encode as BSON: {e}")))?;
+        self.matches_raw(&raw)
     }
 
     /// Whether a stored Document matches, reading only the fields the
@@ -182,21 +182,8 @@ fn parse_field(path: &str, value: &Bson) -> Result<Vec<Filter>> {
         .collect()
 }
 
-/// The value at `path`, descending through nested documents only.
-fn lookup<'a>(doc: &'a Document, path: &[String]) -> Option<&'a Bson> {
-    let (first, rest) = path.split_first()?;
-    let mut current = doc.get(first)?;
-    for segment in rest {
-        match current {
-            Bson::Document(d) => current = d.get(segment)?,
-            _ => return None,
-        }
-    }
-    Some(current)
-}
-
 /// The value at `path` in a stored Document, descending through nested
-/// documents only, as [`lookup`] does.
+/// documents only.
 pub(crate) fn lookup_raw(doc: &RawDocument, path: &[String]) -> Result<Option<Bson>> {
     let corrupt = |e: bson::error::Error| Error::Corruption(format!("stored document: {e}"));
     let Some((first, rest)) = path.split_first() else {
@@ -298,7 +285,7 @@ mod tests {
     use super::*;
 
     fn matches(filter: Document, doc: Document) -> bool {
-        Filter::parse(&filter).unwrap().matches(&doc)
+        Filter::parse(&filter).unwrap().matches(&doc).unwrap()
     }
 
     #[test]
@@ -363,24 +350,6 @@ mod tests {
             };
             if let Some(want) = exact {
                 prop_assert_eq!(cmp_int_double(i, f), Some(want));
-            }
-        }
-
-        #[test]
-        fn raw_and_decoded_matching_agree(a in -3i32..3, b in prop::option::of(-3i32..3), target in -3i32..3) {
-            let mut doc = doc! { "x": { "a": a } };
-            if let Some(b) = b {
-                doc.insert("b", b);
-            }
-            let raw = bson::RawDocumentBuf::try_from(&doc).unwrap();
-            for filter in [
-                doc! { "x.a": { "$gte": target } },
-                doc! { "b": target },
-                doc! { "b": null },
-                doc! { "$or": [ { "x.a": target }, { "b": { "$lt": target } } ] },
-            ] {
-                let f = Filter::parse(&filter).unwrap();
-                prop_assert_eq!(f.matches_raw(&raw).unwrap(), f.matches(&doc), "{}", filter);
             }
         }
     }

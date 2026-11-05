@@ -4,6 +4,9 @@ use std::fmt;
 
 use psdb_storage::StorageError;
 
+use crate::collection_path::CollectionPath;
+use crate::field_path::FieldPath;
+
 /// Result type for Database Layer operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -20,21 +23,11 @@ pub enum Error {
     NoSuchNamespace(String),
     /// No Collection with this name exists in the Namespace at the
     /// Transaction's Snapshot.
-    NoSuchCollection {
-        /// The Namespace name.
-        namespace: String,
-        /// The Collection name.
-        collection: String,
-    },
+    NoSuchCollection(CollectionPath),
     /// A Namespace with this name already exists.
     NamespaceExists(String),
     /// A Collection with this name already exists in the Namespace.
-    CollectionExists {
-        /// The Namespace name.
-        namespace: String,
-        /// The Collection name.
-        collection: String,
-    },
+    CollectionExists(CollectionPath),
     /// A Document with this Document ID already exists in the Collection.
     DuplicateId(String),
     /// Duplicate Value: the write would give two Documents the same value
@@ -48,32 +41,23 @@ pub enum Error {
     InvalidSchema(String),
     /// The Collection already has an Index on this field.
     IndexExists {
-        /// The Namespace name.
-        namespace: String,
-        /// The Collection name.
-        collection: String,
-        /// The field path.
-        path: String,
+        /// The Collection.
+        collection: CollectionPath,
+        /// The Field path.
+        path: FieldPath,
     },
     /// The Collection has no Index on this field.
     NoSuchIndex {
-        /// The Namespace name.
-        namespace: String,
-        /// The Collection name.
-        collection: String,
-        /// The field path.
-        path: String,
+        /// The Collection.
+        collection: CollectionPath,
+        /// The Field path.
+        path: FieldPath,
     },
     /// An Index can only be created inside a Transaction while its
     /// Collection is empty; otherwise use
     /// [`Node::create_index`](crate::Node::create_index), which
     /// builds it on its own (ADR 0010).
-    CollectionNotEmpty {
-        /// The Namespace name.
-        namespace: String,
-        /// The Collection name.
-        collection: String,
-    },
+    CollectionNotEmpty(CollectionPath),
     /// A Namespace or Collection name breaks the naming rules.
     InvalidName(String),
     /// A value cannot be used as a Document ID.
@@ -132,26 +116,26 @@ impl fmt::Display for Error {
                 f.write_str("collection changed: a collection used by this transaction was dropped or altered; retry")
             }
             Error::NoSuchNamespace(namespace) => write!(f, "namespace {namespace:?} does not exist"),
-            Error::NoSuchCollection { namespace, collection } => {
-                write!(f, "collection {namespace}.{collection} does not exist")
+            Error::NoSuchCollection(collection) => {
+                write!(f, "collection {collection} does not exist")
             }
             Error::NamespaceExists(namespace) => write!(f, "namespace {namespace:?} already exists"),
-            Error::CollectionExists { namespace, collection } => {
-                write!(f, "collection {namespace}.{collection} already exists")
+            Error::CollectionExists(collection) => {
+                write!(f, "collection {collection} already exists")
             }
             Error::DuplicateId(id) => write!(f, "a document with _id {id} already exists"),
             Error::DuplicateValue(msg) => write!(f, "duplicate value: {msg}"),
             Error::TypeMismatch(msg) => write!(f, "type mismatch: {msg}"),
             Error::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
-            Error::IndexExists { namespace, collection, path } => {
-                write!(f, "collection {namespace}.{collection} already has an index on {path}")
+            Error::IndexExists { collection, path } => {
+                write!(f, "collection {collection} already has an index on {path}")
             }
-            Error::NoSuchIndex { namespace, collection, path } => {
-                write!(f, "collection {namespace}.{collection} has no index on {path}")
+            Error::NoSuchIndex { collection, path } => {
+                write!(f, "collection {collection} has no index on {path}")
             }
-            Error::CollectionNotEmpty { namespace, collection } => write!(
+            Error::CollectionNotEmpty(collection) => write!(
                 f,
-                "collection {namespace}.{collection} holds documents, so its index must be built outside a transaction"
+                "collection {collection} holds documents, so its index must be built outside a transaction"
             ),
             Error::InvalidName(msg) => write!(f, "invalid name: {msg}"),
             Error::InvalidId(msg) => write!(f, "invalid _id: {msg}"),

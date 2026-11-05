@@ -3,9 +3,10 @@
 //!
 //! An Index has no type of its own: it covers values of its field's Field
 //! Type, read from the Collection Schema (see [`crate::schema`]). Values of
-//! other types are left out of it, except that an `int` Index files a
-//! double under its floor and a `double` Index files an integer as the
-//! nearest double, because filters compare integers and doubles as numbers.
+//! other types are left out of it, except that an Index on an `int` field
+//! files a double under its floor and one on a `double` field files an
+//! integer as the nearest double, because filters compare integers and
+//! doubles as numbers.
 //!
 //! An Index entry's logical key is `namespace_id ‖ collection_id ‖ 0x00 ‖
 //! index_id ‖ component ‖ document_id`, inside its Collection's range but
@@ -19,22 +20,24 @@
 //! Entries point to Document IDs, never to where a Version is stored, so a
 //! write that leaves the indexed value unchanged writes nothing to the
 //! Index. A lookup always fetches the Document at its Snapshot and rechecks
-//! the whole filter, which also makes coerced keys safe: an `int` Index
-//! files `30.5` under `30`, and range scans include their bounds.
+//! the whole filter, which also makes coerced keys safe: an Index on an
+//! `int` field files `30.5` under `30`, and range scans include their
+//! bounds.
 
-use bson::{Bson, RawDocument};
+use bson::Bson;
 use psdb_storage::KeyRange;
 
-use crate::error::Result;
-use crate::filter::{CompareOp, Filter, lookup_raw};
+use crate::catalog::CollectionEntry;
+use crate::field_path::FieldPath;
+use crate::filter::{CompareOp, Filter};
 use crate::keys;
-use crate::schema::{FieldType, Schema};
+use crate::schema::FieldType;
 
 /// An Index as clients see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexInfo {
-    /// The indexed field path, such as `address.city`.
-    pub path: String,
+    /// The indexed field's path, such as `address.city`.
+    pub path: FieldPath,
     /// Whether no two Documents may share a value in the field.
     pub unique: bool,
 }
@@ -42,15 +45,39 @@ pub struct IndexInfo {
 /// An Index as the Catalog stores it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexDef {
-    pub(crate) path: String,
+    pub(crate) path: FieldPath,
     /// Unique within its Collection and never reused there (ADR 0006).
     pub(crate) id: u32,
     pub(crate) unique: bool,
 }
 
+/// A Document's entry in an Index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexEntry {
+    /// The entry's logical key.
+    pub(crate) key: Vec<u8>,
+    /// Whether no other Document may have this key: true in a unique Index,
+    /// except for null and missing, which never collide.
+    pub(crate) unique: bool,
+}
+
+impl IndexEntry {
+    /// The entry in `index`, whose keys start with `prefix`, for the
+    /// Document with encoded ID `doc_id` and key component `component`.
+    pub(crate) fn new(prefix: Vec<u8>, index: &IndexDef, component: &[u8], doc_id: &[u8]) -> Self {
+        let unique = index.unique && !keys::is_null(component);
+        let mut key = prefix;
+        key.extend_from_slice(component);
+        if !unique {
+            key.extend_from_slice(doc_id);
+        }
+        Self { key, unique }
+    }
+}
+
 /// The Index key component for `value` (`None` when the field is missing),
-/// or `None` if the value is left out of an Index of type `ty`.
-pub(crate) fn component(value: Option<&Bson>, ty: FieldType) -> Option<Vec<u8>> {
+/// or `None` if an Index on a field of Field Type `ty` leaves the value out.
+pub(crate) fn key_component(value: Option<&Bson>, ty: FieldType) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match (value, ty) {
         (None | Some(Bson::Null), _) => keys::push_null(&mut out),
@@ -63,11 +90,9 @@ pub(crate) fn component(value: Option<&Bson>, ty: FieldType) -> Option<Vec<u8>> 
         // Rounds to the nearest double, which keeps the order.
         (Some(Bson::Int64(n)), FieldType::Double) => keys::push_double(&mut out, *n as f64),
         (Some(Bson::Double(f)), FieldType::Double) => keys::push_double(&mut out, *f),
-        (Some(v @ Bson::String(_)), FieldType::String)
-        | (Some(v @ Bson::DateTime(_)), FieldType::Date)
-        | (Some(v @ Bson::Boolean(_)), FieldType::Bool)
-        | (Some(v @ Bson::ObjectId(_)), FieldType::ObjectId)
-        | (Some(v @ Bson::Binary(_)), FieldType::Binary) => {
+        // Every pair of numbers was handled above; the other Field Types are
+        // Document ID types, encoded as Document IDs are.
+        (Some(v), _) if FieldType::of(v) == Some(ty) => {
             keys::encode_id(v, &mut out).expect("every Document ID type encodes")
         }
         _ => return None,
@@ -75,36 +100,9 @@ pub(crate) fn component(value: Option<&Bson>, ty: FieldType) -> Option<Vec<u8>> 
     Some(out)
 }
 
-/// The Index key component for the value at the path with `segments` in a
-/// stored Document.
-pub(crate) fn component_of(
-    doc: &RawDocument,
-    segments: &[String],
-    ty: FieldType,
-) -> Result<Option<Vec<u8>>> {
-    Ok(component(lookup_raw(doc, segments)?.as_ref(), ty))
-}
-
-/// The logical key of the entry for the Document with encoded ID `doc_id`
-/// under `component`.
-pub(crate) fn entry_key(
-    namespace_id: u32,
-    collection_id: u32,
-    index: &IndexDef,
-    component: &[u8],
-    doc_id: &[u8],
-) -> Vec<u8> {
-    let mut key = keys::index_prefix(namespace_id, collection_id, index.id);
-    key.extend_from_slice(component);
-    if !index.unique || keys::is_null(component) {
-        key.extend_from_slice(doc_id);
-    }
-    key
-}
-
-/// A range of keys `find` reads candidates from.
+/// A range of keys `find` reads candidate Documents from.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Source {
+pub(crate) enum CandidateRange {
     /// Index entries, whose values are the encoded IDs of the Documents to
     /// fetch.
     Index(KeyRange),
@@ -113,8 +111,8 @@ pub(crate) enum Source {
     Documents(KeyRange),
 }
 
-/// The ranges to read for `filter`, or `None` to scan the whole
-/// Collection. Every Document the filter can match is in at least one
+/// The ranges of the Collection with Catalog entry `collection` to read
+/// for `filter`, or `None` to scan the whole Collection. Every Document the filter can match is in at least one
 /// range; ranges may overlap.
 ///
 /// A comparison can use a range when it must hold for the filter to match
@@ -126,29 +124,22 @@ pub(crate) enum Source {
 /// and other range comparisons on the chosen field narrow the range. `$ne`
 /// never uses a range, and neither does an `$or` with a branch that
 /// cannot: that branch's Documents would be missed.
-pub(crate) fn plan(
-    filter: &Filter,
-    namespace_id: u32,
-    collection_id: u32,
-    schema: &Schema,
-    indexes: &[IndexDef],
-) -> Option<Vec<Source>> {
+pub(crate) fn plan(filter: &Filter, collection: &CollectionEntry) -> Option<Vec<CandidateRange>> {
     let mut comparisons = Vec::new();
     let mut ors = Vec::new();
     collect_conjuncts(filter, &mut comparisons, &mut ors);
-    let candidates: Vec<(String, bool, Source)> = comparisons
+    let candidates: Vec<(String, bool, CandidateRange)> = comparisons
         .into_iter()
         .filter_map(|(path, op, value)| {
-            let source = if path == "_id" {
-                let base = keys::collection_prefix(namespace_id, collection_id);
-                Source::Documents(bounds(base, id_type(value)?, op, value)?)
+            let range = if path == "_id" {
+                let base = collection.prefix();
+                CandidateRange::Documents(bounds(base, id_type(value)?, op, value)?)
             } else {
-                let index = indexes.iter().find(|i| i.path == path)?;
-                let ty = schema.get(&index.path)?.field_type;
-                let base = keys::index_prefix(namespace_id, collection_id, index.id);
-                Source::Index(bounds(base, ty, op, value)?)
+                let index = collection.index_on(&path)?;
+                let ty = collection.schema.get(&index.path)?.field_type;
+                CandidateRange::Index(bounds(collection.index_prefix(index), ty, op, value)?)
             };
-            Some((path, op == CompareOp::Eq, source))
+            Some((path, op == CompareOp::Eq, range))
         })
         .collect();
     let equality = candidates
@@ -157,20 +148,20 @@ pub(crate) fn plan(
         .or_else(|| candidates.iter().find(|(_, eq, _)| *eq));
     if equality.is_none() {
         let union = ors.iter().find_map(|branches| {
-            branches.iter().try_fold(Vec::new(), |mut sources, branch| {
-                sources.extend(plan(branch, namespace_id, collection_id, schema, indexes)?);
-                Some(sources)
+            branches.iter().try_fold(Vec::new(), |mut ranges, branch| {
+                ranges.extend(plan(branch, collection)?);
+                Some(ranges)
             })
         });
         if union.is_some() {
             return union;
         }
     }
-    let (chosen, _, mut source) = equality.or_else(|| candidates.first())?.clone();
-    let (Source::Index(range) | Source::Documents(range)) = &mut source;
+    let (chosen, _, mut candidate) = equality.or_else(|| candidates.first())?.clone();
+    let (CandidateRange::Index(range) | CandidateRange::Documents(range)) = &mut candidate;
     for (path, _, other) in &candidates {
         if *path == chosen {
-            let (Source::Index(other) | Source::Documents(other)) = other;
+            let (CandidateRange::Index(other) | CandidateRange::Documents(other)) = other;
             if other.start > range.start {
                 range.start = other.start.clone();
             }
@@ -179,22 +170,17 @@ pub(crate) fn plan(
             }
         }
     }
-    Some(vec![source])
+    Some(vec![candidate])
 }
 
-/// The Field Type whose Index keys sort `_id` values the way filters compare them
-/// with `value`. Document IDs are encoded as Index keys are, integers as in
-/// an `int` Index; `_id` is never a double, so a double filter value works
-/// as it does against an `int` Index.
+/// The Field Type whose Index keys sort `_id` values the way filters
+/// compare them with `value`. Document IDs are encoded as Index keys are,
+/// integers as in an Index on an `int` field; `_id` is never a double, so a
+/// double filter value works as it does against such an Index.
 fn id_type(value: &Bson) -> Option<FieldType> {
-    match value {
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => Some(FieldType::Int),
-        Bson::String(_) => Some(FieldType::String),
-        Bson::DateTime(_) => Some(FieldType::Date),
-        Bson::Boolean(_) => Some(FieldType::Bool),
-        Bson::ObjectId(_) => Some(FieldType::ObjectId),
-        Bson::Binary(_) => Some(FieldType::Binary),
-        _ => None,
+    match FieldType::of(value)? {
+        FieldType::Double => Some(FieldType::Int),
+        ty => Some(ty),
     }
 }
 
@@ -221,8 +207,8 @@ fn collect_conjuncts<'f>(
 fn bounds(base: Vec<u8>, ty: FieldType, op: CompareOp, value: &Bson) -> Option<KeyRange> {
     let comp = match value {
         // `{f: null}` matches null and missing, which share one component.
-        Bson::Null if op == CompareOp::Eq => component(None, ty)?,
-        v if ty.compares_with(v) => component(Some(v), ty)?,
+        Bson::Null if op == CompareOp::Eq => key_component(None, ty)?,
+        v if ty.compares_with(v) => key_component(Some(v), ty)?,
         _ => return None,
     };
     let at = |bytes: &[u8]| [base.as_slice(), bytes].concat();
@@ -244,11 +230,11 @@ mod tests {
     use bson::doc;
 
     use super::*;
-    use crate::schema::FieldSchema;
+    use crate::schema::{FieldSchema, Schema};
 
     fn schema(path: &str, field_type: FieldType) -> Schema {
         Schema::from([(
-            path.to_owned(),
+            path.parse().unwrap(),
             FieldSchema {
                 field_type,
                 strict: false,
@@ -258,7 +244,7 @@ mod tests {
 
     fn index(path: &str, id: u32) -> IndexDef {
         IndexDef {
-            path: path.into(),
+            path: path.parse().unwrap(),
             id,
             unique: false,
         }
@@ -268,17 +254,25 @@ mod tests {
         filter: bson::Document,
         schema: &Schema,
         indexes: &[IndexDef],
-    ) -> Option<Vec<Source>> {
-        plan(&Filter::parse(&filter).unwrap(), 1, 3, schema, indexes)
+    ) -> Option<Vec<CandidateRange>> {
+        let collection = CollectionEntry {
+            namespace_id: 1,
+            name: "c".into(),
+            id: 3,
+            schema: schema.clone(),
+            indexes: indexes.to_vec(),
+            next_index_id: 0,
+        };
+        plan(&Filter::parse(&filter).unwrap(), &collection)
     }
 
-    fn range(source: &Source) -> &KeyRange {
-        let (Source::Index(r) | Source::Documents(r)) = source;
+    fn range(candidate: &CandidateRange) -> &KeyRange {
+        let (CandidateRange::Index(r) | CandidateRange::Documents(r)) = candidate;
         r
     }
 
     fn comp(v: Bson, ty: FieldType) -> Vec<u8> {
-        component(Some(&v), ty).unwrap()
+        key_component(Some(&v), ty).unwrap()
     }
 
     #[test]
@@ -299,28 +293,31 @@ mod tests {
             comp(Bson::Int64(i64::MAX), Int),
             "saturates"
         );
-        assert_eq!(component(Some(&Bson::Double(f64::NAN)), Double), None);
+        assert_eq!(key_component(Some(&Bson::Double(f64::NAN)), Double), None);
         assert_eq!(
-            component(Some(&Bson::String("30".into())), Int),
+            key_component(Some(&Bson::String("30".into())), Int),
             None,
             "strings are not numbers"
         );
-        assert_eq!(component(Some(&Bson::Array(vec![])), Int), None);
-        assert_eq!(component(None, Int), component(Some(&Bson::Null), String));
+        assert_eq!(key_component(Some(&Bson::Array(vec![])), Int), None);
+        assert_eq!(
+            key_component(None, Int),
+            key_component(Some(&Bson::Null), String)
+        );
     }
 
     #[test]
     fn plan_prefers_equality_and_narrows_ranges() {
         let s = Schema::from([
             (
-                "age".to_owned(),
+                "age".parse().unwrap(),
                 FieldSchema {
                     field_type: FieldType::Int,
                     strict: false,
                 },
             ),
             (
-                "status".to_owned(),
+                "status".parse().unwrap(),
                 FieldSchema {
                     field_type: FieldType::String,
                     strict: false,
@@ -369,14 +366,14 @@ mod tests {
     fn or_reads_the_union_when_every_branch_is_indexed() {
         let s = Schema::from([
             (
-                "age".to_owned(),
+                "age".parse().unwrap(),
                 FieldSchema {
                     field_type: FieldType::Int,
                     strict: false,
                 },
             ),
             (
-                "status".to_owned(),
+                "status".parse().unwrap(),
                 FieldSchema {
                     field_type: FieldType::String,
                     strict: false,
@@ -426,7 +423,7 @@ mod tests {
         let s = schema("age", FieldType::Int);
         let ix = [index("age", 7)];
         let docs = |filter| match planned(filter, &s, &ix).as_deref() {
-            Some([Source::Documents(r)]) => Some(r.clone()),
+            Some([CandidateRange::Documents(r)]) => Some(r.clone()),
             _ => None,
         };
         let one = docs(doc! { "_id": 5 }).unwrap();

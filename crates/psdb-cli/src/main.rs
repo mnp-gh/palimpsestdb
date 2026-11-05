@@ -9,7 +9,7 @@ use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 
 use bson::{Binary, Bson, Document, spec::BinarySubtype};
-use psdb_core::{FieldSchema, FieldType, Node, Transaction};
+use psdb_core::{CollectionPath, FieldPath, FieldSchema, FieldType, Node, Transaction};
 use psdb_storage_memory::MemoryEngine;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -207,34 +207,34 @@ fn execute<'node>(
         "drop-ns" => with_txn(node, txn, |t| t.drop_namespace(rest))?,
         "colls" => print_names(&with_txn(node, txn, |t| t.list_collections(rest))?),
         "create-coll" => {
-            let (ns, coll) = collection_path(rest)?;
-            with_txn(node, txn, |t| t.create_collection(ns, coll))?;
+            let coll = collection_path(rest)?;
+            with_txn(node, txn, |t| t.create_collection(&coll))?;
         }
         "drop-coll" => {
-            let (ns, coll) = collection_path(rest)?;
-            with_txn(node, txn, |t| t.drop_collection(ns, coll))?;
+            let coll = collection_path(rest)?;
+            with_txn(node, txn, |t| t.drop_collection(&coll))?;
         }
 
         "insert" => {
-            let ((ns, coll), args) = split_collection_path(rest)?;
+            let (coll, args) = split_collection_path(rest)?;
             let [doc] = values::<1>(args)?;
             let doc = as_document(doc)?;
-            let id = with_txn(node, txn, |t| t.insert(ns, coll, doc))?;
+            let id = with_txn(node, txn, |t| t.insert(&coll, doc))?;
             println!("{}", to_json(id));
         }
         "get" => {
-            let ((ns, coll), args) = split_collection_path(rest)?;
+            let (coll, args) = split_collection_path(rest)?;
             let [id] = values::<1>(args)?;
-            match with_txn(node, txn, |t| t.get(ns, coll, &id))? {
+            match with_txn(node, txn, |t| t.get(&coll, &id))? {
                 Some(doc) => println!("{}", to_json(Bson::Document(doc))),
                 None => not_found(&id),
             }
         }
         "replace" => {
-            let ((ns, coll), args) = split_collection_path(rest)?;
+            let (coll, args) = split_collection_path(rest)?;
             let [id, doc] = values::<2>(args)?;
             let doc = as_document(doc)?;
-            let replaced = with_txn(node, txn, |t| t.replace(ns, coll, &id, doc))?;
+            let replaced = with_txn(node, txn, |t| t.replace(&coll, &id, doc))?;
             if replaced {
                 println!("replaced");
             } else {
@@ -242,9 +242,9 @@ fn execute<'node>(
             }
         }
         "delete" => {
-            let ((ns, coll), args) = split_collection_path(rest)?;
+            let (coll, args) = split_collection_path(rest)?;
             let [id] = values::<1>(args)?;
-            let deleted = with_txn(node, txn, |t| t.delete(ns, coll, &id))?;
+            let deleted = with_txn(node, txn, |t| t.delete(&coll, &id))?;
             if deleted {
                 println!("deleted");
             } else {
@@ -252,13 +252,13 @@ fn execute<'node>(
             }
         }
         "find" => {
-            let ((ns, coll), args) = split_collection_path(rest)?;
+            let (coll, args) = split_collection_path(rest)?;
             let filter = if args.is_empty() {
                 Document::new()
             } else {
                 as_document(values::<1>(args)?[0].clone())?
             };
-            let docs = with_txn(node, txn, |t| t.find(ns, coll, &filter))?;
+            let docs = with_txn(node, txn, |t| t.find(&coll, &filter))?;
             for doc in &docs {
                 println!("{}", to_json(Bson::Document(doc.clone())));
             }
@@ -266,8 +266,8 @@ fn execute<'node>(
         }
 
         "schema" => {
-            let (d, c) = collection_path(rest)?;
-            for (path, field) in with_txn(node, txn, |t| t.collection_schema(d, c))? {
+            let coll = collection_path(rest)?;
+            for (path, field) in with_txn(node, txn, |t| t.collection_schema(&coll))? {
                 let strict = if field.strict { " strict" } else { "" };
                 println!("{path}: {}{strict}", field.field_type);
             }
@@ -281,18 +281,20 @@ fn execute<'node>(
             };
             let field_type: FieldType = field_type.parse().map_err(message)?;
             let field = FieldSchema { field_type, strict };
-            with_txn(node, txn, |t| t.set_field_type(coll.0, coll.1, path, field))?;
+            let path = field_path(path)?;
+            with_txn(node, txn, |t| t.set_field_type(&coll, &path, field))?;
         }
         "unset-type" => {
             let (coll, args) = split_collection_path(rest)?;
             let [path] = words(args)[..] else {
                 return Err("usage: unset-type <ns>.<coll> <path>".into());
             };
-            with_txn(node, txn, |t| t.remove_field_type(coll.0, coll.1, path))?;
+            let path = field_path(path)?;
+            with_txn(node, txn, |t| t.remove_field_type(&coll, &path))?;
         }
         "indexes" => {
-            let (d, c) = collection_path(rest)?;
-            for index in with_txn(node, txn, |t| t.list_indexes(d, c))? {
+            let coll = collection_path(rest)?;
+            for index in with_txn(node, txn, |t| t.list_indexes(&coll))? {
                 let unique = if index.unique { " unique" } else { "" };
                 println!("{}{unique}", index.path);
             }
@@ -304,10 +306,11 @@ fn execute<'node>(
                 [path, "unique"] => (path, true),
                 _ => return Err("usage: create-index <ns>.<coll> <path> [unique]".into()),
             };
+            let path = field_path(path)?;
             match txn {
-                Some(open) => open.create_index(coll.0, coll.1, path, unique),
+                Some(open) => open.create_index(&coll, &path, unique),
                 // Builds from existing Documents, committing on its own.
-                None => node.create_index(coll.0, coll.1, path, unique),
+                None => node.create_index(&coll, &path, unique),
             }
             .map_err(message)?;
         }
@@ -316,7 +319,8 @@ fn execute<'node>(
             let [path] = words(args)[..] else {
                 return Err("usage: drop-index <ns>.<coll> <path>".into());
             };
-            with_txn(node, txn, |t| t.drop_index(coll.0, coll.1, path))?;
+            let path = field_path(path)?;
+            with_txn(node, txn, |t| t.drop_index(&coll, &path))?;
         }
 
         other => return Err(format!("unknown command {other:?}; type `help`")),
@@ -348,13 +352,16 @@ fn message(e: psdb_core::Error) -> String {
     e.to_string()
 }
 
-fn collection_path(text: &str) -> Result<(&str, &str), String> {
-    text.split_once('.')
-        .ok_or_else(|| format!("expected <ns>.<coll>, got {text:?}"))
+fn collection_path(text: &str) -> Result<CollectionPath, String> {
+    text.parse().map_err(message)
+}
+
+fn field_path(text: &str) -> Result<FieldPath, String> {
+    text.parse().map_err(message)
 }
 
 /// Split `<ns>.<coll> rest...` into the Collection path and the rest.
-fn split_collection_path(text: &str) -> Result<((&str, &str), &str), String> {
+fn split_collection_path(text: &str) -> Result<(CollectionPath, &str), String> {
     let (path, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
     Ok((collection_path(path)?, rest.trim()))
 }

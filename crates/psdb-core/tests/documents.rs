@@ -2,6 +2,8 @@
 
 mod common;
 
+use common::collection;
+
 use bson::{Bson, doc, oid::ObjectId, spec::BinarySubtype};
 use psdb_core::{Error, Limits, Node};
 use psdb_storage_memory::MemoryEngine;
@@ -10,28 +12,36 @@ use psdb_storage_memory::MemoryEngine;
 fn insert_get_replace_delete() {
     let node = common::shop();
     let id = node
-        .insert("shop", "orders", doc! { "_id": 1, "item": "book" })
+        .insert(
+            &collection("shop.orders"),
+            doc! { "_id": 1, "item": "book" },
+        )
         .unwrap();
     assert_eq!(id, Bson::Int32(1));
     assert_eq!(
-        node.get("shop", "orders", &id).unwrap(),
+        node.get(&collection("shop.orders"), &id).unwrap(),
         Some(doc! { "_id": 1, "item": "book" })
     );
 
     assert!(
-        node.replace("shop", "orders", &id, doc! { "item": "pen" })
+        node.replace(&collection("shop.orders"), &id, doc! { "item": "pen" })
             .unwrap()
     );
     assert_eq!(
-        node.get("shop", "orders", &id).unwrap(),
+        node.get(&collection("shop.orders"), &id).unwrap(),
         Some(doc! { "_id": 1, "item": "pen" })
     );
 
-    assert!(node.delete("shop", "orders", &id).unwrap());
-    assert_eq!(node.get("shop", "orders", &id).unwrap(), None);
-    assert!(!node.delete("shop", "orders", &id).unwrap(), "already gone");
+    assert!(node.delete(&collection("shop.orders"), &id).unwrap());
+    assert_eq!(node.get(&collection("shop.orders"), &id).unwrap(), None);
     assert!(
-        !node.replace("shop", "orders", &id, doc! {}).unwrap(),
+        !node.delete(&collection("shop.orders"), &id).unwrap(),
+        "already gone"
+    );
+    assert!(
+        !node
+            .replace(&collection("shop.orders"), &id, doc! {})
+            .unwrap(),
         "replace never creates"
     );
 }
@@ -40,7 +50,10 @@ fn insert_get_replace_delete() {
 fn generated_ids_are_uuids_in_creation_order() {
     let node = common::shop();
     let ids: Vec<Bson> = (0..50)
-        .map(|n| node.insert("shop", "orders", doc! { "n": n }).unwrap())
+        .map(|n| {
+            node.insert(&collection("shop.orders"), doc! { "n": n })
+                .unwrap()
+        })
         .collect();
     for id in &ids {
         assert!(
@@ -51,7 +64,7 @@ fn generated_ids_are_uuids_in_creation_order() {
     // UUIDv7 sorts by creation time, so find (which returns _id order)
     // returns Documents in insertion order.
     let found: Vec<i32> = node
-        .find("shop", "orders", &doc! {})
+        .find(&collection("shop.orders"), &doc! {})
         .unwrap()
         .iter()
         .map(|d| d.get_i32("n").unwrap())
@@ -62,10 +75,10 @@ fn generated_ids_are_uuids_in_creation_order() {
 #[test]
 fn duplicate_id_is_rejected_even_across_int_widths() {
     let node = common::shop();
-    node.insert("shop", "orders", doc! { "_id": 7_i32 })
+    node.insert(&collection("shop.orders"), doc! { "_id": 7_i32 })
         .unwrap();
     let err = node
-        .insert("shop", "orders", doc! { "_id": 7_i64 })
+        .insert(&collection("shop.orders"), doc! { "_id": 7_i64 })
         .unwrap_err();
     assert!(matches!(err, Error::DuplicateId(_)), "{err}");
 }
@@ -74,13 +87,13 @@ fn duplicate_id_is_rejected_even_across_int_widths() {
 fn deleted_id_can_be_reused() {
     let node = common::shop();
     let id = node
-        .insert("shop", "orders", doc! { "_id": "x", "v": 1 })
+        .insert(&collection("shop.orders"), doc! { "_id": "x", "v": 1 })
         .unwrap();
-    node.delete("shop", "orders", &id).unwrap();
-    node.insert("shop", "orders", doc! { "_id": "x", "v": 2 })
+    node.delete(&collection("shop.orders"), &id).unwrap();
+    node.insert(&collection("shop.orders"), doc! { "_id": "x", "v": 2 })
         .unwrap();
     assert_eq!(
-        node.get("shop", "orders", &id).unwrap(),
+        node.get(&collection("shop.orders"), &id).unwrap(),
         Some(doc! { "_id": "x", "v": 2 })
     );
 }
@@ -95,7 +108,7 @@ fn invalid_ids_are_rejected() {
         Bson::Document(doc! {}),
     ] {
         let err = node
-            .insert("shop", "orders", doc! { "_id": id.clone() })
+            .insert(&collection("shop.orders"), doc! { "_id": id.clone() })
             .unwrap_err();
         assert!(matches!(err, Error::InvalidId(_)), "{id:?}: {err}");
     }
@@ -110,14 +123,17 @@ fn limits_are_enforced() {
     };
     let node = Node::with_limits(MemoryEngine::new(), limits);
     node.create_namespace("d").unwrap();
-    node.create_collection("d", "c").unwrap();
-    assert!(node.insert("d", "c", doc! { "a": { "b": 1 } }).is_ok());
+    node.create_collection(&collection("d.c")).unwrap();
+    assert!(
+        node.insert(&collection("d.c"), doc! { "a": { "b": 1 } })
+            .is_ok()
+    );
     assert!(matches!(
-        node.insert("d", "c", doc! { "a": { "b": {} } }),
+        node.insert(&collection("d.c"), doc! { "a": { "b": {} } }),
         Err(Error::InvalidDocument(_))
     ));
     assert!(matches!(
-        node.insert("d", "c", doc! { "s": "x".repeat(200) }),
+        node.insert(&collection("d.c"), doc! { "s": "x".repeat(200) }),
         Err(Error::InvalidDocument(_))
     ));
 }
@@ -127,14 +143,13 @@ fn find_filters_in_id_order() {
     let node = common::shop();
     for (id, status, total) in [(3, "open", 30), (1, "paid", 10), (2, "open", 20)] {
         node.insert(
-            "shop",
-            "orders",
+            &collection("shop.orders"),
             doc! { "_id": id, "status": status, "total": total },
         )
         .unwrap();
     }
     let ids = |filter| -> Vec<Bson> {
-        node.find("shop", "orders", &filter)
+        node.find(&collection("shop.orders"), &filter)
             .unwrap()
             .iter()
             .map(|d| d.get("_id").unwrap().clone())
@@ -161,13 +176,21 @@ fn find_filters_in_id_order() {
 #[test]
 fn collections_are_separate() {
     let node = common::shop();
-    node.create_collection("shop", "returns").unwrap();
-    node.insert("shop", "orders", doc! { "_id": 1 }).unwrap();
-    node.insert("shop", "returns", doc! { "_id": 1 }).unwrap();
-    assert_eq!(node.find("shop", "returns", &doc! {}).unwrap().len(), 1);
-    node.delete("shop", "returns", &Bson::Int32(1)).unwrap();
+    node.create_collection(&collection("shop.returns")).unwrap();
+    node.insert(&collection("shop.orders"), doc! { "_id": 1 })
+        .unwrap();
+    node.insert(&collection("shop.returns"), doc! { "_id": 1 })
+        .unwrap();
+    assert_eq!(
+        node.find(&collection("shop.returns"), &doc! {})
+            .unwrap()
+            .len(),
+        1
+    );
+    node.delete(&collection("shop.returns"), &Bson::Int32(1))
+        .unwrap();
     assert!(
-        node.get("shop", "orders", &Bson::Int32(1))
+        node.get(&collection("shop.orders"), &Bson::Int32(1))
             .unwrap()
             .is_some()
     );
@@ -179,22 +202,21 @@ fn client_supplied_object_ids_work_as_ids_and_fields() {
     let node = common::shop();
     let (order, customer) = (ObjectId::new(), ObjectId::new());
     node.insert(
-        "shop",
-        "orders",
+        &collection("shop.orders"),
         doc! { "_id": order, "customer": customer },
     )
     .unwrap();
     let err = node
-        .insert("shop", "orders", doc! { "_id": order })
+        .insert(&collection("shop.orders"), doc! { "_id": order })
         .unwrap_err();
     assert!(matches!(err, Error::DuplicateId(_)), "{err}");
     assert!(
-        node.get("shop", "orders", &Bson::ObjectId(order))
+        node.get(&collection("shop.orders"), &Bson::ObjectId(order))
             .unwrap()
             .is_some()
     );
     let found = node
-        .find("shop", "orders", &doc! { "customer": customer })
+        .find(&collection("shop.orders"), &doc! { "customer": customer })
         .unwrap();
     assert_eq!(found.len(), 1);
 }

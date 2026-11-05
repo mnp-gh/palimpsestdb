@@ -28,12 +28,15 @@
 
 use std::collections::BTreeMap;
 
-use bson::{Bson, Document, doc};
-use psdb_storage::StorageEngine;
+use bson::{Bson, Document, RawDocument, doc};
+use psdb_storage::{KeyRange, StorageEngine};
 
+use crate::collection_path::CollectionPath;
 use crate::document::{self, validate_name};
 use crate::error::{Error, Result};
-use crate::index::{IndexDef, IndexInfo};
+use crate::field_path::FieldPath;
+use crate::filter::lookup_raw;
+use crate::index::{self, IndexDef, IndexEntry, IndexInfo};
 use crate::keys;
 use crate::mvcc;
 use crate::schema::{self, FieldSchema, FieldType, Schema};
@@ -42,16 +45,19 @@ use crate::transaction::Transaction;
 /// A Collection's Catalog entry.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CollectionEntry {
+    /// The ID of the Namespace the Collection is in. Not stored in the
+    /// entry: its key holds it.
+    pub(crate) namespace_id: u32,
     pub(crate) name: String,
     pub(crate) id: u32,
     pub(crate) schema: Schema,
     pub(crate) indexes: Vec<IndexDef>,
     /// The lowest Index ID never given out in this Collection.
-    next_index_id: u32,
+    pub(crate) next_index_id: u32,
 }
 
 impl CollectionEntry {
-    fn decode(bytes: &[u8]) -> Result<Self> {
+    fn decode(namespace_id: u32, bytes: &[u8]) -> Result<Self> {
         let doc = document::decode(bytes)?;
         let corrupt = |what: &str| Error::Corruption(format!("catalog entry {what}"));
         let list = |field: &str| -> Result<Vec<Document>> {
@@ -64,9 +70,17 @@ impl CollectionEntry {
                 Some(_) => Err(corrupt(field)),
             }
         };
+        // Stored paths were checked when declared; one that fails now is
+        // corrupt.
+        let path = |item: &Document, what: &str| -> Result<FieldPath> {
+            item.get_str("path")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .ok_or_else(|| corrupt(what))
+        };
         let mut schema = Schema::new();
         for field in list("fields")? {
-            let path = field.get_str("path").map_err(|_| corrupt("field path"))?;
+            let path = path(&field, "field path")?;
             let field_type = field
                 .get_str("type")
                 .ok()
@@ -75,16 +89,13 @@ impl CollectionEntry {
             let strict = field
                 .get_bool("strict")
                 .map_err(|_| corrupt("field strict"))?;
-            schema.insert(path.to_owned(), FieldSchema { field_type, strict });
+            schema.insert(path, FieldSchema { field_type, strict });
         }
         let indexes = list("indexes")?
             .iter()
             .map(|ix| {
                 Ok(IndexDef {
-                    path: ix
-                        .get_str("path")
-                        .map_err(|_| corrupt("index path"))?
-                        .to_owned(),
+                    path: path(ix, "index path")?,
                     id: read_u32(ix, "id")?,
                     unique: ix.get_bool("unique").map_err(|_| corrupt("index unique"))?,
                 })
@@ -95,6 +106,7 @@ impl CollectionEntry {
             return Err(corrupt("index on an undeclared field"));
         }
         Ok(Self {
+            namespace_id,
             name: doc.get_str("name").map_err(|_| corrupt("name"))?.to_owned(),
             id: read_u32(&doc, "id")?,
             schema,
@@ -109,7 +121,7 @@ impl CollectionEntry {
     /// Fail with [`Error::TypeMismatch`] if `doc` breaks any Strict Field.
     pub(crate) fn check_strict(&self, doc: &bson::RawDocument) -> Result<()> {
         for (path, field) in self.schema.iter().filter(|(_, f)| f.strict) {
-            schema::check_field(doc, path, &schema::segments(path), *field)?;
+            schema::check_field(doc, path, *field)?;
         }
         Ok(())
     }
@@ -120,7 +132,7 @@ impl CollectionEntry {
             .iter()
             .map(|(path, f)| {
                 Bson::Document(
-                    doc! { "path": path, "type": f.field_type.name(), "strict": f.strict },
+                    doc! { "path": path.as_str(), "type": f.field_type.name(), "strict": f.strict },
                 )
             })
             .collect();
@@ -129,7 +141,7 @@ impl CollectionEntry {
             .iter()
             .map(|ix| {
                 Bson::Document(
-                    doc! { "path": &ix.path, "id": i64::from(ix.id), "unique": ix.unique },
+                    doc! { "path": ix.path.as_str(), "id": i64::from(ix.id), "unique": ix.unique },
                 )
             })
             .collect();
@@ -142,8 +154,39 @@ impl CollectionEntry {
         })
     }
 
-    fn index_on(&self, path: &str) -> Option<&IndexDef> {
-        self.indexes.iter().find(|ix| ix.path == path)
+    /// The Index on the field at `path`, which may come from a filter and
+    /// so is not always a valid Field path.
+    pub(crate) fn index_on(&self, path: &str) -> Option<&IndexDef> {
+        self.indexes.iter().find(|ix| ix.path.as_str() == path)
+    }
+
+    /// The prefix of every key the Collection owns.
+    pub(crate) fn prefix(&self) -> Vec<u8> {
+        keys::collection_prefix(self.namespace_id, self.id)
+    }
+
+    /// The Collection's Documents, without its Index entries.
+    pub(crate) fn documents(&self) -> KeyRange {
+        keys::documents_range(self.namespace_id, self.id)
+    }
+
+    /// The prefix of every entry in `index`.
+    pub(crate) fn index_prefix(&self, index: &IndexDef) -> Vec<u8> {
+        keys::index_prefix(self.namespace_id, self.id, index.id)
+    }
+
+    /// The entry the stored Document `doc`, with encoded ID `doc_id`, has in
+    /// `index`, or `None` if the Index leaves its value out.
+    pub(crate) fn index_entry(
+        &self,
+        index: &IndexDef,
+        doc: &RawDocument,
+        doc_id: &[u8],
+    ) -> Result<Option<IndexEntry>> {
+        let ty = self.schema[&index.path].field_type;
+        let value = lookup_raw(doc, &index.path.segments())?;
+        Ok(index::key_component(value.as_ref(), ty)
+            .map(|component| IndexEntry::new(self.index_prefix(index), index, &component, doc_id)))
     }
 }
 
@@ -176,25 +219,24 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// Create a Collection in an existing Namespace.
-    pub fn create_collection(&mut self, namespace: &str, name: &str) -> Result<()> {
-        validate_name(name)?;
-        let ns_id = self.resolve_namespace(namespace)?;
-        let key = keys::collection_entry_key(ns_id, name);
+    pub fn create_collection(&mut self, collection: &CollectionPath) -> Result<()> {
+        let ns_id = self.resolve_namespace(collection.namespace())?;
+        let key = keys::collection_entry_key(ns_id, collection.collection());
         if self.read(&key)?.is_some() {
-            return Err(Error::CollectionExists {
-                namespace: namespace.to_owned(),
-                collection: name.to_owned(),
-            });
+            return Err(Error::CollectionExists(collection.clone()));
         }
         let id = self.allocate_id(Some(ns_id))?;
-        self.write(key, Some(entry(name, id)))
+        self.write(key, Some(entry(collection.collection(), id)))
     }
 
     /// Drop a Collection. Its Documents become unreachable and stay behind
     /// until garbage collection exists.
-    pub fn drop_collection(&mut self, namespace: &str, name: &str) -> Result<()> {
-        let (ns_id, _) = self.resolve_collection(namespace, name)?;
-        self.write(keys::collection_entry_key(ns_id, name), None)
+    pub fn drop_collection(&mut self, collection: &CollectionPath) -> Result<()> {
+        let (ns_id, _) = self.resolve_collection(collection)?;
+        self.write(
+            keys::collection_entry_key(ns_id, collection.collection()),
+            None,
+        )
     }
 
     /// The names of every Collection in a Namespace, in byte order.
@@ -219,39 +261,30 @@ impl<E: StorageEngine> Transaction<'_, E> {
 
     /// The Namespace and Collection IDs at this Snapshot. Records both
     /// dependencies.
-    pub(crate) fn resolve_collection(
-        &mut self,
-        namespace: &str,
-        collection: &str,
-    ) -> Result<(u32, u32)> {
-        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
-        Ok((ns_id, entry.id))
+    pub(crate) fn resolve_collection(&mut self, collection: &CollectionPath) -> Result<(u32, u32)> {
+        let entry = self.collection_entry(collection)?;
+        Ok((entry.namespace_id, entry.id))
     }
 
-    /// The Namespace ID and the Collection's entry, with its schema and
-    /// Indexes, as this Transaction sees them. Records both dependencies.
+    /// The Collection's entry, with its schema and Indexes, as this
+    /// Transaction sees it. Records the dependencies on both the Namespace
+    /// and the Collection.
     pub(crate) fn collection_entry(
         &mut self,
-        namespace: &str,
-        collection: &str,
-    ) -> Result<(u32, CollectionEntry)> {
-        let ns_id = self.resolve_namespace(namespace)?;
-        let key = keys::collection_entry_key(ns_id, collection);
-        let value = self.read(&key)?.ok_or_else(|| Error::NoSuchCollection {
-            namespace: namespace.to_owned(),
-            collection: collection.to_owned(),
-        })?;
+        collection: &CollectionPath,
+    ) -> Result<CollectionEntry> {
+        let ns_id = self.resolve_namespace(collection.namespace())?;
+        let key = keys::collection_entry_key(ns_id, collection.collection());
+        let value = self
+            .read(&key)?
+            .ok_or_else(|| Error::NoSuchCollection(collection.clone()))?;
         self.catalog_reads.insert(key);
-        Ok((ns_id, CollectionEntry::decode(&value)?))
+        CollectionEntry::decode(ns_id, &value)
     }
 
-    pub(crate) fn write_collection_entry(
-        &mut self,
-        ns_id: u32,
-        entry: &CollectionEntry,
-    ) -> Result<()> {
+    pub(crate) fn write_collection_entry(&mut self, entry: &CollectionEntry) -> Result<()> {
         self.write(
-            keys::collection_entry_key(ns_id, &entry.name),
+            keys::collection_entry_key(entry.namespace_id, &entry.name),
             Some(entry.encode()),
         )
     }
@@ -265,15 +298,13 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// [`Error::TypeMismatch`] if any breaks the rule.
     pub fn set_field_type(
         &mut self,
-        namespace: &str,
-        collection: &str,
-        path: &str,
+        collection: &CollectionPath,
+        path: &FieldPath,
         field: FieldSchema,
     ) -> Result<()> {
-        let segments = schema::split_path(path)?;
-        let (ns_id, mut entry) = self.collection_entry(namespace, collection)?;
+        let mut entry = self.collection_entry(collection)?;
         let old = entry.schema.get(path).copied();
-        if let (Some(ix), Some(old)) = (entry.index_on(path), old) {
+        if let (Some(ix), Some(old)) = (entry.index_on(path.as_str()), old) {
             if old.field_type != field.field_type {
                 return Err(Error::InvalidSchema(format!(
                     "{path} has an index; drop it before changing the field's type"
@@ -287,28 +318,25 @@ impl<E: StorageEngine> Transaction<'_, E> {
         }
         let already_enforced = old.is_some_and(|o| o.strict && o.field_type == field.field_type);
         if field.strict && !already_enforced {
-            let documents = keys::documents_range(ns_id, entry.id);
-            for bytes in self.scan_range(&documents)?.values() {
-                schema::check_field(document::raw(bytes)?, path, &segments, field)?;
+            for bytes in self.scan_range(&entry.documents())?.values() {
+                schema::check_field(document::raw(bytes)?, path, field)?;
             }
             // A Document committed concurrently was not checked.
-            self.collection_reads
-                .insert(keys::collection_prefix(ns_id, entry.id));
+            self.collection_reads.insert(entry.prefix());
         }
-        entry.schema.insert(path.to_owned(), field);
-        self.write_collection_entry(ns_id, &entry)
+        entry.schema.insert(path.clone(), field);
+        self.write_collection_entry(&entry)
     }
 
     /// Remove a field's declaration from the Collection Schema. Refused
     /// while an Index on the field exists.
     pub fn remove_field_type(
         &mut self,
-        namespace: &str,
-        collection: &str,
-        path: &str,
+        collection: &CollectionPath,
+        path: &FieldPath,
     ) -> Result<()> {
-        let (ns_id, mut entry) = self.collection_entry(namespace, collection)?;
-        if entry.index_on(path).is_some() {
+        let mut entry = self.collection_entry(collection)?;
+        if entry.index_on(path.as_str()).is_some() {
             return Err(Error::InvalidSchema(format!(
                 "{path} has an index; drop it before removing the field's type"
             )));
@@ -316,16 +344,15 @@ impl<E: StorageEngine> Transaction<'_, E> {
         if entry.schema.remove(path).is_none() {
             return Err(Error::InvalidSchema(format!("{path} is not declared")));
         }
-        self.write_collection_entry(ns_id, &entry)
+        self.write_collection_entry(&entry)
     }
 
     /// The Collection Schema: every declared field path and its type.
     pub fn collection_schema(
         &mut self,
-        namespace: &str,
-        collection: &str,
-    ) -> Result<BTreeMap<String, FieldSchema>> {
-        Ok(self.collection_entry(namespace, collection)?.1.schema)
+        collection: &CollectionPath,
+    ) -> Result<BTreeMap<FieldPath, FieldSchema>> {
+        Ok(self.collection_entry(collection)?.schema)
     }
 
     /// Create an Index on a field of an empty Collection, as part of this
@@ -338,22 +365,17 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// makes this Transaction abort with Collection Changed.
     pub fn create_index(
         &mut self,
-        namespace: &str,
-        collection: &str,
-        path: &str,
+        collection: &CollectionPath,
+        path: &FieldPath,
         unique: bool,
     ) -> Result<()> {
-        let (ns_id, mut entry, index) = self.prepare_index(namespace, collection, path, unique)?;
-        if self.any_live_in(&keys::documents_range(ns_id, entry.id))? {
-            return Err(Error::CollectionNotEmpty {
-                namespace: namespace.to_owned(),
-                collection: collection.to_owned(),
-            });
+        let (mut entry, index) = self.prepare_index(collection, path, unique)?;
+        if self.any_live_in(&entry.documents())? {
+            return Err(Error::CollectionNotEmpty(collection.clone()));
         }
-        self.collection_reads
-            .insert(keys::collection_prefix(ns_id, entry.id));
+        self.collection_reads.insert(entry.prefix());
         entry.indexes.push(index);
-        self.write_collection_entry(ns_id, &entry)
+        self.write_collection_entry(&entry)
     }
 
     /// Check that an Index may be created and give it the Collection's next
@@ -361,22 +383,20 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// entry, whose counter has moved past the ID.
     pub(crate) fn prepare_index(
         &mut self,
-        namespace: &str,
-        collection: &str,
-        path: &str,
+        collection: &CollectionPath,
+        path: &FieldPath,
         unique: bool,
-    ) -> Result<(u32, CollectionEntry, IndexDef)> {
-        let (ns_id, mut entry) = self.collection_entry(namespace, collection)?;
+    ) -> Result<(CollectionEntry, IndexDef)> {
+        let mut entry = self.collection_entry(collection)?;
         let Some(field) = entry.schema.get(path) else {
             return Err(Error::InvalidSchema(format!(
                 "declare the type of {path} in the collection schema before indexing it"
             )));
         };
-        if entry.index_on(path).is_some() {
+        if entry.index_on(path.as_str()).is_some() {
             return Err(Error::IndexExists {
-                namespace: namespace.to_owned(),
-                collection: collection.to_owned(),
-                path: path.to_owned(),
+                collection: collection.clone(),
+                path: path.clone(),
             });
         }
         if unique && !field.strict {
@@ -386,44 +406,37 @@ impl<E: StorageEngine> Transaction<'_, E> {
         }
         // Skip IDs holding entries from a build that never committed: the
         // counter moves only when the Index is added (ADR 0010).
-        let mut id = entry.next_index_id;
-        while mvcc::any_version_under(&self.node.engine, &keys::index_prefix(ns_id, entry.id, id))?
-        {
-            id += 1;
+        let mut index = IndexDef {
+            path: path.clone(),
+            id: entry.next_index_id,
+            unique,
+        };
+        while mvcc::any_version_under(&self.node.engine, &entry.index_prefix(&index))? {
+            index.id += 1;
         }
-        entry.next_index_id = id + 1;
-        Ok((
-            ns_id,
-            entry,
-            IndexDef {
-                path: path.to_owned(),
-                id,
-                unique,
-            },
-        ))
+        entry.next_index_id = index.id + 1;
+        Ok((entry, index))
     }
 
     /// Drop the Index on a field. Its entries become unreachable and stay
     /// behind until garbage collection exists.
-    pub fn drop_index(&mut self, namespace: &str, collection: &str, path: &str) -> Result<()> {
-        let (ns_id, mut entry) = self.collection_entry(namespace, collection)?;
+    pub fn drop_index(&mut self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
+        let mut entry = self.collection_entry(collection)?;
         let before = entry.indexes.len();
-        entry.indexes.retain(|ix| ix.path != path);
+        entry.indexes.retain(|ix| ix.path != *path);
         if entry.indexes.len() == before {
             return Err(Error::NoSuchIndex {
-                namespace: namespace.to_owned(),
-                collection: collection.to_owned(),
-                path: path.to_owned(),
+                collection: collection.clone(),
+                path: path.clone(),
             });
         }
-        self.write_collection_entry(ns_id, &entry)
+        self.write_collection_entry(&entry)
     }
 
     /// The Collection's Indexes, in the order they were created.
-    pub fn list_indexes(&mut self, namespace: &str, collection: &str) -> Result<Vec<IndexInfo>> {
+    pub fn list_indexes(&mut self, collection: &CollectionPath) -> Result<Vec<IndexInfo>> {
         Ok(self
-            .collection_entry(namespace, collection)?
-            .1
+            .collection_entry(collection)?
             .indexes
             .into_iter()
             .map(|ix| IndexInfo {
@@ -532,9 +545,10 @@ mod tests {
     fn id_of_an_empty_collection_is_in_use() {
         let node = Node::new(MemoryEngine::new());
         node.create_namespace("shop").unwrap();
-        node.create_collection("shop", "orders").unwrap();
+        let orders = "shop.orders".parse().unwrap();
+        node.create_collection(&orders).unwrap();
         let mut txn = node.begin();
-        let (ns_id, taken) = txn.resolve_collection("shop", "orders").unwrap();
+        let (ns_id, taken) = txn.resolve_collection(&orders).unwrap();
         assert_eq!(txn.allocate_id_from([taken, 7], Some(ns_id)).unwrap(), 7);
     }
 
@@ -542,21 +556,23 @@ mod tests {
     fn index_ids_are_counted_per_collection_and_never_reused() {
         let node = Node::new(MemoryEngine::new());
         node.create_namespace("shop").unwrap();
-        node.create_collection("shop", "orders").unwrap();
+        let orders = "shop.orders".parse().unwrap();
+        node.create_collection(&orders).unwrap();
         let int = FieldSchema {
             field_type: FieldType::Int,
             strict: false,
         };
-        node.set_field_type("shop", "orders", "n", int).unwrap();
+        let n = "n".parse().unwrap();
+        node.set_field_type(&orders, &n, int).unwrap();
         let index_ids = || {
-            let (_, entry) = node.begin().collection_entry("shop", "orders").unwrap();
+            let entry = node.begin().collection_entry(&orders).unwrap();
             entry.indexes.iter().map(|ix| ix.id).collect::<Vec<_>>()
         };
-        node.create_index("shop", "orders", "n", false).unwrap();
+        node.create_index(&orders, &n, false).unwrap();
         assert_eq!(index_ids(), [0]);
         // Never held an entry, so only the counter keeps 0 from coming back.
-        node.drop_index("shop", "orders", "n").unwrap();
-        node.create_index("shop", "orders", "n", false).unwrap();
+        node.drop_index(&orders, &n).unwrap();
+        node.create_index(&orders, &n, false).unwrap();
         assert_eq!(index_ids(), [1]);
     }
 

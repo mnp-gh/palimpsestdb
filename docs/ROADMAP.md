@@ -42,10 +42,10 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.3: Indexes
 
 - Single-field secondary Indexes, at most one per field path, versioned and maintained in the same Write Set; each has an ID, counted per Collection and never reused, in its key prefix
-- Collection Schema declaring a field's Field Type (`int`, `double`, `string`, `date`, `bool`, `objectId`, `binary`) and whether it is a Strict Field ([ADR 0011](./adr/0011-field-types-live-in-collection-schema.md)). Values of other types are left out of the Index; an `int` or `double` Index converts the other kind of number when building its key (the Document is unchanged)
+- Collection Schema declaring a field's Field Type (`int`, `double`, `string`, `date`, `bool`, `objectId`, `binary`) and whether it is a Strict Field ([ADR 0011](./adr/0011-field-types-live-in-collection-schema.md)). Values of other types are left out of the Index; an Index on an `int` or `double` field converts the other kind of number when building its key (the Document is unchanged)
 - Unique Indexes, on Strict Fields only, keyed by value alone so concurrent duplicates become Write Conflicts; missing and null never collide
 - Index builds in the foreground, committing their entries in chunks outside the Write Set and its cap, made visible by one final commit ([ADR 0010](./adr/0010-index-builds-commit-in-chunks.md))
-- Index-backed filters: an equality or range comparison at the top level or in `$and`, whose value is in the Index's type, or an `$or` whose every branch can use an Index (the union of their ranges); equality first, then `$or`, then range; the full filter is always rechecked
+- Index-backed filters: an equality or range comparison at the top level or in `$and`, whose value compares with the indexed field's Field Type, or an `$or` whose every branch can use an Index (the union of their ranges); equality first, then `$or`, then range; the full filter is always rechecked
 - `_id` filters read a range of the Collection itself, which is sorted by `_id`, instead of scanning it: an `_id` equality beats any other, and `_id` comparisons take part in `$or` unions like Index ones
 - Exact comparison between integers and doubles in filters (today large integers lose precision when converted to double)
 - Evaluate filters on raw BSON (`RawDocument`) instead of decoding whole Documents
