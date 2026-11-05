@@ -27,6 +27,7 @@ use crate::transaction::Transaction;
 /// Collections stay schemaless: a Document whose field holds another type
 /// is still stored, unless the field is strict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FieldType {
     /// 64-bit integers.
     Int,
@@ -135,7 +136,7 @@ pub(crate) type Schema = BTreeMap<FieldPath, FieldSchema>;
 /// Fail with [`Error::TypeMismatch`] unless the value at `path` is missing,
 /// null, or converts exactly to the field's type.
 pub(crate) fn check_field(doc: &RawDocument, path: &FieldPath, field: FieldSchema) -> Result<()> {
-    match lookup_raw(doc, &path.segments())? {
+    match lookup_raw(doc, path)? {
         None | Some(Bson::Null) => Ok(()),
         Some(v) if fits_exactly(&v, field.field_type) => Ok(()),
         Some(v) => Err(Error::TypeMismatch(format!(
@@ -184,9 +185,14 @@ impl<E: StorageEngine> Transaction<'_, E> {
         path: &FieldPath,
         field: FieldSchema,
     ) -> Result<()> {
+        if path.is_under_id() {
+            return Err(Error::InvalidSchema(
+                "_id cannot be declared or indexed; Documents are already keyed by it".into(),
+            ));
+        }
         let mut entry = self.collection_entry(collection)?;
         let old = entry.schema.get(path).copied();
-        if let (Some(ix), Some(old)) = (entry.index_on(path.as_str()), old) {
+        if let (Some(ix), Some(old)) = (entry.index_on(path), old) {
             if old.field_type != field.field_type {
                 return Err(Error::InvalidSchema(format!(
                     "{path} has an index; drop it before changing the field's type"
@@ -204,7 +210,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
                 check_field(document::raw(bytes)?, path, field)?;
             }
             // A Document committed concurrently was not checked.
-            self.collection_reads.insert(entry.prefix());
+            self.depend_on_whole_collection(entry.prefix());
         }
         entry.schema.insert(path.clone(), field);
         self.write_collection_entry(&entry)
@@ -218,7 +224,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         path: &FieldPath,
     ) -> Result<()> {
         let mut entry = self.collection_entry(collection)?;
-        if entry.index_on(path.as_str()).is_some() {
+        if entry.index_on(path).is_some() {
             return Err(Error::InvalidSchema(format!(
                 "{path} has an index; drop it before removing the field's type"
             )));

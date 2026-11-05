@@ -5,6 +5,7 @@ use bson::{Binary, Bson, Document, RawBsonRef, RawDocument, spec::BinarySubtype}
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
+use crate::field_path::FieldPath;
 
 /// The largest Namespace or Collection name accepted, in bytes. Fixed by the
 /// key format.
@@ -14,7 +15,18 @@ pub const MAX_NAME_BYTES: usize = 64;
 ///
 /// Limits fixed by the on-disk format, such as [`MAX_NAME_BYTES`] and
 /// [`MAX_ID_BYTES`](crate::MAX_ID_BYTES), are constants instead.
+///
+/// New limits will be added, so start from the defaults and change what
+/// you need:
+///
+/// ```
+/// use psdb_core::Limits;
+///
+/// let limits = Limits::default().with_max_document_bytes(1024);
+/// assert_eq!(limits.max_document_bytes, 1024);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Limits {
     /// The largest Document accepted, in encoded BSON bytes.
     pub max_document_bytes: usize,
@@ -35,6 +47,35 @@ impl Default for Limits {
             max_document_bytes: 16 * 1024 * 1024,
             max_nesting_depth: 100,
             max_write_set_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl Limits {
+    /// These limits with [`max_document_bytes`](Self::max_document_bytes)
+    /// set to `bytes`.
+    pub fn with_max_document_bytes(self, bytes: usize) -> Self {
+        Self {
+            max_document_bytes: bytes,
+            ..self
+        }
+    }
+
+    /// These limits with [`max_nesting_depth`](Self::max_nesting_depth)
+    /// set to `depth`.
+    pub fn with_max_nesting_depth(self, depth: usize) -> Self {
+        Self {
+            max_nesting_depth: depth,
+            ..self
+        }
+    }
+
+    /// These limits with [`max_write_set_bytes`](Self::max_write_set_bytes)
+    /// set to `bytes`.
+    pub fn with_max_write_set_bytes(self, bytes: usize) -> Self {
+        Self {
+            max_write_set_bytes: bytes,
+            ..self
         }
     }
 }
@@ -140,11 +181,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Document> {
 
 /// The value at `path` in a stored Document, descending through nested
 /// documents only.
-pub(crate) fn lookup_raw(doc: &RawDocument, path: &[String]) -> Result<Option<Bson>> {
+pub(crate) fn lookup_raw(doc: &RawDocument, path: &FieldPath) -> Result<Option<Bson>> {
     let corrupt = |e: bson::error::Error| Error::Corruption(format!("stored document: {e}"));
-    let Some((first, rest)) = path.split_first() else {
-        return Ok(None);
-    };
+    let (first, rest) = path
+        .segments()
+        .split_first()
+        .expect("a Field path has at least one segment");
     let mut current = doc.get(first).map_err(corrupt)?;
     for segment in rest {
         current = match current {

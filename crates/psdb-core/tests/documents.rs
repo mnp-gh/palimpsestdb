@@ -116,12 +116,10 @@ fn invalid_ids_are_rejected() {
 
 #[test]
 fn limits_are_enforced() {
-    let limits = Limits {
-        max_document_bytes: 100,
-        max_nesting_depth: 2,
-        ..Limits::default()
-    };
-    let node = Node::with_limits(MemoryEngine::new(), limits);
+    let limits = Limits::default()
+        .with_max_document_bytes(100)
+        .with_max_nesting_depth(2);
+    let node = Node::with_limits(MemoryEngine::new(), limits).unwrap();
     node.create_namespace("d").unwrap();
     node.create_collection(&collection("d.c")).unwrap();
     assert!(

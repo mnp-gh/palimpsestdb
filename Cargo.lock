@@ -480,6 +480,7 @@ dependencies = [
  "crc32c",
  "getrandom 0.4.3",
  "proptest",
+ "psdb-core",
  "psdb-storage",
  "psdb-storage-memory",
  "uuid",

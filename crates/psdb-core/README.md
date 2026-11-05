@@ -24,13 +24,13 @@ txn.commit()?;
 | `transaction` | Snapshot reads, Write Set, commit-time conflict checks |
 | `catalog` | Namespaces, Collections, Collection Schemas and Indexes as versioned Catalog entries |
 | `collection_path` | `CollectionPath`: a Namespace and Collection name, `shop.orders` |
-| `field_path` | `FieldPath`: a dotted path to a declared or indexed field, `address.city` |
+| `field_path` | `FieldPath`: a dotted path to a field, `address.city`, as filters, the Collection Schema and Indexes name it |
 | `schema` | The Collection Schema: Field Types and Strict Fields |
 | `index` | Index entry keys, choosing an Index or `_id` range for a filter |
 | `mvcc` | Which Version of a key a Snapshot sees |
 | `keys` | Order-preserving key encoding |
 | `document` | Limits, Document IDs, name rules |
 | `filter` | Parsing and evaluating `find` filters |
-| `wal` | WAL records, recovery, and the `WalFile` I/O seam with its `SimDisk` fake |
+| `wal` | WAL records, recovery, and the `WalFile` I/O seam with its `SimDisk` fake (feature `testing`) |
 
 **Depends on:** `psdb-storage` (never on a concrete engine outside tests). **Depended on by:** `psdb-cli`.

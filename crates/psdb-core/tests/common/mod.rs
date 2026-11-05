@@ -8,7 +8,7 @@ use psdb_storage_memory::MemoryEngine;
 
 /// A Node with `shop.orders` already created.
 pub fn shop() -> Node<MemoryEngine> {
-    let node = Node::new(MemoryEngine::new());
+    let node = Node::new(MemoryEngine::new()).unwrap();
     node.create_namespace("shop").unwrap();
     node.create_collection(&collection("shop.orders")).unwrap();
     node

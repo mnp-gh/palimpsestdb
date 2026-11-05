@@ -38,7 +38,7 @@ Modules are cut by concept, not by type. `Node`, `Transaction` and `CollectionEn
 | How does a commit get checked and logged? | `transaction` (`commit`), `node` (`apply_commit`) |
 | What does a Catalog entry hold? | `catalog` (`CollectionEntry`) |
 | What may change in a Collection Schema? | `schema` |
-| How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `build_index`) |
+| How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `create_index_on_empty`, `build_index`) |
 | Which Index or `_id` range does `find` use? | `index` (`plan`) |
 | What is a valid name, `_id` or Document? | `document`, `collection_path`, `field_path` |
 | How does recovery work? | `node` (`open_with`), `wal` |
@@ -55,7 +55,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 ## Flows
 
-**Opening.** `Node::open` opens the WAL file. `Wal::open` reads every record and truncates a torn one at the end. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch`, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable.
+**Opening.** `Node::open` opens the WAL file. `Wal::open` reads every record and truncates a torn one at the end. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch`, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
 
 **A write** (`Transaction::insert`, `replace`, `delete`) touches only the Transaction's private Write Set:
 
@@ -81,7 +81,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 2. `build_index` reads the Collection at one Snapshot, in chunks of at most 1024 Documents or 16 MiB, and commits each chunk's entries through `apply_commit` directly, outside any Write Set and its cap.
 3. A final commit adds the Index to the Collection's entry, which makes the entries reachable.
 
-`Transaction::create_index` only works on an empty Collection, where there is nothing to build (ADR 0010).
+`Transaction::create_index_on_empty` only works on an empty Collection, where there is nothing to build (ADR 0010).
 
 ## Invariants
 

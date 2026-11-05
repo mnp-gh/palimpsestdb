@@ -16,20 +16,25 @@
 //! are logical keys and values are BSON, exactly as in the Write Set.
 //!
 //! All I/O goes through the [`WalFile`] seam, so tests can simulate power
-//! loss with [`SimDisk`]. Every implementation passes [`conformance`].
+//! loss with `SimDisk`. Every implementation passes `conformance`.
 //!
 //! The seam is a `Box<dyn WalFile>` rather than a generic parameter, an
 //! exception to the generics-at-seams rule in `docs/CONVENTIONS.md`: a
 //! generic would spread a second type parameter through `Node` and
 //! `Transaction` for a virtual call that costs nothing next to an fsync.
-//! [`SimDisk`] is public, like `psdb_storage::conformance`, because the
-//! crash tests in `tests/` can only use public items.
+//!
+//! `SimDisk` and `conformance` exist only for tests, so they are public
+//! only with the `testing` feature: the crash tests in `tests/` can use
+//! nothing else, and `psdb-core`'s own dev-dependency turns it on.
 
+#[cfg(any(test, feature = "testing"))]
 pub mod conformance;
 mod file;
+#[cfg(any(test, feature = "testing"))]
 mod sim;
 
 pub use file::{OsWalFile, WalFile};
+#[cfg(any(test, feature = "testing"))]
 pub use sim::{SimDisk, SimWalFile};
 
 use crate::error::{Error, Result};

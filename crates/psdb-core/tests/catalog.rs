@@ -10,7 +10,7 @@ use psdb_storage_memory::MemoryEngine;
 
 #[test]
 fn create_list_drop() {
-    let node = Node::new(MemoryEngine::new());
+    let node = Node::new(MemoryEngine::new()).unwrap();
     node.create_namespace("b").unwrap();
     node.create_namespace("a").unwrap();
     assert_eq!(node.list_namespaces().unwrap(), ["a", "b"]);

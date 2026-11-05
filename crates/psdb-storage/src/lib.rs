@@ -58,6 +58,27 @@ impl KeyRange {
     pub fn contains(&self, key: &[u8]) -> bool {
         key >= self.start.as_slice() && self.end.as_deref().is_none_or(|end| key < end)
     }
+
+    /// The keys in both `self` and `other`. An unbounded end counts as
+    /// above every key. The result may be empty (`end <= start`).
+    ///
+    /// ```
+    /// use psdb_storage::KeyRange;
+    /// let r = KeyRange::new(b"b", b"d").intersect(&KeyRange::prefix(b"c"));
+    /// assert_eq!(r, KeyRange::new(b"c", b"d"));
+    /// assert_eq!(KeyRange::all().intersect(&r), r);
+    /// ```
+    pub fn intersect(&self, other: &KeyRange) -> KeyRange {
+        let end = match (&self.end, &other.end) {
+            (Some(a), Some(b)) => Some(a.min(b).clone()),
+            (Some(e), None) | (None, Some(e)) => Some(e.clone()),
+            (None, None) => None,
+        };
+        KeyRange {
+            start: self.start.clone().max(other.start.clone()),
+            end,
+        }
+    }
 }
 
 /// The smallest key greater than every key starting with `prefix`, or `None`
