@@ -29,7 +29,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - MVCC with Snapshot Isolation, first-committer-wins ([ADR 0001](./adr/0001-mvcc-lives-above-storage-engine.md))
 - Get, insert, replace and delete by Document ID; full-Collection scan with filters (equality, comparison, `$and`, `$or`, dotted paths)
 - Autocommit for single operations
-- Size limits: Document 16 MB, Document ID 1 KB, nesting depth 100, Namespace and Collection names 64 bytes without `.` or NUL. Configurable, except limits fixed by the on-disk format
+- Size limits: Document 16 MB, Document ID 1 KB, nesting depth 100, Namespace and Collection names 64 bytes without `.`, NUL or whitespace. Configurable, except limits fixed by the on-disk format
 - Property tests with `proptest`
 
 ## v0.2: Durability

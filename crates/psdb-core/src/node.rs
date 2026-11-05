@@ -74,7 +74,7 @@ impl<E: StorageEngine> Node<E> {
 
     /// Open a durable Node whose WAL lives in `dir`, creating `dir` and
     /// the WAL if needed, and replay the WAL into `engine`, which must be
-    /// empty.
+    /// empty. Fails with [`Error::Io`] if another Node has `dir` open.
     ///
     /// ```
     /// use bson::doc;

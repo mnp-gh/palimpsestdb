@@ -17,6 +17,8 @@ psdb(txn)> abort
 
 Type `help` for every command.
 
-Commands piped in on stdin run as a script: the first error stops it with exit status 1, so an open Transaction is never committed.
+Commands piped in on stdin run as a script: the first error stops it with exit status 1, so an open Transaction is never committed. A script that ends with a Transaction still open also exits with status 1, and the Transaction is aborted.
+
+Only one `psdb` (or other Node) can have a `--data-dir` open at a time; a second one fails to start.
 
 **Depends on:** `psdb-core`, `psdb-storage-memory`. This is where the Storage Engine is chosen.

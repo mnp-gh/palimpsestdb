@@ -61,15 +61,13 @@ pub(crate) fn read_at<E: StorageEngine>(
     // Versions are newest first, so seeking to the Snapshot's timestamp lands
     // on the newest Version at or before it.
     range.start = physical_key(logical, snapshot_ts);
-    let mut found = None;
+    // Decoded inside the scan, so the value is copied once.
+    let mut found = Ok(None);
     engine.scan(&range, &mut |_, value| {
-        found = Some(value.to_vec());
+        found = decode_value(value);
         ControlFlow::Break(())
     })?;
-    match found {
-        Some(stored) => decode_value(&stored),
-        None => Ok(None),
-    }
+    found
 }
 
 /// The Commit Timestamp of the newest Version of `logical`, whatever the
