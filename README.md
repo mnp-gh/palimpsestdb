@@ -17,7 +17,7 @@ cargo test --workspace
 |---|---|
 | [`psdb-storage`](crates/psdb-storage) | The Storage Engine contract and its conformance suite |
 | [`psdb-storage-memory`](crates/psdb-storage-memory) | In-memory Storage Engine |
-| [`psdb-core`](crates/psdb-core) | The Document Layer: Catalog, Documents, MVCC, Transactions |
+| [`psdb-core`](crates/psdb-core) | The Database Layer: Catalog, Documents, MVCC, Transactions |
 | [`psdb-cli`](crates/psdb-cli) | Interactive shell |
 
 ## Design docs

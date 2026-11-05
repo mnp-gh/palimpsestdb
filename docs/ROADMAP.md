@@ -24,17 +24,17 @@ A single-threaded library with no network, no durability and no garbage collecti
 - `StorageEngine` trait with its contract documented on the trait, plus the conformance suite every engine must pass
 - In-memory Storage Engine
 - BSON Documents, Document IDs (client-supplied or generated)
-- Databases and Collections in a transactional Catalog ([ADR 0006](./adr/0006-transactional-catalog.md)), with numeric IDs in the key layout ([ADR 0005](./adr/0005-shared-engine-numeric-ids.md))
+- Namespaces and Collections in a transactional Catalog ([ADR 0006](./adr/0006-transactional-catalog.md)), with numeric IDs in the key layout ([ADR 0005](./adr/0005-shared-engine-numeric-ids.md))
 - Order-preserving key encoding, newest Version first
 - MVCC with Snapshot Isolation, first-committer-wins ([ADR 0001](./adr/0001-mvcc-lives-above-storage-engine.md))
 - Get, insert, replace and delete by Document ID; full-Collection scan with filters (equality, comparison, `$and`, `$or`, dotted paths)
 - Autocommit for single operations
-- Size limits: Document 16 MB, Document ID 1 KB, nesting depth 100, Database and Collection names 64 bytes without `.` or NUL. Configurable, except limits fixed by the on-disk format
+- Size limits: Document 16 MB, Document ID 1 KB, nesting depth 100, Namespace and Collection names 64 bytes without `.` or NUL. Configurable, except limits fixed by the on-disk format
 - Property tests with `proptest`
 
 ## v0.2: Durability
 
-- WAL owned by the Document Layer, one fsync per commit ([ADR 0004](./adr/0004-document-layer-owns-wal.md))
+- WAL owned by the Database Layer, one fsync per commit ([ADR 0004](./adr/0004-database-layer-owns-wal.md))
 - Length and CRC32C per record; recovery replays above `applied_up_to`
 - Crash test harness: kill at random points, and simulate power loss through a WAL file seam that drops unsynced bytes. After recovery, every acknowledged commit is present, every recovered commit was attempted, and recovered commits form an unbroken run in Commit Timestamp order
 - The in-memory engine plus the WAL is a durable database; `psdb-cli --data-dir <path>` opens one
@@ -48,7 +48,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## v0.4: Concurrency
 
-- Thread-safe Document Layer; single in-order applier; visibility watermark
+- Thread-safe Database Layer; single in-order applier; visibility watermark
 - In-RAM Catalog cache (v0.1 reads Catalog entries from the engine on every operation)
 - Garbage collection of old Versions below the oldest active Snapshot
 - `fjall` Storage Engine, passing the conformance suite, with block compression (LZ4 or zstd) enabled
@@ -69,8 +69,8 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## v0.7: Access
 
-- Users and built-in Roles per Database (`read`, `readWrite`, `dbAdmin`, Node-wide `root`)
-- Roles are granted on a Database's ID, not its name: a Database must exist before access to it is granted, and dropping it removes its grants in the same Transaction, so a recreated Database with the same name starts with no access (unlike MongoDB). Record as an ADR when v0.7 starts
+- Users and built-in Roles per Namespace (`read`, `readWrite`, `nsAdmin`, Node-wide `root`)
+- Roles are granted on a Namespace's ID, not its name: a Namespace must exist before access to it is granted, and dropping it removes its grants in the same Transaction, so a recreated Namespace with the same name starts with no access (unlike MongoDB). Record as an ADR when v0.7 starts
 - SCRAM-SHA-256 authentication over TLS (`rustls`)
 
 ## v0.8: Richer queries
