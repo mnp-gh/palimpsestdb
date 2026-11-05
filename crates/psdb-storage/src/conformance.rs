@@ -148,6 +148,10 @@ fn scan_respects_range_bounds<E: StorageEngine>(engine: &E) {
         "start is inclusive, end exclusive"
     );
     assert!(collect(engine, &KeyRange::new("x", "z")).is_empty());
+    assert!(
+        collect(engine, &KeyRange::new("d", "b")).is_empty(),
+        "an empty range (end <= start) visits nothing"
+    );
 }
 
 fn scan_prefix<E: StorageEngine>(engine: &E) {

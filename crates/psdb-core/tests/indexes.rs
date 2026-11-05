@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{collection, field_path};
+use common::{collection, durable_shop, field_path};
 
 use bson::oid::ObjectId;
 use bson::spec::BinarySubtype;
@@ -743,8 +743,9 @@ fn writer_aborts_when_indexes_change_under_it() {
     assert!(matches!(txn.commit(), Err(Error::CollectionChanged)));
 }
 
-#[test]
-fn building_a_unique_index_over_duplicates_fails_and_leaves_no_index() {
+/// `shop.orders` after a unique Index build on `n` failed with Duplicate
+/// Value past its first chunk, so some of its entries were committed.
+fn failed_unique_build() -> Node<MemoryEngine> {
     let node = common::shop();
     node.set_field_type(
         &collection("shop.orders"),
@@ -752,7 +753,6 @@ fn building_a_unique_index_over_duplicates_fails_and_leaves_no_index() {
         field(FieldType::Int, true),
     )
     .unwrap();
-    // Past the first chunk, so some entries are committed before the build fails.
     for i in 0..3000 {
         node.insert(&collection("shop.orders"), doc! { "_id": i, "n": i % 2500 })
             .unwrap();
@@ -761,6 +761,12 @@ fn building_a_unique_index_over_duplicates_fails_and_leaves_no_index() {
         node.create_index(&collection("shop.orders"), &field_path("n"), true),
         Err(Error::DuplicateValue(_))
     ));
+    node
+}
+
+#[test]
+fn building_a_unique_index_over_duplicates_fails_and_leaves_no_index() {
+    let node = failed_unique_build();
     assert!(
         node.list_indexes(&collection("shop.orders"))
             .unwrap()
@@ -777,37 +783,68 @@ fn building_a_unique_index_over_duplicates_fails_and_leaves_no_index() {
     );
 }
 
+/// A durable `shop.orders` of 2500 Documents, enough for three build
+/// chunks, with a strict `int` field `n` equal to `_id`.
+fn durable_unindexed(disk: &SimDisk) -> Node<MemoryEngine> {
+    let node = durable_shop(disk);
+    for i in 0..2500 {
+        node.insert(&collection("shop.orders"), doc! { "_id": i, "n": i })
+            .unwrap();
+    }
+    node.set_field_type(
+        &collection("shop.orders"),
+        &field_path("n"),
+        field(FieldType::Int, true),
+    )
+    .unwrap();
+    node
+}
+
 #[test]
 fn built_index_survives_reopen() {
     let disk = SimDisk::new();
-    {
-        let node = Node::open_with(MemoryEngine::new(), disk.file(), Limits::default()).unwrap();
-        node.create_namespace("shop").unwrap();
-        node.create_collection(&collection("shop.orders")).unwrap();
-        for i in 0..2500 {
-            node.insert(&collection("shop.orders"), doc! { "_id": i, "n": i % 100 })
-                .unwrap();
-        }
-        node.set_field_type(
-            &collection("shop.orders"),
-            &field_path("n"),
-            field(FieldType::Int, false),
-        )
+    durable_unindexed(&disk)
+        .create_index(&collection("shop.orders"), &field_path("n"), false)
         .unwrap();
-        node.create_index(&collection("shop.orders"), &field_path("n"), false)
-            .unwrap();
-    }
-    let engine = MemoryEngine::new();
-    let node = Node::open_with(engine, disk.file(), Limits::default()).unwrap();
+    let node = common::open(&disk).unwrap();
     let found = node
-        .find(&collection("shop.orders"), &doc! { "n": 42 })
+        .find(
+            &collection("shop.orders"),
+            &doc! { "n": { "$gte": 42, "$lt": 45 } },
+        )
         .unwrap();
     assert_eq!(
         ids(&found),
-        (0..25)
-            .map(|k| Bson::Int32(k * 100 + 42))
-            .collect::<Vec<_>>()
+        [Bson::Int32(42), Bson::Int32(43), Bson::Int32(44)]
     );
+}
+
+#[test]
+fn index_build_cut_off_by_power_loss_is_rebuilt_after_reopen() {
+    let disk = SimDisk::new();
+    let node = durable_unindexed(&disk);
+    // Each commit is an append and a sync: the first chunk becomes durable,
+    // then the power fails while the second is appended.
+    disk.crash_after(2, 0);
+    assert!(
+        node.create_index(&collection("shop.orders"), &field_path("n"), true)
+            .is_err()
+    );
+    drop(node);
+    let node = common::open(&disk).unwrap();
+    assert!(
+        node.list_indexes(&collection("shop.orders"))
+            .unwrap()
+            .is_empty()
+    );
+    // The replayed chunk holds an entry for `n: 0`. If the new build reused
+    // its Index ID, that orphan would make the value look taken.
+    node.delete(&collection("shop.orders"), &Bson::Int32(0))
+        .unwrap();
+    node.create_index(&collection("shop.orders"), &field_path("n"), true)
+        .unwrap();
+    node.insert(&collection("shop.orders"), doc! { "_id": -1, "n": 0 })
+        .unwrap();
 }
 
 #[test]
@@ -837,6 +874,29 @@ fn write_set_cap_fails_the_write_that_crosses_it() {
 }
 
 #[test]
+fn overwriting_a_key_counts_only_its_latest_value_against_the_cap() {
+    let limits = Limits::default().with_max_write_set_bytes(2000);
+    let node = Node::with_limits(MemoryEngine::new(), limits).unwrap();
+    node.create_namespace("d").unwrap();
+    node.create_collection(&collection("d.c")).unwrap();
+    node.run(|t| {
+        t.insert(
+            &collection("d.c"),
+            doc! { "_id": 1, "pad": "x".repeat(100) },
+        )?;
+        for _ in 0..100 {
+            t.replace(
+                &collection("d.c"),
+                &Bson::Int32(1),
+                doc! { "pad": "x".repeat(100) },
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
 fn largest_document_fits_the_default_write_set_cap() {
     let node = indexed("s", FieldType::String, false, false);
     let max = node.limits().max_document_bytes;
@@ -853,6 +913,14 @@ fn largest_document_fits_the_default_write_set_cap() {
         .len(),
         1
     );
+    // The worst case: a replace deletes the old entry and adds the new one,
+    // and NUL bytes take twice the room in a key.
+    for s in ["\0".repeat(max - 100), "\0".repeat(max - 101)] {
+        assert!(
+            node.replace(&collection("shop.orders"), &Bson::Int32(1), doc! { "s": s })
+                .unwrap()
+        );
+    }
 }
 
 #[test]
@@ -925,21 +993,7 @@ fn deleting_the_last_document_lets_a_transaction_create_an_index() {
 
 #[test]
 fn orphaned_index_entries_do_not_make_a_collection_look_non_empty() {
-    let node = common::shop();
-    node.set_field_type(
-        &collection("shop.orders"),
-        &field_path("n"),
-        field(FieldType::Int, true),
-    )
-    .unwrap();
-    for i in 0..3000 {
-        node.insert(&collection("shop.orders"), doc! { "_id": i, "n": i % 2500 })
-            .unwrap();
-    }
-    assert!(
-        node.create_index(&collection("shop.orders"), &field_path("n"), true)
-            .is_err()
-    );
+    let node = failed_unique_build();
     node.run(|t| {
         for i in 0..3000 {
             t.delete(&collection("shop.orders"), &Bson::Int32(i))?;

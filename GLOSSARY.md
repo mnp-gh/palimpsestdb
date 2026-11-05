@@ -79,7 +79,7 @@ A unit of reads and writes that commits or aborts as a whole.
 The consistent view of every Namespace on the Node that a Transaction reads, fixed at the moment the Transaction begins.
 
 **Write Set**:
-The Documents a Transaction has written but not yet committed; visible only to that Transaction.
+The writes a Transaction has made but not yet committed (Documents, their Index entries and Catalog entries); visible only to that Transaction.
 _Avoid_: Buffer, pending writes
 
 **Commit Timestamp**:
@@ -87,7 +87,7 @@ A counter, not clock time, that orders committed Transactions: each commit takes
 _Avoid_: Version number, LSN, wall-clock time
 
 **Version**:
-One committed state of a Document, identified by its Commit Timestamp.
+One committed state of a key (a Document, an Index entry or a Catalog entry), identified by its Commit Timestamp.
 _Avoid_: Revision
 
 **Snapshot Isolation**:
@@ -107,13 +107,13 @@ The outcome of a Transaction whose writes are discarded. Aborts caused by concur
 _Avoid_: Rollback (that is what the client asks for; Abort is the outcome)
 
 **Write Conflict**:
-An Abort because a concurrent Transaction committed a write to the same Document first.
+An Abort because a concurrent Transaction committed a write to the same key first: the same Document, the same value in a unique Index, or the same Catalog entry.
 
 **Serialization Failure**:
 An Abort because committing would produce an outcome not equivalent to any serial order.
 
 **Collection Changed**:
-An Abort because a Collection the Transaction used was dropped, renamed or re-indexed after its Snapshot.
+An Abort because, after the Transaction's Snapshot, a Collection it used was dropped, renamed, or had its Collection Schema or Indexes changed; or a Document was committed into a Collection whose every Document it relied on (a schema change, or an Index created on an empty Collection).
 
 **Commit Outcome Unknown**:
 The result of a commit whose durability could not be confirmed: the Transaction may or may not survive a restart. Not an Abort, and not safely retryable.

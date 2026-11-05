@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::collection;
+use common::{collection, open};
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use bson::{Bson, doc};
 use proptest::prelude::*;
 use psdb_core::wal::SimDisk;
-use psdb_core::{Limits, Node, Transaction};
+use psdb_core::{Node, Transaction};
 use psdb_storage_memory::MemoryEngine;
 
 /// What a Node holds: whether `shop` exists, and `shop.orders` as
@@ -38,10 +38,6 @@ type Op = (i32, Option<i32>);
 /// each commit leaves a different State and a recovered State names exactly
 /// how many commits survived.
 const SEQUENCE_ID: i32 = -1;
-
-fn open(disk: &SimDisk) -> psdb_core::Result<Node<MemoryEngine>> {
-    Node::open_with(MemoryEngine::new(), disk.file(), Limits::default())
-}
 
 fn state(node: &Node<MemoryEngine>) -> State {
     let shop = node

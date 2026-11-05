@@ -472,14 +472,17 @@ mod tests {
     use super::*;
     use crate::schema::{FieldSchema, Schema};
 
-    fn schema(path: &str, field_type: FieldType) -> Schema {
-        Schema::from([(
-            path.parse().unwrap(),
-            FieldSchema {
-                field_type,
-                strict: false,
-            },
-        )])
+    fn schema(fields: &[(&str, FieldType)]) -> Schema {
+        fields
+            .iter()
+            .map(|&(path, field_type)| {
+                let field = FieldSchema {
+                    field_type,
+                    strict: false,
+                };
+                (path.parse().unwrap(), field)
+            })
+            .collect()
     }
 
     fn index(path: &str, id: u32) -> IndexDef {
@@ -548,22 +551,7 @@ mod tests {
 
     #[test]
     fn plan_prefers_equality_and_narrows_ranges() {
-        let s = Schema::from([
-            (
-                "age".parse().unwrap(),
-                FieldSchema {
-                    field_type: FieldType::Int,
-                    strict: false,
-                },
-            ),
-            (
-                "status".parse().unwrap(),
-                FieldSchema {
-                    field_type: FieldType::String,
-                    strict: false,
-                },
-            ),
-        ]);
+        let s = schema(&[("age", FieldType::Int), ("status", FieldType::String)]);
         let ix = [index("age", 7), index("status", 9)];
         let status_range = planned(doc! { "status": "open" }, &s, &ix).unwrap();
         assert_eq!(
@@ -583,7 +571,7 @@ mod tests {
 
     #[test]
     fn plan_falls_back_to_a_scan() {
-        let s = schema("age", FieldType::Int);
+        let s = schema(&[("age", FieldType::Int)]);
         let ix = [index("age", 7)];
         for filter in [
             doc! { "age": { "$ne": 3 } },
@@ -604,22 +592,7 @@ mod tests {
 
     #[test]
     fn or_reads_the_union_when_every_branch_is_indexed() {
-        let s = Schema::from([
-            (
-                "age".parse().unwrap(),
-                FieldSchema {
-                    field_type: FieldType::Int,
-                    strict: false,
-                },
-            ),
-            (
-                "status".parse().unwrap(),
-                FieldSchema {
-                    field_type: FieldType::String,
-                    strict: false,
-                },
-            ),
-        ]);
+        let s = schema(&[("age", FieldType::Int), ("status", FieldType::String)]);
         let ix = [index("age", 7), index("status", 9)];
         let either = doc! { "$or": [ { "status": "open" }, { "age": { "$gt": 65 } } ] };
         assert_eq!(planned(either, &s, &ix).map(|r| r.len()), Some(2));
@@ -660,7 +633,7 @@ mod tests {
 
     #[test]
     fn id_comparisons_read_documents_directly() {
-        let s = schema("age", FieldType::Int);
+        let s = schema(&[("age", FieldType::Int)]);
         let ix = [index("age", 7)];
         let docs = |filter| match planned(filter, &s, &ix).as_deref() {
             Some([CandidateRange::Documents(r)]) => Some(r.clone()),
@@ -692,7 +665,7 @@ mod tests {
 
     #[test]
     fn binary_indexes_answer_equality_only() {
-        let s = schema("b", FieldType::Binary);
+        let s = schema(&[("b", FieldType::Binary)]);
         let ix = [index("b", 7)];
         let bin = Bson::Binary(bson::Binary {
             subtype: bson::spec::BinarySubtype::Generic,
