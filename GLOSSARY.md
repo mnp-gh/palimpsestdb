@@ -13,15 +13,19 @@ The `_id` of a Document: unique within its Collection, supplied by the client or
 _Avoid_: Primary key, key, oid
 
 **Collection**:
-A named, schemaless group of Documents within a Database.
+A named, schemaless group of Documents within a Namespace.
 _Avoid_: Table, bucket
 
-**Database**:
-A named namespace of Collections, and the unit to which permissions are granted.
-_Avoid_: Schema, keyspace, tenant
+**Namespace**:
+A named group of Collections, and the unit to which permissions are granted.
+_Avoid_: Database (the Database Layer is the software, not a group of Collections), Schema (that is the Collection Schema), keyspace, tenant
+
+**Collection path**:
+The name of a Collection together with the name of its Namespace, written `<namespace>.<collection>` (e.g. `shop.orders`); it identifies one Collection on the Node.
+_Avoid_: Namespace (MongoDB's word for it, but a Namespace here is only the first part), full name, qualified name
 
 **Catalog**:
-The authoritative record of which Databases and Collections exist and how their names map to their identities.
+The authoritative record of which Namespaces and Collections exist and how their names map to their identities.
 _Avoid_: Metadata store, schema registry
 
 **Index**:
@@ -43,14 +47,14 @@ _Avoid_: Required field (a Strict Field may be missing), typed column
 ## Access
 
 **User**:
-An identity that can authenticate to a Node. Users belong to the Node, not to any one Database.
+An identity that can authenticate to a Node. Users belong to the Node, not to any one Namespace.
 _Avoid_: Account, login, principal
 
 **Role**:
-A named set of permissions granted to a User on one Database (or Node-wide, for root). It belongs to that Database, not to its name: dropping the Database removes it.
+A named set of permissions granted to a User on one Namespace (or Node-wide, for root). It belongs to that Namespace, not to its name: dropping the Namespace removes it.
 _Avoid_: Permission group, grant
 
-Tenants are not modelled; a tenant is a convention of Users holding Roles on a set of Databases.
+Tenants are not modelled; a tenant is a convention of Users holding Roles on a set of Namespaces.
 
 ## Layers
 
@@ -58,9 +62,9 @@ Tenants are not modelled; a tenant is a convention of Users holding Roles on a s
 The replaceable bottom layer: an ordered store of byte keys to byte values with atomic batched writes. It knows nothing about documents, versions or transactions.
 _Avoid_: Backend, driver, store
 
-**Document Layer**:
+**Database Layer**:
 Everything above the Storage Engine that gives bytes meaning: documents, versions, transactions, durability and isolation.
-_Avoid_: Database Layer ("Database" is the namespace), engine (ambiguous with Storage Engine), core
+_Avoid_: Document Layer (Documents are one thing it manages, not all), engine (ambiguous with Storage Engine), core
 
 ## Transactions
 
@@ -68,7 +72,7 @@ _Avoid_: Database Layer ("Database" is the namespace), engine (ambiguous with St
 A unit of reads and writes that commits or aborts as a whole.
 
 **Snapshot**:
-The consistent view of every Database on the Node that a Transaction reads, fixed at the moment the Transaction begins.
+The consistent view of every Namespace on the Node that a Transaction reads, fixed at the moment the Transaction begins.
 
 **Write Set**:
 The Documents a Transaction has written but not yet committed; visible only to that Transaction.
@@ -125,7 +129,7 @@ _Avoid_: Schema violation, validation error
 
 **Node**:
 One running instance of PalimpsestDB. Until replication exists, PalimpsestDB runs as exactly one Node.
-_Avoid_: Server, instance, replica (until replication is designed)
+_Avoid_: Server, instance, replica (until replication is designed), database (a Node holds many Namespaces)
 
 ## Commit lifecycle
 

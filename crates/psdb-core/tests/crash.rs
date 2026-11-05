@@ -16,10 +16,10 @@ use std::process::{Command, Stdio};
 use bson::{Bson, doc};
 use proptest::prelude::*;
 use psdb_core::wal::SimDisk;
-use psdb_core::{Database, Limits, Transaction};
+use psdb_core::{Limits, Node, Transaction};
 use psdb_storage_memory::MemoryEngine;
 
-/// What a Database holds: whether `shop` exists, and `shop.orders` as
+/// What a Node holds: whether `shop` exists, and `shop.orders` as
 /// `_id → v` once it exists.
 #[derive(Debug, Clone, PartialEq)]
 struct State {
@@ -35,19 +35,22 @@ type Op = (i32, Option<i32>);
 /// how many commits survived.
 const SEQUENCE_ID: i32 = -1;
 
-fn open(disk: &SimDisk) -> psdb_core::Result<Database<MemoryEngine>> {
-    Database::open_with(MemoryEngine::new(), disk.file(), Limits::default())
+fn open(disk: &SimDisk) -> psdb_core::Result<Node<MemoryEngine>> {
+    Node::open_with(MemoryEngine::new(), disk.file(), Limits::default())
 }
 
-fn state(db: &Database<MemoryEngine>) -> State {
-    let shop = db.list_databases().unwrap().contains(&"shop".to_string());
+fn state(node: &Node<MemoryEngine>) -> State {
+    let shop = node
+        .list_namespaces()
+        .unwrap()
+        .contains(&"shop".to_string());
     let has_orders = shop
-        && db
+        && node
             .list_collections("shop")
             .unwrap()
             .contains(&"orders".to_string());
     let orders = has_orders.then(|| {
-        db.find("shop", "orders", &doc! {})
+        node.find("shop", "orders", &doc! {})
             .unwrap()
             .into_iter()
             .map(|d| (d.get_i32("_id").unwrap(), d.get_i32("v").unwrap()))
@@ -65,8 +68,8 @@ fn upsert(t: &mut Transaction<'_, MemoryEngine>, id: i32, v: i32) -> psdb_core::
 }
 
 /// Run `txn`, the `sequence`th workload Transaction, and commit it.
-fn run(db: &Database<MemoryEngine>, sequence: i32, txn: &[Op]) -> psdb_core::Result<()> {
-    let mut t = db.begin();
+fn run(node: &Node<MemoryEngine>, sequence: i32, txn: &[Op]) -> psdb_core::Result<()> {
+    let mut t = node.begin();
     upsert(&mut t, SEQUENCE_ID, sequence)?;
     for &(id, value) in txn {
         match value {
@@ -115,15 +118,15 @@ proptest! {
         let disk = SimDisk::new();
         disk.crash_after(crash_after, keep_unsynced);
         let mut acknowledged = 0;
-        if let Ok(db) = open(&disk) {
+        if let Ok(node) = open(&disk) {
             let setup: [&dyn Fn() -> psdb_core::Result<()>; 2] = [
-                &|| db.create_database("shop"),
-                &|| db.create_collection("shop", "orders"),
+                &|| node.create_namespace("shop"),
+                &|| node.create_collection("shop", "orders"),
             ];
             let commits = setup
                 .iter()
                 .map(|f| f())
-                .chain((0..).zip(&txns).map(|(sequence, t)| run(&db, sequence, t)));
+                .chain((0..).zip(&txns).map(|(sequence, t)| run(&node, sequence, t)));
             for outcome in commits {
                 if outcome.is_err() {
                     break;
@@ -144,12 +147,12 @@ proptest! {
             "recovered {recovered:?} (commit {survived:?}) after {acknowledged} acknowledged"
         );
 
-        // The recovered Database keeps working and survives another reopen.
-        let db = open(&disk).unwrap();
-        prop_assert_eq!(state(&db), recovered.clone());
+        // The recovered Node keeps working and survives another reopen.
+        let node = open(&disk).unwrap();
+        prop_assert_eq!(state(&node), recovered.clone());
         if recovered.orders.is_some() {
-            db.insert("shop", "orders", doc! { "_id": 99, "v": 0 }).unwrap();
-            drop(db);
+            node.insert("shop", "orders", doc! { "_id": 99, "v": 0 }).unwrap();
+            drop(node);
             let orders = state(&open(&disk).unwrap()).orders.unwrap();
             prop_assert_eq!(orders.get(&99).copied(), Some(0));
         }
@@ -167,12 +170,12 @@ fn kill_child() {
     let Some(dir) = std::env::var_os(CHILD_DIR) else {
         return;
     };
-    let db = Database::open(MemoryEngine::new(), dir).unwrap();
-    db.create_database("shop").unwrap();
-    db.create_collection("shop", "orders").unwrap();
+    let node = Node::open(MemoryEngine::new(), dir).unwrap();
+    node.create_namespace("shop").unwrap();
+    node.create_collection("shop", "orders").unwrap();
     let mut out = std::io::stdout().lock();
     for id in 0.. {
-        db.insert("shop", "orders", doc! { "_id": id, "v": 0 })
+        node.insert("shop", "orders", doc! { "_id": id, "v": 0 })
             .unwrap();
         writeln!(out, "acknowledged {id}").unwrap();
         out.flush().unwrap();
@@ -222,8 +225,8 @@ fn kill_keeps_exactly_a_prefix_of_commits() {
 }
 
 fn recovered_ids(dir: &Path) -> Vec<i32> {
-    let db = Database::open(MemoryEngine::new(), dir).unwrap();
-    match state(&db).orders {
+    let node = Node::open(MemoryEngine::new(), dir).unwrap();
+    match state(&node).orders {
         Some(docs) => docs.into_keys().collect(),
         None => Vec::new(),
     }

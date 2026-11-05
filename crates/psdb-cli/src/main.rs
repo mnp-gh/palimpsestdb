@@ -9,42 +9,42 @@ use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 
 use bson::{Binary, Bson, Document, spec::BinarySubtype};
-use psdb_core::{Database, FieldSchema, FieldType, Transaction};
+use psdb_core::{FieldSchema, FieldType, Node, Transaction};
 use psdb_storage_memory::MemoryEngine;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-type Db = Database<MemoryEngine>;
-type Txn<'db> = Transaction<'db, MemoryEngine>;
+type MemNode = Node<MemoryEngine>;
+type Txn<'node> = Transaction<'node, MemoryEngine>;
 
 const HELP: &str = "\
-Databases and collections
-  dbs                          list databases
-  create-db <db>               create a database
-  drop-db <db>                 drop a database
-  colls <db>                   list collections
-  create-coll <db>.<coll>      create a collection
-  drop-coll <db>.<coll>        drop a collection
+Namespaces and collections
+  namespaces                   list namespaces
+  create-ns <ns>               create a namespace
+  drop-ns <ns>                 drop a namespace
+  colls <ns>                   list collections
+  create-coll <ns>.<coll>      create a collection
+  drop-coll <ns>.<coll>        drop a collection
 
 Documents (values are relaxed Extended JSON)
-  insert <db>.<coll> <doc>             insert; prints the _id
-  get <db>.<coll> <id>                 print the document with this _id
-  replace <db>.<coll> <id> <doc>       replace the whole document
-  delete <db>.<coll> <id>              delete the document
-  find <db>.<coll> [filter]            print matching documents
+  insert <ns>.<coll> <doc>             insert; prints the _id
+  get <ns>.<coll> <id>                 print the document with this _id
+  replace <ns>.<coll> <id> <doc>       replace the whole document
+  delete <ns>.<coll> <id>              delete the document
+  find <ns>.<coll> [filter]            print matching documents
 
 Schema and indexes (types: int double string date bool objectId binary)
-  schema <db>.<coll>                     list declared field types
-  set-type <db>.<coll> <path> <type> [strict]
+  schema <ns>.<coll>                     list declared field types
+  set-type <ns>.<coll> <path> <type> [strict]
                                          declare a field's type; strict rejects other types
-  unset-type <db>.<coll> <path>          remove a field's declaration
-  indexes <db>.<coll>                    list indexes
-  create-index <db>.<coll> <path> [unique]
+  unset-type <ns>.<coll> <path>          remove a field's declaration
+  indexes <ns>.<coll>                    list indexes
+  create-index <ns>.<coll> <path> [unique]
                                          index a declared field (unique needs strict);
                                          inside a transaction, only on an empty collection
-  drop-index <db>.<coll> <path>          drop the index on a field
+  drop-index <ns>.<coll> <path>          drop the index on a field
 
 Transactions (without begin, every command commits on its own)
   begin                        start a transaction
@@ -69,15 +69,15 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let (db, mode) = match &data_dir {
-        Some(dir) => match Database::open(MemoryEngine::new(), dir) {
-            Ok(db) => (db, format!("data in {}", dir.display())),
+    let (node, mode) = match &data_dir {
+        Some(dir) => match Node::open(MemoryEngine::new(), dir) {
+            Ok(node) => (node, format!("data in {}", dir.display())),
             Err(e) => {
                 eprintln!("error: opening {}: {e}", dir.display());
                 std::process::exit(1);
             }
         },
-        None => (Database::new(MemoryEngine::new()), "in-memory".to_string()),
+        None => (Node::new(MemoryEngine::new()), "in-memory".to_string()),
     };
     let mut txn: Option<Txn<'_>> = None;
     let mut input = Input::open();
@@ -97,7 +97,7 @@ fn main() {
         let Some(line) = input.next_line(prompt) else {
             break;
         };
-        match execute(&db, &mut txn, line.trim()) {
+        match execute(&node, &mut txn, line.trim()) {
             Ok(Outcome::Continue) => {}
             Ok(Outcome::Quit) => break,
             Err(message) => eprintln!("error: {message}"),
@@ -174,7 +174,11 @@ impl Input {
     }
 }
 
-fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<Outcome, String> {
+fn execute<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    line: &str,
+) -> Result<Outcome, String> {
     let (command, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let rest = rest.trim();
     match command {
@@ -186,7 +190,7 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
             if txn.is_some() {
                 return Err("a transaction is already open; commit or abort it first".into());
             }
-            *txn = Some(db.begin());
+            *txn = Some(node.begin());
         }
         "commit" => {
             let open = txn.take().ok_or("no open transaction")?;
@@ -198,41 +202,39 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
             println!("aborted");
         }
 
-        "dbs" => print_names(&with_txn(db, txn, |t| t.list_databases())?),
-        "create-db" => with_txn(db, txn, |t| t.create_database(rest))?,
-        "drop-db" => with_txn(db, txn, |t| t.drop_database(rest))?,
-        "colls" => print_names(&with_txn(db, txn, |t| t.list_collections(rest))?),
+        "namespaces" => print_names(&with_txn(node, txn, |t| t.list_namespaces())?),
+        "create-ns" => with_txn(node, txn, |t| t.create_namespace(rest))?,
+        "drop-ns" => with_txn(node, txn, |t| t.drop_namespace(rest))?,
+        "colls" => print_names(&with_txn(node, txn, |t| t.list_collections(rest))?),
         "create-coll" => {
-            let (d, c) = namespace(rest)?;
-            with_txn(db, txn, |t| t.create_collection(d, c))?;
+            let (ns, coll) = collection_path(rest)?;
+            with_txn(node, txn, |t| t.create_collection(ns, coll))?;
         }
         "drop-coll" => {
-            let (d, c) = namespace(rest)?;
-            with_txn(db, txn, |t: &mut Transaction<'_, MemoryEngine>| {
-                t.drop_collection(d, c)
-            })?;
+            let (ns, coll) = collection_path(rest)?;
+            with_txn(node, txn, |t| t.drop_collection(ns, coll))?;
         }
 
         "insert" => {
-            let (ns, args) = split_namespace(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let [doc] = values::<1>(args)?;
             let doc = as_document(doc)?;
-            let id = with_txn(db, txn, |t| t.insert(ns.0, ns.1, doc))?;
+            let id = with_txn(node, txn, |t| t.insert(ns, coll, doc))?;
             println!("{}", to_json(id));
         }
         "get" => {
-            let (ns, args) = split_namespace(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let [id] = values::<1>(args)?;
-            match with_txn(db, txn, |t| t.get(ns.0, ns.1, &id))? {
+            match with_txn(node, txn, |t| t.get(ns, coll, &id))? {
                 Some(doc) => println!("{}", to_json(Bson::Document(doc))),
                 None => not_found(&id),
             }
         }
         "replace" => {
-            let (ns, args) = split_namespace(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let [id, doc] = values::<2>(args)?;
             let doc = as_document(doc)?;
-            let replaced = with_txn(db, txn, |t| t.replace(ns.0, ns.1, &id, doc))?;
+            let replaced = with_txn(node, txn, |t| t.replace(ns, coll, &id, doc))?;
             if replaced {
                 println!("replaced");
             } else {
@@ -240,9 +242,9 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
             }
         }
         "delete" => {
-            let (ns, args) = split_namespace(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let [id] = values::<1>(args)?;
-            let deleted = with_txn(db, txn, |t| t.delete(ns.0, ns.1, &id))?;
+            let deleted = with_txn(node, txn, |t| t.delete(ns, coll, &id))?;
             if deleted {
                 println!("deleted");
             } else {
@@ -250,13 +252,13 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
             }
         }
         "find" => {
-            let (ns, args) = split_namespace(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let filter = if args.is_empty() {
                 Document::new()
             } else {
                 as_document(values::<1>(args)?[0].clone())?
             };
-            let docs = with_txn(db, txn, |t| t.find(ns.0, ns.1, &filter))?;
+            let docs = with_txn(node, txn, |t| t.find(ns, coll, &filter))?;
             for doc in &docs {
                 println!("{}", to_json(Bson::Document(doc.clone())));
             }
@@ -264,57 +266,57 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
         }
 
         "schema" => {
-            let (d, c) = namespace(rest)?;
-            for (path, field) in with_txn(db, txn, |t| t.collection_schema(d, c))? {
+            let (d, c) = collection_path(rest)?;
+            for (path, field) in with_txn(node, txn, |t| t.collection_schema(d, c))? {
                 let strict = if field.strict { " strict" } else { "" };
                 println!("{path}: {}{strict}", field.field_type);
             }
         }
         "set-type" => {
-            let (ns, args) = split_namespace(rest)?;
+            let (coll, args) = split_collection_path(rest)?;
             let (path, field_type, strict) = match words(args)[..] {
                 [path, ty] => (path, ty, false),
                 [path, ty, "strict"] => (path, ty, true),
-                _ => return Err("usage: set-type <db>.<coll> <path> <type> [strict]".into()),
+                _ => return Err("usage: set-type <ns>.<coll> <path> <type> [strict]".into()),
             };
             let field_type: FieldType = field_type.parse().map_err(message)?;
             let field = FieldSchema { field_type, strict };
-            with_txn(db, txn, |t| t.set_field_type(ns.0, ns.1, path, field))?;
+            with_txn(node, txn, |t| t.set_field_type(coll.0, coll.1, path, field))?;
         }
         "unset-type" => {
-            let (ns, args) = split_namespace(rest)?;
+            let (coll, args) = split_collection_path(rest)?;
             let [path] = words(args)[..] else {
-                return Err("usage: unset-type <db>.<coll> <path>".into());
+                return Err("usage: unset-type <ns>.<coll> <path>".into());
             };
-            with_txn(db, txn, |t| t.remove_field_type(ns.0, ns.1, path))?;
+            with_txn(node, txn, |t| t.remove_field_type(coll.0, coll.1, path))?;
         }
         "indexes" => {
-            let (d, c) = namespace(rest)?;
-            for index in with_txn(db, txn, |t| t.list_indexes(d, c))? {
+            let (d, c) = collection_path(rest)?;
+            for index in with_txn(node, txn, |t| t.list_indexes(d, c))? {
                 let unique = if index.unique { " unique" } else { "" };
                 println!("{}{unique}", index.path);
             }
         }
         "create-index" => {
-            let (ns, args) = split_namespace(rest)?;
+            let (coll, args) = split_collection_path(rest)?;
             let (path, unique) = match words(args)[..] {
                 [path] => (path, false),
                 [path, "unique"] => (path, true),
-                _ => return Err("usage: create-index <db>.<coll> <path> [unique]".into()),
+                _ => return Err("usage: create-index <ns>.<coll> <path> [unique]".into()),
             };
             match txn {
-                Some(open) => open.create_index(ns.0, ns.1, path, unique),
+                Some(open) => open.create_index(coll.0, coll.1, path, unique),
                 // Builds from existing Documents, committing on its own.
-                None => db.create_index(ns.0, ns.1, path, unique),
+                None => node.create_index(coll.0, coll.1, path, unique),
             }
             .map_err(message)?;
         }
         "drop-index" => {
-            let (ns, args) = split_namespace(rest)?;
+            let (coll, args) = split_collection_path(rest)?;
             let [path] = words(args)[..] else {
-                return Err("usage: drop-index <db>.<coll> <path>".into());
+                return Err("usage: drop-index <ns>.<coll> <path>".into());
             };
-            with_txn(db, txn, |t| t.drop_index(ns.0, ns.1, path))?;
+            with_txn(node, txn, |t| t.drop_index(coll.0, coll.1, path))?;
         }
 
         other => return Err(format!("unknown command {other:?}; type `help`")),
@@ -324,19 +326,19 @@ fn execute<'db>(db: &'db Db, txn: &mut Option<Txn<'db>>, line: &str) -> Result<O
 
 /// Run `work` in the open transaction, or in its own autocommit transaction
 /// if none is open.
-fn with_txn<'db, T>(
-    db: &'db Db,
-    txn: &mut Option<Txn<'db>>,
-    work: impl FnOnce(&mut Transaction<'_, MemoryEngine>) -> psdb_core::Result<T>,
+fn with_txn<'node, T>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    work: impl FnOnce(&mut Txn<'_>) -> psdb_core::Result<T>,
 ) -> Result<T, String> {
     match txn {
         Some(open) => work(open),
-        None => db.run(work),
+        None => node.run(work),
     }
     .map_err(message)
 }
 
-/// The error as a message to print. Exits instead if the database can no
+/// The error as a message to print. Exits instead if the Node can no
 /// longer commit, so a script fed to `psdb` stops with a non-zero status.
 fn message(e: psdb_core::Error) -> String {
     if e.requires_reopen() {
@@ -346,15 +348,15 @@ fn message(e: psdb_core::Error) -> String {
     e.to_string()
 }
 
-fn namespace(text: &str) -> Result<(&str, &str), String> {
+fn collection_path(text: &str) -> Result<(&str, &str), String> {
     text.split_once('.')
-        .ok_or_else(|| format!("expected <db>.<coll>, got {text:?}"))
+        .ok_or_else(|| format!("expected <ns>.<coll>, got {text:?}"))
 }
 
-/// Split `<db>.<coll> rest...` into the namespace and the rest.
-fn split_namespace(text: &str) -> Result<((&str, &str), &str), String> {
-    let (ns, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-    Ok((namespace(ns)?, rest.trim()))
+/// Split `<ns>.<coll> rest...` into the Collection path and the rest.
+fn split_collection_path(text: &str) -> Result<((&str, &str), &str), String> {
+    let (path, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    Ok((collection_path(path)?, rest.trim()))
 }
 
 fn words(text: &str) -> Vec<&str> {

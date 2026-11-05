@@ -9,17 +9,17 @@ use psdb_storage::KeyRange;
 
 use crate::error::{Error, Result};
 
-/// The reserved system Database: the Catalog (ADR 0006) and unversioned
-/// Document Layer state.
-pub(crate) const SYSTEM_DATABASE: u32 = 0;
-/// Unversioned Document Layer state, such as `applied_up_to`.
+/// The reserved system Namespace: the Catalog (ADR 0006) and unversioned
+/// Database Layer state.
+pub(crate) const SYSTEM_NAMESPACE: u32 = 0;
+/// Unversioned Database Layer state, such as `applied_up_to`.
 const STATE_COLLECTION: u32 = 0;
 /// The component naming the `applied_up_to` entry in [`STATE_COLLECTION`].
 /// Part of the on-disk layout (ADR 0008): never change it.
 const APPLIED_UP_TO: &[u8] = b"applied_up_to";
-const DATABASES_COLLECTION: u32 = 1;
+const NAMESPACES_COLLECTION: u32 = 1;
 const COLLECTIONS_COLLECTION: u32 = 2;
-const DATABASE_IDS_COLLECTION: u32 = 3;
+const NAMESPACE_IDS_COLLECTION: u32 = 3;
 const COLLECTION_IDS_COLLECTION: u32 = 4;
 
 /// The component that starts every Index entry key in a Collection. It
@@ -46,16 +46,16 @@ const TAG_DATE_TIME: u8 = 0x60;
 const TIMESTAMP_BYTES: usize = 8;
 
 /// The key prefix shared by every logical key in one Collection.
-pub(crate) fn collection_prefix(database_id: u32, collection_id: u32) -> Vec<u8> {
+pub(crate) fn collection_prefix(namespace_id: u32, collection_id: u32) -> Vec<u8> {
     let mut key = Vec::with_capacity(8);
-    key.extend_from_slice(&database_id.to_be_bytes());
+    key.extend_from_slice(&namespace_id.to_be_bytes());
     key.extend_from_slice(&collection_id.to_be_bytes());
     key
 }
 
 /// Every Document of a Collection, without its Index entries.
-pub(crate) fn documents_range(database_id: u32, collection_id: u32) -> KeyRange {
-    let prefix = collection_prefix(database_id, collection_id);
+pub(crate) fn documents_range(namespace_id: u32, collection_id: u32) -> KeyRange {
+    let prefix = collection_prefix(namespace_id, collection_id);
     let all = KeyRange::prefix(&prefix);
     let start = [prefix.as_slice(), &[INDEX_ENTRIES + 1]].concat();
     KeyRange::new(
@@ -65,16 +65,16 @@ pub(crate) fn documents_range(database_id: u32, collection_id: u32) -> KeyRange 
 }
 
 /// The key prefix shared by every entry of one Index.
-pub(crate) fn index_prefix(database_id: u32, collection_id: u32, index_id: u32) -> Vec<u8> {
-    let mut key = collection_prefix(database_id, collection_id);
+pub(crate) fn index_prefix(namespace_id: u32, collection_id: u32, index_id: u32) -> Vec<u8> {
+    let mut key = collection_prefix(namespace_id, collection_id);
     key.push(INDEX_ENTRIES);
     key.extend_from_slice(&index_id.to_be_bytes());
     key
 }
 
 /// The logical key of a Document.
-pub(crate) fn document_key(database_id: u32, collection_id: u32, id: &Bson) -> Result<Vec<u8>> {
-    let mut key = collection_prefix(database_id, collection_id);
+pub(crate) fn document_key(namespace_id: u32, collection_id: u32, id: &Bson) -> Result<Vec<u8>> {
+    let mut key = collection_prefix(namespace_id, collection_id);
     let start = key.len();
     encode_id(id, &mut key)?;
     if key.len() - start > MAX_ID_BYTES {
@@ -85,44 +85,44 @@ pub(crate) fn document_key(database_id: u32, collection_id: u32, id: &Bson) -> R
     Ok(key)
 }
 
-/// The prefix of every Database entry in the Catalog.
-pub(crate) fn databases_prefix() -> Vec<u8> {
-    collection_prefix(SYSTEM_DATABASE, DATABASES_COLLECTION)
+/// The prefix of every Namespace entry in the Catalog.
+pub(crate) fn namespaces_prefix() -> Vec<u8> {
+    collection_prefix(SYSTEM_NAMESPACE, NAMESPACES_COLLECTION)
 }
 
-/// The logical key of a Database entry in the Catalog.
-pub(crate) fn database_entry_key(name: &str) -> Vec<u8> {
-    let mut key = databases_prefix();
+/// The logical key of a Namespace entry in the Catalog.
+pub(crate) fn namespace_entry_key(name: &str) -> Vec<u8> {
+    let mut key = namespaces_prefix();
     push_escaped(&mut key, name.as_bytes());
     key
 }
 
-/// The prefix of every Collection entry of one Database in the Catalog.
-pub(crate) fn collections_prefix(database_id: u32) -> Vec<u8> {
-    let mut key = collection_prefix(SYSTEM_DATABASE, COLLECTIONS_COLLECTION);
-    key.extend_from_slice(&database_id.to_be_bytes());
+/// The prefix of every Collection entry of one Namespace in the Catalog.
+pub(crate) fn collections_prefix(namespace_id: u32) -> Vec<u8> {
+    let mut key = collection_prefix(SYSTEM_NAMESPACE, COLLECTIONS_COLLECTION);
+    key.extend_from_slice(&namespace_id.to_be_bytes());
     key
 }
 
 /// The logical key of a Collection entry in the Catalog.
-pub(crate) fn collection_entry_key(database_id: u32, name: &str) -> Vec<u8> {
-    let mut key = collections_prefix(database_id);
+pub(crate) fn collection_entry_key(namespace_id: u32, name: &str) -> Vec<u8> {
+    let mut key = collections_prefix(namespace_id);
     push_escaped(&mut key, name.as_bytes());
     key
 }
 
-/// The key that marks a Database ID as used, forever (ADR 0006).
-pub(crate) fn database_id_key(id: u32) -> Vec<u8> {
-    let mut key = collection_prefix(SYSTEM_DATABASE, DATABASE_IDS_COLLECTION);
+/// The key that marks a Namespace ID as used, forever (ADR 0006).
+pub(crate) fn namespace_id_key(id: u32) -> Vec<u8> {
+    let mut key = collection_prefix(SYSTEM_NAMESPACE, NAMESPACE_IDS_COLLECTION);
     key.extend_from_slice(&id.to_be_bytes());
     key
 }
 
-/// The key that marks a Collection ID in a Database as used, forever
+/// The key that marks a Collection ID in a Namespace as used, forever
 /// (ADR 0006).
-pub(crate) fn collection_id_key(database_id: u32, id: u32) -> Vec<u8> {
-    let mut key = collection_prefix(SYSTEM_DATABASE, COLLECTION_IDS_COLLECTION);
-    key.extend_from_slice(&database_id.to_be_bytes());
+pub(crate) fn collection_id_key(namespace_id: u32, id: u32) -> Vec<u8> {
+    let mut key = collection_prefix(SYSTEM_NAMESPACE, COLLECTION_IDS_COLLECTION);
+    key.extend_from_slice(&namespace_id.to_be_bytes());
     key.extend_from_slice(&id.to_be_bytes());
     key
 }
@@ -130,7 +130,7 @@ pub(crate) fn collection_id_key(database_id: u32, id: u32) -> Vec<u8> {
 /// The unversioned key holding the Commit Timestamp of the newest commit
 /// Applied to the engine (ADR 0004).
 pub(crate) fn applied_up_to_key() -> Vec<u8> {
-    let mut key = collection_prefix(SYSTEM_DATABASE, STATE_COLLECTION);
+    let mut key = collection_prefix(SYSTEM_NAMESPACE, STATE_COLLECTION);
     key.extend_from_slice(APPLIED_UP_TO);
     key
 }

@@ -1,4 +1,4 @@
-//! Document and name rules: limits, Document IDs, Database and Collection
+//! Document and name rules: limits, Document IDs, Namespace and Collection
 //! names.
 
 use bson::{Binary, Bson, Document, RawDocument, spec::BinarySubtype};
@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
-/// The largest Database or Collection name accepted, in bytes. Fixed by the
+/// The largest Namespace or Collection name accepted, in bytes. Fixed by the
 /// key format.
 pub const MAX_NAME_BYTES: usize = 64;
 
@@ -39,8 +39,8 @@ impl Default for Limits {
     }
 }
 
-/// Check a Database or Collection name: 1 to [`MAX_NAME_BYTES`] bytes, with
-/// no `.` (it separates Database from Collection) and no NUL.
+/// Check a Namespace or Collection name: 1 to [`MAX_NAME_BYTES`] bytes, with
+/// no `.` (it separates Namespace from Collection) and no NUL.
 pub(crate) fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidName("names must not be empty".into()));

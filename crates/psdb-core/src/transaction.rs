@@ -9,13 +9,13 @@ use bson::{Bson, Document};
 use psdb_storage::{KeyRange, StorageEngine};
 
 use crate::catalog::CollectionEntry;
-use crate::database::{CommitState, Database};
 use crate::document;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
 use crate::index::{self, Source};
 use crate::keys;
 use crate::mvcc;
+use crate::node::{CommitState, Node};
 use crate::schema;
 
 /// One entry of a Write Set: a logical key and its new value (`None`
@@ -30,13 +30,13 @@ pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
     write_set.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
 }
 
-/// A Transaction: reads see the Snapshot taken at [`Database::begin`] plus
+/// A Transaction: reads see the Snapshot taken at [`Node::begin`] plus
 /// this Transaction's own writes; writes stay in its Write Set until
 /// [`commit`](Self::commit).
 ///
 /// Dropping a Transaction without committing aborts it.
-pub struct Transaction<'db, E: StorageEngine> {
-    pub(crate) db: &'db Database<E>,
+pub struct Transaction<'node, E: StorageEngine> {
+    pub(crate) node: &'node Node<E>,
     pub(crate) snapshot_ts: u64,
     /// Logical key → new value (`None` deletes). Ordered so scans can
     /// overlay it on the Snapshot.
@@ -53,10 +53,10 @@ pub struct Transaction<'db, E: StorageEngine> {
     pub(crate) collection_reads: BTreeSet<Vec<u8>>,
 }
 
-impl<'db, E: StorageEngine> Transaction<'db, E> {
-    pub(crate) fn new(db: &'db Database<E>, snapshot_ts: u64) -> Self {
+impl<'node, E: StorageEngine> Transaction<'node, E> {
+    pub(crate) fn new(node: &'node Node<E>, snapshot_ts: u64) -> Self {
         Self {
-            db,
+            node,
             snapshot_ts,
             write_set: WriteSet::new(),
             write_set_bytes: 0,
@@ -74,7 +74,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     pub(crate) fn read(&self, logical: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.write_set.get(logical) {
             Some(own) => Ok(own.clone()),
-            None => mvcc::read_at(&self.db.engine, logical, self.snapshot_ts),
+            None => mvcc::read_at(&self.node.engine, logical, self.snapshot_ts),
         }
     }
 
@@ -94,7 +94,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
                 total -= size(key, old);
             }
         }
-        if total > self.db.limits.max_write_set_bytes {
+        if total > self.node.limits.max_write_set_bytes {
             return Err(Error::TransactionTooLarge);
         }
         self.write_set.extend(writes);
@@ -113,7 +113,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
             return Ok(true);
         }
         let mut found = false;
-        mvcc::scan_range_at(&self.db.engine, range, self.snapshot_ts, &mut |key, _| {
+        mvcc::scan_range_at(&self.node.engine, range, self.snapshot_ts, &mut |key, _| {
             // Skip a value this Transaction deleted.
             if self.write_set.get(key) == Some(&None) {
                 return ControlFlow::Continue(());
@@ -135,7 +135,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     pub(crate) fn scan_range(&self, range: &KeyRange) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
         let mut rows = BTreeMap::new();
         mvcc::scan_range_at(
-            &self.db.engine,
+            &self.node.engine,
             range,
             self.snapshot_ts,
             &mut |key, value| {
@@ -158,21 +158,26 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
 
     /// Insert a Document. If it has no `_id`, a UUIDv7 is generated.
     /// Returns the Document ID.
-    pub fn insert(&mut self, database: &str, collection: &str, doc: Document) -> Result<Bson> {
-        let (db_id, entry) = self.collection_entry(database, collection)?;
-        let (id, bytes) = document::prepare(doc, None, &self.db.limits)?;
-        let key = keys::document_key(db_id, entry.id, &id)?;
+    pub fn insert(&mut self, namespace: &str, collection: &str, doc: Document) -> Result<Bson> {
+        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
+        let (id, bytes) = document::prepare(doc, None, &self.node.limits)?;
+        let key = keys::document_key(ns_id, entry.id, &id)?;
         if self.read(&key)?.is_some() {
             return Err(Error::DuplicateId(id.to_string()));
         }
-        self.write_document(db_id, &entry, key, None, Some(bytes))?;
+        self.write_document(ns_id, &entry, key, None, Some(bytes))?;
         Ok(id)
     }
 
     /// The Document with this Document ID, if it exists.
-    pub fn get(&mut self, database: &str, collection: &str, id: &Bson) -> Result<Option<Document>> {
-        let (db_id, coll_id) = self.resolve_collection(database, collection)?;
-        let key = keys::document_key(db_id, coll_id, id)?;
+    pub fn get(
+        &mut self,
+        namespace: &str,
+        collection: &str,
+        id: &Bson,
+    ) -> Result<Option<Document>> {
+        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
+        let key = keys::document_key(ns_id, coll_id, id)?;
         self.read(&key)?
             .map(|bytes| document::decode(&bytes))
             .transpose()
@@ -183,30 +188,30 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     /// Document exists (nothing is written).
     pub fn replace(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         id: &Bson,
         doc: Document,
     ) -> Result<bool> {
-        let (db_id, entry) = self.collection_entry(database, collection)?;
-        let key = keys::document_key(db_id, entry.id, id)?;
+        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
+        let key = keys::document_key(ns_id, entry.id, id)?;
         let Some(old) = self.read(&key)? else {
             return Ok(false);
         };
-        let (_, bytes) = document::prepare(doc, Some(id), &self.db.limits)?;
-        self.write_document(db_id, &entry, key, Some(&old), Some(bytes))?;
+        let (_, bytes) = document::prepare(doc, Some(id), &self.node.limits)?;
+        self.write_document(ns_id, &entry, key, Some(&old), Some(bytes))?;
         Ok(true)
     }
 
     /// Delete the Document with this Document ID. Returns `false` if no such
     /// Document exists.
-    pub fn delete(&mut self, database: &str, collection: &str, id: &Bson) -> Result<bool> {
-        let (db_id, entry) = self.collection_entry(database, collection)?;
-        let key = keys::document_key(db_id, entry.id, id)?;
+    pub fn delete(&mut self, namespace: &str, collection: &str, id: &Bson) -> Result<bool> {
+        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
+        let key = keys::document_key(ns_id, entry.id, id)?;
         let Some(old) = self.read(&key)? else {
             return Ok(false);
         };
-        self.write_document(db_id, &entry, key, Some(&old), None)?;
+        self.write_document(ns_id, &entry, key, Some(&old), None)?;
         Ok(true)
     }
 
@@ -215,7 +220,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     /// Fields and unique Indexes. Nothing is written if any check fails.
     fn write_document(
         &mut self,
-        db_id: u32,
+        ns_id: u32,
         entry: &CollectionEntry,
         key: Vec<u8>,
         old: Option<&[u8]>,
@@ -226,7 +231,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         if let Some(doc) = new_doc {
             entry.check_strict(doc)?;
         }
-        let doc_id = &key[keys::collection_prefix(db_id, entry.id).len()..];
+        let doc_id = &key[keys::collection_prefix(ns_id, entry.id).len()..];
         let mut writes = Vec::new();
         for ix in &entry.indexes {
             let segments = schema::segments(&ix.path);
@@ -242,10 +247,10 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
                 continue;
             }
             if let Some(c) = before {
-                writes.push((index::entry_key(db_id, entry.id, ix, &c, doc_id), None));
+                writes.push((index::entry_key(ns_id, entry.id, ix, &c, doc_id), None));
             }
             if let Some(c) = after {
-                let entry_key = index::entry_key(db_id, entry.id, ix, &c, doc_id);
+                let entry_key = index::entry_key(ns_id, entry.id, ix, &c, doc_id);
                 if ix.unique
                     && !keys::is_null(&c)
                     && let Some(owner) = self.read(&entry_key)?
@@ -265,21 +270,21 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
 
     /// Every Document in the Collection that matches `filter`, in Document
     /// ID order. Reads candidates from a range of `_id`s or from an Index
-    /// when one fits the filter (see [`Database::create_index`]), and the
+    /// when one fits the filter (see [`Node::create_index`]), and the
     /// whole Collection otherwise; either way every candidate is checked
     /// against the whole filter.
     pub fn find(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         filter: &Document,
     ) -> Result<Vec<Document>> {
         let filter = Filter::parse(filter)?;
-        let (db_id, entry) = self.collection_entry(database, collection)?;
-        let prefix = keys::collection_prefix(db_id, entry.id);
-        let candidates = match index::plan(&filter, db_id, entry.id, &entry.schema, &entry.indexes)
+        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
+        let prefix = keys::collection_prefix(ns_id, entry.id);
+        let candidates = match index::plan(&filter, ns_id, entry.id, &entry.schema, &entry.indexes)
         {
-            None => self.scan_range(&keys::documents_range(db_id, entry.id))?,
+            None => self.scan_range(&keys::documents_range(ns_id, entry.id))?,
             Some(sources) => {
                 // Keyed by Document key, so a Document found through several
                 // ranges is read once, and results stay in Document ID order.
@@ -318,16 +323,16 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     /// committed a write to any key this one wrote, or with
     /// [`Error::CollectionChanged`] if a Catalog entry this one used changed
     /// since its Snapshot. Both are retryable. A Transaction that wrote
-    /// nothing always commits, unless the Database is poisoned.
+    /// nothing always commits, unless the Node is poisoned.
     ///
-    /// In a durable Database, fails with [`Error::TransactionTooLarge`] if
+    /// In a durable Node, fails with [`Error::TransactionTooLarge`] if
     /// its WAL Record would exceed 4 GiB, before anything is written. Fails
     /// with [`Error::CommitOutcomeUnknown`] if the WAL or the engine fails
-    /// partway, which poisons the Database: every later commit, read-only
+    /// partway, which poisons the Node: every later commit, read-only
     /// or not, fails with [`Error::Poisoned`].
     pub fn commit(self) -> Result<u64> {
-        let db = self.db;
-        let mut commits = db.commits.lock().expect("lock poisoned");
+        let node = self.node;
+        let mut commits = node.commits.lock().expect("lock poisoned");
         self.commit_locked(&mut commits)
     }
 
@@ -343,7 +348,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         if self.write_set.is_empty() {
             return Ok(self.snapshot_ts);
         }
-        let engine = &self.db.engine;
+        let engine = &self.node.engine;
         let changed_since_snapshot = |key: &[u8]| -> Result<bool> {
             Ok(mvcc::latest_commit_ts(engine, key)?.is_some_and(|ts| ts > self.snapshot_ts))
         };
@@ -368,7 +373,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
                 return Err(Error::WriteConflict);
             }
         }
-        self.db.apply_commit(commits, &self.write_set)
+        self.node.apply_commit(commits, &self.write_set)
     }
 
     /// Abort, discarding the Write Set. Same as dropping the Transaction.

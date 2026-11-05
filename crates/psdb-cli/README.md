@@ -4,7 +4,7 @@
 
 ```
 $ cargo run -p psdb-cli -- --data-dir ./data
-psdb> create-db shop
+psdb> create-ns shop
 psdb> create-coll shop.orders
 psdb> insert shop.orders {"_id": 1, "item": "book", "qty": 2}
 psdb> set-type shop.orders qty int

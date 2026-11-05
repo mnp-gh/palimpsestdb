@@ -1,6 +1,6 @@
 [package]
 name = "psdb-core"
-description = "The PalimpsestDB Document Layer: Documents, Catalog, MVCC and Snapshot Isolation over any Storage Engine."
+description = "The PalimpsestDB Database Layer: Documents, Catalog, MVCC and Snapshot Isolation over any Storage Engine."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

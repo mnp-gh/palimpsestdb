@@ -1,5 +1,5 @@
-//! The Catalog: which Databases and Collections exist, stored as versioned
-//! entries in Database 0 so DDL is transactional (ADR 0006).
+//! The Catalog: which Namespaces and Collections exist, stored as versioned
+//! entries in Namespace 0 so DDL is transactional (ADR 0006).
 //!
 //! Each entry's value is a BSON document `{ name, id }`; a Collection entry
 //! adds its Collection Schema and Indexes (ADR 0011):
@@ -16,9 +16,9 @@
 //! Indexes rewrites the entry, so a concurrent writer to the Collection
 //! aborts with Collection Changed.
 //!
-//! Database and Collection IDs are random, and creating one also writes its
+//! Namespace and Collection IDs are random, and creating one also writes its
 //! ID key, which dropping leaves in place, so an ID is never reused, even by
-//! a Database or Collection that holds no Documents. Creating different
+//! a Namespace or Collection that holds no Documents. Creating different
 //! names concurrently never conflicts; creating the same name, or drawing
 //! the same ID, does, because both Transactions write the same key.
 //!
@@ -148,110 +148,110 @@ impl CollectionEntry {
 }
 
 impl<E: StorageEngine> Transaction<'_, E> {
-    /// Create a Database.
-    pub fn create_database(&mut self, name: &str) -> Result<()> {
+    /// Create a Namespace.
+    pub fn create_namespace(&mut self, name: &str) -> Result<()> {
         validate_name(name)?;
-        let key = keys::database_entry_key(name);
+        let key = keys::namespace_entry_key(name);
         if self.read(&key)?.is_some() {
-            return Err(Error::DatabaseExists(name.to_owned()));
+            return Err(Error::NamespaceExists(name.to_owned()));
         }
         let id = self.allocate_id(None)?;
         self.write(key, Some(entry(name, id)))
     }
 
-    /// Drop a Database. Its Collections become unreachable: their Catalog
+    /// Drop a Namespace. Its Collections become unreachable: their Catalog
     /// entries and Documents stay behind under the old IDs until garbage
     /// collection exists.
-    pub fn drop_database(&mut self, name: &str) -> Result<()> {
-        self.resolve_database(name)?;
-        self.write(keys::database_entry_key(name), None)
+    pub fn drop_namespace(&mut self, name: &str) -> Result<()> {
+        self.resolve_namespace(name)?;
+        self.write(keys::namespace_entry_key(name), None)
     }
 
-    /// The names of every Database, in byte order.
-    pub fn list_databases(&mut self) -> Result<Vec<String>> {
-        self.scan(&keys::databases_prefix())?
+    /// The names of every Namespace, in byte order.
+    pub fn list_namespaces(&mut self) -> Result<Vec<String>> {
+        self.scan(&keys::namespaces_prefix())?
             .values()
             .map(|v| entry_name(v))
             .collect()
     }
 
-    /// Create a Collection in an existing Database.
-    pub fn create_collection(&mut self, database: &str, name: &str) -> Result<()> {
+    /// Create a Collection in an existing Namespace.
+    pub fn create_collection(&mut self, namespace: &str, name: &str) -> Result<()> {
         validate_name(name)?;
-        let db_id = self.resolve_database(database)?;
-        let key = keys::collection_entry_key(db_id, name);
+        let ns_id = self.resolve_namespace(namespace)?;
+        let key = keys::collection_entry_key(ns_id, name);
         if self.read(&key)?.is_some() {
             return Err(Error::CollectionExists {
-                database: database.to_owned(),
+                namespace: namespace.to_owned(),
                 collection: name.to_owned(),
             });
         }
-        let id = self.allocate_id(Some(db_id))?;
+        let id = self.allocate_id(Some(ns_id))?;
         self.write(key, Some(entry(name, id)))
     }
 
     /// Drop a Collection. Its Documents become unreachable and stay behind
     /// until garbage collection exists.
-    pub fn drop_collection(&mut self, database: &str, name: &str) -> Result<()> {
-        let (db_id, _) = self.resolve_collection(database, name)?;
-        self.write(keys::collection_entry_key(db_id, name), None)
+    pub fn drop_collection(&mut self, namespace: &str, name: &str) -> Result<()> {
+        let (ns_id, _) = self.resolve_collection(namespace, name)?;
+        self.write(keys::collection_entry_key(ns_id, name), None)
     }
 
-    /// The names of every Collection in a Database, in byte order.
-    pub fn list_collections(&mut self, database: &str) -> Result<Vec<String>> {
-        let db_id = self.resolve_database(database)?;
-        self.scan(&keys::collections_prefix(db_id))?
+    /// The names of every Collection in a Namespace, in byte order.
+    pub fn list_collections(&mut self, namespace: &str) -> Result<Vec<String>> {
+        let ns_id = self.resolve_namespace(namespace)?;
+        self.scan(&keys::collections_prefix(ns_id))?
             .values()
             .map(|v| entry_name(v))
             .collect()
     }
 
-    /// The ID of a Database at this Snapshot. Records the dependency, so the
-    /// commit aborts if the Database is dropped concurrently.
-    pub(crate) fn resolve_database(&mut self, name: &str) -> Result<u32> {
-        let key = keys::database_entry_key(name);
+    /// The ID of a Namespace at this Snapshot. Records the dependency, so the
+    /// commit aborts if the Namespace is dropped concurrently.
+    pub(crate) fn resolve_namespace(&mut self, name: &str) -> Result<u32> {
+        let key = keys::namespace_entry_key(name);
         let value = self
             .read(&key)?
-            .ok_or_else(|| Error::NoSuchDatabase(name.to_owned()))?;
+            .ok_or_else(|| Error::NoSuchNamespace(name.to_owned()))?;
         self.catalog_reads.insert(key);
         entry_id(&value)
     }
 
-    /// The Database and Collection IDs at this Snapshot. Records both
+    /// The Namespace and Collection IDs at this Snapshot. Records both
     /// dependencies.
     pub(crate) fn resolve_collection(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
     ) -> Result<(u32, u32)> {
-        let (db_id, entry) = self.collection_entry(database, collection)?;
-        Ok((db_id, entry.id))
+        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
+        Ok((ns_id, entry.id))
     }
 
-    /// The Database ID and the Collection's entry, with its schema and
+    /// The Namespace ID and the Collection's entry, with its schema and
     /// Indexes, as this Transaction sees them. Records both dependencies.
     pub(crate) fn collection_entry(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
     ) -> Result<(u32, CollectionEntry)> {
-        let db_id = self.resolve_database(database)?;
-        let key = keys::collection_entry_key(db_id, collection);
+        let ns_id = self.resolve_namespace(namespace)?;
+        let key = keys::collection_entry_key(ns_id, collection);
         let value = self.read(&key)?.ok_or_else(|| Error::NoSuchCollection {
-            database: database.to_owned(),
+            namespace: namespace.to_owned(),
             collection: collection.to_owned(),
         })?;
         self.catalog_reads.insert(key);
-        Ok((db_id, CollectionEntry::decode(&value)?))
+        Ok((ns_id, CollectionEntry::decode(&value)?))
     }
 
     pub(crate) fn write_collection_entry(
         &mut self,
-        db_id: u32,
+        ns_id: u32,
         entry: &CollectionEntry,
     ) -> Result<()> {
         self.write(
-            keys::collection_entry_key(db_id, &entry.name),
+            keys::collection_entry_key(ns_id, &entry.name),
             Some(entry.encode()),
         )
     }
@@ -265,13 +265,13 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// [`Error::TypeMismatch`] if any breaks the rule.
     pub fn set_field_type(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         path: &str,
         field: FieldSchema,
     ) -> Result<()> {
         let segments = schema::split_path(path)?;
-        let (db_id, mut entry) = self.collection_entry(database, collection)?;
+        let (ns_id, mut entry) = self.collection_entry(namespace, collection)?;
         let old = entry.schema.get(path).copied();
         if let (Some(ix), Some(old)) = (entry.index_on(path), old) {
             if old.field_type != field.field_type {
@@ -287,27 +287,27 @@ impl<E: StorageEngine> Transaction<'_, E> {
         }
         let already_enforced = old.is_some_and(|o| o.strict && o.field_type == field.field_type);
         if field.strict && !already_enforced {
-            let documents = keys::documents_range(db_id, entry.id);
+            let documents = keys::documents_range(ns_id, entry.id);
             for bytes in self.scan_range(&documents)?.values() {
                 schema::check_field(document::raw(bytes)?, path, &segments, field)?;
             }
             // A Document committed concurrently was not checked.
             self.collection_reads
-                .insert(keys::collection_prefix(db_id, entry.id));
+                .insert(keys::collection_prefix(ns_id, entry.id));
         }
         entry.schema.insert(path.to_owned(), field);
-        self.write_collection_entry(db_id, &entry)
+        self.write_collection_entry(ns_id, &entry)
     }
 
     /// Remove a field's declaration from the Collection Schema. Refused
     /// while an Index on the field exists.
     pub fn remove_field_type(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         path: &str,
     ) -> Result<()> {
-        let (db_id, mut entry) = self.collection_entry(database, collection)?;
+        let (ns_id, mut entry) = self.collection_entry(namespace, collection)?;
         if entry.index_on(path).is_some() {
             return Err(Error::InvalidSchema(format!(
                 "{path} has an index; drop it before removing the field's type"
@@ -316,16 +316,16 @@ impl<E: StorageEngine> Transaction<'_, E> {
         if entry.schema.remove(path).is_none() {
             return Err(Error::InvalidSchema(format!("{path} is not declared")));
         }
-        self.write_collection_entry(db_id, &entry)
+        self.write_collection_entry(ns_id, &entry)
     }
 
     /// The Collection Schema: every declared field path and its type.
     pub fn collection_schema(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
     ) -> Result<BTreeMap<String, FieldSchema>> {
-        Ok(self.collection_entry(database, collection)?.1.schema)
+        Ok(self.collection_entry(namespace, collection)?.1.schema)
     }
 
     /// Create an Index on a field of an empty Collection, as part of this
@@ -333,27 +333,27 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// aborts with the rest of the Transaction.
     ///
     /// Fails with [`Error::CollectionNotEmpty`] if the Collection holds
-    /// Documents: use [`Database::create_index`](crate::Database::create_index),
+    /// Documents: use [`Node::create_index`](crate::Node::create_index),
     /// which builds the Index on its own. A Document committed concurrently
     /// makes this Transaction abort with Collection Changed.
     pub fn create_index(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         path: &str,
         unique: bool,
     ) -> Result<()> {
-        let (db_id, mut entry, index) = self.prepare_index(database, collection, path, unique)?;
-        if self.any_live_in(&keys::documents_range(db_id, entry.id))? {
+        let (ns_id, mut entry, index) = self.prepare_index(namespace, collection, path, unique)?;
+        if self.any_live_in(&keys::documents_range(ns_id, entry.id))? {
             return Err(Error::CollectionNotEmpty {
-                database: database.to_owned(),
+                namespace: namespace.to_owned(),
                 collection: collection.to_owned(),
             });
         }
         self.collection_reads
-            .insert(keys::collection_prefix(db_id, entry.id));
+            .insert(keys::collection_prefix(ns_id, entry.id));
         entry.indexes.push(index);
-        self.write_collection_entry(db_id, &entry)
+        self.write_collection_entry(ns_id, &entry)
     }
 
     /// Check that an Index may be created and give it the Collection's next
@@ -361,12 +361,12 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// entry, whose counter has moved past the ID.
     pub(crate) fn prepare_index(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         path: &str,
         unique: bool,
     ) -> Result<(u32, CollectionEntry, IndexDef)> {
-        let (db_id, mut entry) = self.collection_entry(database, collection)?;
+        let (ns_id, mut entry) = self.collection_entry(namespace, collection)?;
         let Some(field) = entry.schema.get(path) else {
             return Err(Error::InvalidSchema(format!(
                 "declare the type of {path} in the collection schema before indexing it"
@@ -374,7 +374,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         };
         if entry.index_on(path).is_some() {
             return Err(Error::IndexExists {
-                database: database.to_owned(),
+                namespace: namespace.to_owned(),
                 collection: collection.to_owned(),
                 path: path.to_owned(),
             });
@@ -387,12 +387,13 @@ impl<E: StorageEngine> Transaction<'_, E> {
         // Skip IDs holding entries from a build that never committed: the
         // counter moves only when the Index is added (ADR 0010).
         let mut id = entry.next_index_id;
-        while mvcc::any_version_under(&self.db.engine, &keys::index_prefix(db_id, entry.id, id))? {
+        while mvcc::any_version_under(&self.node.engine, &keys::index_prefix(ns_id, entry.id, id))?
+        {
             id += 1;
         }
         entry.next_index_id = id + 1;
         Ok((
-            db_id,
+            ns_id,
             entry,
             IndexDef {
                 path: path.to_owned(),
@@ -404,24 +405,24 @@ impl<E: StorageEngine> Transaction<'_, E> {
 
     /// Drop the Index on a field. Its entries become unreachable and stay
     /// behind until garbage collection exists.
-    pub fn drop_index(&mut self, database: &str, collection: &str, path: &str) -> Result<()> {
-        let (db_id, mut entry) = self.collection_entry(database, collection)?;
+    pub fn drop_index(&mut self, namespace: &str, collection: &str, path: &str) -> Result<()> {
+        let (ns_id, mut entry) = self.collection_entry(namespace, collection)?;
         let before = entry.indexes.len();
         entry.indexes.retain(|ix| ix.path != path);
         if entry.indexes.len() == before {
             return Err(Error::NoSuchIndex {
-                database: database.to_owned(),
+                namespace: namespace.to_owned(),
                 collection: collection.to_owned(),
                 path: path.to_owned(),
             });
         }
-        self.write_collection_entry(db_id, &entry)
+        self.write_collection_entry(ns_id, &entry)
     }
 
     /// The Collection's Indexes, in the order they were created.
-    pub fn list_indexes(&mut self, database: &str, collection: &str) -> Result<Vec<IndexInfo>> {
+    pub fn list_indexes(&mut self, namespace: &str, collection: &str) -> Result<Vec<IndexInfo>> {
         Ok(self
-            .collection_entry(database, collection)?
+            .collection_entry(namespace, collection)?
             .1
             .indexes
             .into_iter()
@@ -432,11 +433,11 @@ impl<E: StorageEngine> Transaction<'_, E> {
             .collect())
     }
 
-    /// A random ID for a new Database (`database: None`) or for a new
-    /// Collection in `database`. Indexes are numbered per Collection
-    /// instead.
-    fn allocate_id(&mut self, database: Option<u32>) -> Result<u32> {
-        self.allocate_id_from(std::iter::repeat_with(random_id), database)
+    /// A random ID for a new Namespace (`namespace_id: None`) or for a new
+    /// Collection in the Namespace `namespace_id`. Indexes are numbered per
+    /// Collection instead.
+    fn allocate_id(&mut self, namespace_id: Option<u32>) -> Result<u32> {
+        self.allocate_id_from(std::iter::repeat_with(random_id), namespace_id)
     }
 
     /// The first of `candidates` whose ID key was never written, at any
@@ -445,21 +446,21 @@ impl<E: StorageEngine> Transaction<'_, E> {
     fn allocate_id_from(
         &mut self,
         candidates: impl IntoIterator<Item = u32>,
-        database: Option<u32>,
+        namespace_id: Option<u32>,
     ) -> Result<u32> {
-        let id_key = |id| match database {
-            None => keys::database_id_key(id),
-            Some(db_id) => keys::collection_id_key(db_id, id),
+        let id_key = |id| match namespace_id {
+            None => keys::namespace_id_key(id),
+            Some(ns_id) => keys::collection_id_key(ns_id, id),
         };
         let id = pick_unused(candidates, |id| {
-            mvcc::any_version_under(&self.db.engine, &id_key(id))
+            mvcc::any_version_under(&self.node.engine, &id_key(id))
         })?;
         self.write(id_key(id), Some(Vec::new()))?;
         Ok(id)
     }
 }
 
-/// The first candidate that is not 0 (the Catalog's own Database) and not
+/// The first candidate that is not 0 (the Catalog's own Namespace) and not
 /// in use.
 fn pick_unused(
     candidates: impl IntoIterator<Item = u32>,
@@ -467,7 +468,7 @@ fn pick_unused(
 ) -> Result<u32> {
     const ATTEMPTS: usize = 16;
     for id in candidates.into_iter().take(ATTEMPTS) {
-        if id != keys::SYSTEM_DATABASE && !in_use(id)? {
+        if id != keys::SYSTEM_NAMESPACE && !in_use(id)? {
             return Ok(id);
         }
     }
@@ -516,53 +517,53 @@ mod tests {
     use psdb_storage_memory::MemoryEngine;
 
     use super::*;
-    use crate::Database;
+    use crate::Node;
 
     #[test]
-    fn id_of_an_empty_database_is_in_use() {
-        let db = Database::new(MemoryEngine::new());
-        db.create_database("shop").unwrap();
-        let mut txn = db.begin();
-        let taken = txn.resolve_database("shop").unwrap();
+    fn id_of_an_empty_namespace_is_in_use() {
+        let node = Node::new(MemoryEngine::new());
+        node.create_namespace("shop").unwrap();
+        let mut txn = node.begin();
+        let taken = txn.resolve_namespace("shop").unwrap();
         assert_eq!(txn.allocate_id_from([taken, 7], None).unwrap(), 7);
     }
 
     #[test]
     fn id_of_an_empty_collection_is_in_use() {
-        let db = Database::new(MemoryEngine::new());
-        db.create_database("shop").unwrap();
-        db.create_collection("shop", "orders").unwrap();
-        let mut txn = db.begin();
-        let (db_id, taken) = txn.resolve_collection("shop", "orders").unwrap();
-        assert_eq!(txn.allocate_id_from([taken, 7], Some(db_id)).unwrap(), 7);
+        let node = Node::new(MemoryEngine::new());
+        node.create_namespace("shop").unwrap();
+        node.create_collection("shop", "orders").unwrap();
+        let mut txn = node.begin();
+        let (ns_id, taken) = txn.resolve_collection("shop", "orders").unwrap();
+        assert_eq!(txn.allocate_id_from([taken, 7], Some(ns_id)).unwrap(), 7);
     }
 
     #[test]
     fn index_ids_are_counted_per_collection_and_never_reused() {
-        let db = Database::new(MemoryEngine::new());
-        db.create_database("shop").unwrap();
-        db.create_collection("shop", "orders").unwrap();
+        let node = Node::new(MemoryEngine::new());
+        node.create_namespace("shop").unwrap();
+        node.create_collection("shop", "orders").unwrap();
         let int = FieldSchema {
             field_type: FieldType::Int,
             strict: false,
         };
-        db.set_field_type("shop", "orders", "n", int).unwrap();
+        node.set_field_type("shop", "orders", "n", int).unwrap();
         let index_ids = || {
-            let (_, entry) = db.begin().collection_entry("shop", "orders").unwrap();
+            let (_, entry) = node.begin().collection_entry("shop", "orders").unwrap();
             entry.indexes.iter().map(|ix| ix.id).collect::<Vec<_>>()
         };
-        db.create_index("shop", "orders", "n", false).unwrap();
+        node.create_index("shop", "orders", "n", false).unwrap();
         assert_eq!(index_ids(), [0]);
         // Never held an entry, so only the counter keeps 0 from coming back.
-        db.drop_index("shop", "orders", "n").unwrap();
-        db.create_index("shop", "orders", "n", false).unwrap();
+        node.drop_index("shop", "orders", "n").unwrap();
+        node.create_index("shop", "orders", "n", false).unwrap();
         assert_eq!(index_ids(), [1]);
     }
 
     #[test]
     fn concurrent_draws_of_one_id_conflict() {
-        let db = Database::new(MemoryEngine::new());
-        let (mut t1, mut t2) = (db.begin(), db.begin());
+        let node = Node::new(MemoryEngine::new());
+        let (mut t1, mut t2) = (node.begin(), node.begin());
         t1.allocate_id_from([7], None).unwrap();
         t2.allocate_id_from([7], None).unwrap();
         t1.commit().unwrap();
