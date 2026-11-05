@@ -14,7 +14,7 @@ SOLID is applied to modules and crates, and strictly only to substitutability.
 
 ## Choosing a Storage Engine
 
-The core is generic over the engine (`Node<E: StorageEngine>`), monomorphised and zero-cost. The binary chooses once, at its entry point, from configuration, via an enum or `Box<dyn StorageEngine>`.
+The Database Layer is generic over the Storage Engine (`Node<E: StorageEngine>`), monomorphised and zero-cost. The binary chooses once, at its entry point, from configuration, via an enum or `Box<dyn StorageEngine>`.
 
 ## Crates
 

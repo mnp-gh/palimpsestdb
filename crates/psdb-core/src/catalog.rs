@@ -108,10 +108,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
         Ok((ns_id, entry_id(&value)?))
     }
 
-    /// A random ID for a new Namespace (`namespace: None`) or for a new
-    /// Collection in `namespace`.
-    fn allocate_id(&mut self, namespace: Option<u32>) -> Result<u32> {
-        self.allocate_id_from(std::iter::repeat_with(random_id), namespace)
+    /// A random ID for a new Namespace (`namespace_id: None`) or for a new
+    /// Collection in the Namespace `namespace_id`.
+    fn allocate_id(&mut self, namespace_id: Option<u32>) -> Result<u32> {
+        self.allocate_id_from(std::iter::repeat_with(random_id), namespace_id)
     }
 
     /// The first of `candidates` whose ID key was never written, at any
@@ -120,9 +120,9 @@ impl<E: StorageEngine> Transaction<'_, E> {
     fn allocate_id_from(
         &mut self,
         candidates: impl IntoIterator<Item = u32>,
-        namespace: Option<u32>,
+        namespace_id: Option<u32>,
     ) -> Result<u32> {
-        let id_key = |id| match namespace {
+        let id_key = |id| match namespace_id {
             None => keys::namespace_id_key(id),
             Some(ns_id) => keys::collection_id_key(ns_id, id),
         };

@@ -69,7 +69,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## v0.7: Access
 
-- Users and built-in Roles per Namespace (`read`, `readWrite`, `dbAdmin`, Node-wide `root`)
+- Users and built-in Roles per Namespace (`read`, `readWrite`, `nsAdmin`, Node-wide `root`)
 - Roles are granted on a Namespace's ID, not its name: a Namespace must exist before access to it is granted, and dropping it removes its grants in the same Transaction, so a recreated Namespace with the same name starts with no access (unlike MongoDB). Record as an ADR when v0.7 starts
 - SCRAM-SHA-256 authentication over TLS (`rustls`)
 
