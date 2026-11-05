@@ -27,6 +27,7 @@ The Database Layer is generic over the Storage Engine (`Node<E: StorageEngine>`)
 - A README per crate stating its responsibility and its place in the dependency graph.
 - Doc examples are tests (`cargo test` runs them).
 - Domain terms in code, comments and tests use the glossary's words.
+- [ARCHITECTURE.md](../ARCHITECTURE.md) maps the code. Update it in the same change as a new crate or module, a changed flow, or a changed invariant.
 
 ## Testing
 
