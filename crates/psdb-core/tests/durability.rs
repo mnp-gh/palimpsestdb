@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::collection;
+use common::{collection, durable_shop, open};
 
 use bson::{Bson, doc};
 use psdb_core::wal::SimDisk;
@@ -10,21 +10,10 @@ use psdb_core::{Error, Limits, Node};
 use psdb_storage::{StorageEngine, WriteBatch};
 use psdb_storage_memory::MemoryEngine;
 
-fn open(disk: &SimDisk) -> Node<MemoryEngine> {
-    Node::open_with(MemoryEngine::new(), disk.file(), Limits::default()).unwrap()
-}
-
-fn shop(disk: &SimDisk) -> Node<MemoryEngine> {
-    let node = open(disk);
-    node.create_namespace("shop").unwrap();
-    node.create_collection(&collection("shop.orders")).unwrap();
-    node
-}
-
 #[test]
 fn reopen_replays_every_commit() {
     let disk = SimDisk::new();
-    let node = shop(&disk);
+    let node = durable_shop(&disk);
     node.insert(&collection("shop.orders"), doc! { "_id": 1, "v": 1 })
         .unwrap();
     node.insert(&collection("shop.orders"), doc! { "_id": 2, "v": 2 })
@@ -44,7 +33,7 @@ fn reopen_replays_every_commit() {
     drop(node);
     disk.power_loss(0);
 
-    let node = open(&disk);
+    let node = open(&disk).unwrap();
     assert_eq!(
         node.find(&collection("shop.orders"), &doc! {}).unwrap(),
         [doc! { "_id": 1, "v": 10 }]
@@ -57,7 +46,7 @@ fn reopen_replays_every_commit() {
     node.insert(&collection("shop.orders"), doc! { "_id": 3 })
         .unwrap();
     drop(node);
-    let node = open(&disk);
+    let node = open(&disk).unwrap();
     assert_eq!(
         node.find(&collection("shop.orders"), &doc! {})
             .unwrap()
@@ -68,21 +57,25 @@ fn reopen_replays_every_commit() {
 
 #[test]
 fn engine_with_data_is_refused() {
-    let engine = MemoryEngine::new();
-    let mut batch = WriteBatch::new();
-    batch.put(b"k".to_vec(), b"v".to_vec());
-    engine.write_batch(batch).unwrap();
+    let with_data = || {
+        let engine = MemoryEngine::new();
+        let mut batch = WriteBatch::new();
+        batch.put(b"k".to_vec(), b"v".to_vec());
+        engine.write_batch(batch).unwrap();
+        engine
+    };
     let disk = SimDisk::new();
     assert!(matches!(
-        Node::open_with(engine, disk.file(), Limits::default()),
+        Node::open_with(with_data(), disk.file(), Limits::default()),
         Err(Error::EngineNotEmpty)
     ));
+    assert!(matches!(Node::new(with_data()), Err(Error::EngineNotEmpty)));
 }
 
 #[test]
 fn failed_fsync_poisons_and_leaves_the_outcome_unknown() {
     let disk = SimDisk::new();
-    let node = shop(&disk);
+    let node = durable_shop(&disk);
     node.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
 
@@ -116,11 +109,11 @@ fn failed_fsync_poisons_and_leaves_the_outcome_unknown() {
             .map(|d| d.get("_id").unwrap().clone())
             .collect()
     };
-    assert_eq!(ids(&open(&disk)), [Bson::Int32(1), Bson::Int32(2)]);
+    assert_eq!(ids(&open(&disk).unwrap()), [Bson::Int32(1), Bson::Int32(2)]);
 
     // After a power loss it is gone.
     let disk = SimDisk::new();
-    let node = shop(&disk);
+    let node = durable_shop(&disk);
     node.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
     disk.fail_next_sync();
@@ -128,13 +121,13 @@ fn failed_fsync_poisons_and_leaves_the_outcome_unknown() {
         .unwrap_err();
     drop(node);
     disk.power_loss(0);
-    assert_eq!(ids(&open(&disk)), [Bson::Int32(1)]);
+    assert_eq!(ids(&open(&disk).unwrap()), [Bson::Int32(1)]);
 }
 
 #[test]
 fn failed_append_poisons() {
     let disk = SimDisk::new();
-    let node = shop(&disk);
+    let node = durable_shop(&disk);
     disk.fail_next_append();
     assert!(matches!(
         node.insert(&collection("shop.orders"), doc! { "_id": 1 }),

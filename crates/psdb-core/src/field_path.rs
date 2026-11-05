@@ -1,10 +1,7 @@
 //! Field paths: the dotted path to a field that a filter compares, the
 //! Collection Schema declares and an Index covers, such as `address.city`.
 
-use std::borrow::Borrow;
-use std::cmp::Ordering;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
 use crate::error::{Error, Result};
@@ -25,7 +22,9 @@ use crate::error::{Error, Result};
 /// assert!("address..city".parse::<FieldPath>().is_err());
 /// # Ok::<(), psdb_core::Error>(())
 /// ```
-#[derive(Debug, Clone)]
+// `segments` is derived from `path`, so the derived comparisons order by
+// the path as written.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FieldPath {
     path: String,
     segments: Vec<String>,
@@ -73,42 +72,6 @@ impl FromStr for FieldPath {
 impl fmt::Display for FieldPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.path)
-    }
-}
-
-// Equality, order and hash follow the path as written, which `Borrow<str>`
-// requires; the segments are derived from it.
-
-impl PartialEq for FieldPath {
-    fn eq(&self, other: &Self) -> bool {
-        self.path == other.path
-    }
-}
-
-impl Eq for FieldPath {}
-
-impl PartialOrd for FieldPath {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FieldPath {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.path.cmp(&other.path)
-    }
-}
-
-impl Hash for FieldPath {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.path.hash(state);
-    }
-}
-
-/// Lets a map keyed by Field paths be looked up with a `&str`.
-impl Borrow<str> for FieldPath {
-    fn borrow(&self) -> &str {
-        &self.path
     }
 }
 

@@ -46,7 +46,7 @@ Single-field secondary Indexes, typed by a Collection Schema, kept consistent wi
 
 ## Write Set cap
 
-- `Limits::max_write_set_bytes`, default 64 MB (a 16 MB Document plus Index entries on its large fields must fit), counts the bytes of every key and value in the Write Set, Index entries included. A write that would cross it fails with Transaction Too Large and is not made.
+- `Limits::max_write_set_bytes`, default 96 MB (replacing a 16 MB Document, with the old and new Index entries on its large fields, must fit; a key escapes NUL bytes, so it can be twice the field's size), counts the bytes of every key and value in the Write Set, Index entries included. A write that would cross it fails with Transaction Too Large and is not made.
 
 ## Tests
 

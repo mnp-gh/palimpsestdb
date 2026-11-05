@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::field_path::FieldPath;
+use crate::keys;
 
 /// The largest Namespace or Collection name accepted, in bytes. Fixed by the
 /// key format.
@@ -36,8 +37,9 @@ pub struct Limits {
     /// The largest Write Set a Transaction may build, counting the bytes of
     /// every key and value written, Index entries included. A write that
     /// would cross it fails with Transaction Too Large. The default leaves
-    /// room for a Document of the largest default size plus Index entries
-    /// on its large fields.
+    /// room to replace a Document of the largest default size: the
+    /// Document, plus the old and new Index entries on its large fields,
+    /// each up to twice the field's size once NUL bytes are escaped.
     pub max_write_set_bytes: usize,
 }
 
@@ -46,7 +48,7 @@ impl Default for Limits {
         Self {
             max_document_bytes: 16 * 1024 * 1024,
             max_nesting_depth: 100,
-            max_write_set_bytes: 64 * 1024 * 1024,
+            max_write_set_bytes: 96 * 1024 * 1024,
         }
     }
 }
@@ -99,20 +101,30 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 
 /// Validate `doc` against `limits` and return it with its Document ID as
 /// the first field. If `doc` has no `_id`, `id` is used, or a new UUIDv7
-/// (BSON Binary subtype 4) is generated when `id` is `None`. If both are present they must be equal.
+/// (BSON Binary subtype 4) is generated when `id` is `None`. If both are
+/// present they must be the same Document ID: an int32 and an int64 of one
+/// value are, as their keys are equal.
 pub(crate) fn prepare(
     doc: Document,
     id: Option<&Bson>,
     limits: &Limits,
 ) -> Result<(Bson, Vec<u8>)> {
     let mut doc = doc;
+    let id_key = |id: &Bson| -> Result<Vec<u8>> {
+        let mut key = Vec::new();
+        keys::encode_id(id, &mut key)?;
+        Ok(key)
+    };
     let id = match (doc.remove("_id"), id) {
-        (Some(own), Some(given)) if own != *given => {
-            return Err(Error::InvalidDocument(format!(
-                "document _id {own} does not match the _id being replaced, {given}"
-            )));
+        (Some(own), Some(given)) => {
+            if id_key(&own)? != id_key(given)? {
+                return Err(Error::InvalidDocument(format!(
+                    "document _id {own} does not match the _id being replaced, {given}"
+                )));
+            }
+            own
         }
-        (Some(own), _) => own,
+        (Some(own), None) => own,
         (None, Some(given)) => given.clone(),
         (None, None) => generate_id(),
     };
@@ -230,6 +242,14 @@ mod tests {
     fn mismatched_id_is_rejected() {
         let err = prepare(doc! { "_id": 1 }, Some(&Bson::Int32(2)), &Limits::default());
         assert!(matches!(err, Err(Error::InvalidDocument(_))));
+        // One Document ID whatever the integer's width.
+        let (id, _) = prepare(
+            doc! { "_id": 1i64 },
+            Some(&Bson::Int32(1)),
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(id, Bson::Int64(1));
     }
 
     #[test]

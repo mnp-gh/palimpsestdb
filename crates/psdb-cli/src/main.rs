@@ -104,7 +104,14 @@ fn main() {
         match execute(&node, &mut txn, line.trim()) {
             Ok(Outcome::Continue) => {}
             Ok(Outcome::Quit) => break,
-            Err(message) => eprintln!("error: {message}"),
+            Err(message) => {
+                eprintln!("error: {message}");
+                // A script must not run on after a failed step: an open
+                // Transaction would commit the rest of its writes.
+                if matches!(input, Input::Piped(_)) {
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

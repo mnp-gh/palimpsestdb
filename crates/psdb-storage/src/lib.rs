@@ -230,7 +230,8 @@ pub trait StorageEngine: Send + Sync {
 
     /// Visit every key in `range` in ascending order, calling `visit` with
     /// each key and value. Return [`ControlFlow::Break`] from `visit` to stop
-    /// early.
+    /// early. An empty range (`end <= start`), such as one from
+    /// [`KeyRange::intersect`], visits nothing.
     ///
     /// `visit` must not call back into the engine.
     fn scan(&self, range: &KeyRange, visit: &mut ScanVisitor<'_>) -> Result<()>;

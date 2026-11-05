@@ -49,7 +49,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - `_id` filters read a range of the Collection itself, which is sorted by `_id`, instead of scanning it: an `_id` equality beats any other, and `_id` comparisons take part in `$or` unions like Index ones
 - Exact comparison between integers and doubles in filters (today large integers lose precision when converted to double)
 - Evaluate filters on raw BSON (`RawDocument`) instead of decoding whole Documents
-- Configurable Write Set cap (default 64 MB: room for a Document of the largest default size, 16 MB, plus Index entries on its large fields)
+- Configurable Write Set cap (default 96 MB: room to replace a Document of the largest default size, 16 MB, with old and new Index entries on its large fields)
 
 ## v0.4: Concurrency
 

@@ -209,7 +209,9 @@ fn compare_at(found: Option<&Bson>, op: CompareOp, target: &Bson) -> bool {
 /// Order two values of the same comparable type. Numbers compare across
 /// int32, int64 and double, exactly: an integer is never rounded to a
 /// double. NaN equals nothing, itself included. Documents, arrays and
-/// binary only compare for equality. Values of different types are
+/// binary only compare for equality: documents with the same keys in the
+/// same order and equal values, arrays with equal elements, each compared
+/// by these rules (as in MongoDB). Values of different types are
 /// incomparable, so range operators never match across types.
 fn compare(a: &Bson, b: &Bson) -> Option<Ordering> {
     use Bson::*;
@@ -223,9 +225,21 @@ fn compare(a: &Bson, b: &Bson) -> Option<Ordering> {
         (DateTime(x), DateTime(y)) => Some(x.cmp(y)),
         (ObjectId(x), ObjectId(y)) => Some(x.bytes().cmp(&y.bytes())),
         (Null, Null) => Some(Ordering::Equal),
+        (Document(x), Document(y)) => (x.len() == y.len()
+            && x.iter()
+                .zip(y)
+                .all(|((kx, vx), (ky, vy))| kx == ky && equal(vx, vy)))
+        .then_some(Ordering::Equal),
+        (Array(x), Array(y)) => (x.len() == y.len()
+            && x.iter().zip(y).all(|(vx, vy)| equal(vx, vy)))
+        .then_some(Ordering::Equal),
         _ if a == b => Some(Ordering::Equal),
         _ => None,
     }
+}
+
+fn equal(a: &Bson, b: &Bson) -> bool {
+    compare(a, b) == Some(Ordering::Equal)
 }
 
 fn as_i64(v: &Bson) -> Option<i64> {
@@ -280,6 +294,26 @@ mod tests {
         );
         assert!(!matches(doc! { "a": 1 }, doc! { "a": "1" }));
         assert!(
+            matches(doc! { "a": { "b": 1 } }, doc! { "a": { "b": 1i64 } }),
+            "numbers compare across types inside documents"
+        );
+        assert!(
+            matches(doc! { "a": [1, [2]] }, doc! { "a": [1.0, [2i64]] }),
+            "and inside arrays"
+        );
+        assert!(
+            !matches(
+                doc! { "a": { "b": 1, "c": 2 } },
+                doc! { "a": { "c": 2, "b": 1 } }
+            ),
+            "key order matters"
+        );
+        assert!(!matches(doc! { "a": [1] }, doc! { "a": [1, 2] }));
+        assert!(!matches(
+            doc! { "a": { "b": 1 } },
+            doc! { "a": { "b": 1, "c": 2 } }
+        ));
+        assert!(
             matches(doc! { "a": null }, doc! { "b": 1 }),
             "missing equals null"
         );
@@ -315,6 +349,12 @@ mod tests {
             doc! { "a": { "$gt": f64::NEG_INFINITY } },
             doc! { "a": i64::MIN }
         ));
+        // The edges of the i64 range, where casting the double would saturate.
+        assert!(matches(
+            doc! { "a": { "$lt": TWO_63 } },
+            doc! { "a": i64::MAX }
+        ));
+        assert!(matches(doc! { "a": -TWO_63 }, doc! { "a": i64::MIN }));
         assert!(
             !matches(doc! { "a": f64::NAN }, doc! { "a": f64::NAN }),
             "NaN equals nothing"
