@@ -48,9 +48,6 @@ pub(crate) struct CollectionEntry {
     pub(crate) indexes: Vec<IndexDef>,
     /// The lowest Index ID never given out in this Collection.
     next_index_id: u32,
-    /// Each declared path split into segments once, rather than on every
-    /// write.
-    segments: BTreeMap<String, Vec<String>>,
 }
 
 impl CollectionEntry {
@@ -92,11 +89,11 @@ impl CollectionEntry {
                     unique: ix.get_bool("unique").map_err(|_| corrupt("index unique"))?,
                 })
             })
-            .collect::<Result<_>>()?;
-        let segments = schema
-            .keys()
-            .map(|path| (path.clone(), schema::segments(path)))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
+        // Writes look up each indexed field's type in the schema.
+        if indexes.iter().any(|ix| !schema.contains_key(&ix.path)) {
+            return Err(corrupt("index on an undeclared field"));
+        }
         Ok(Self {
             name: doc.get_str("name").map_err(|_| corrupt("name"))?.to_owned(),
             id: read_u32(&doc, "id")?,
@@ -106,22 +103,13 @@ impl CollectionEntry {
                 None => 0,
                 Some(_) => read_u32(&doc, "nextIndexId")?,
             },
-            segments,
         })
-    }
-
-    /// The segments of a path declared in the schema.
-    pub(crate) fn segments(&self, path: &str) -> Result<&[String]> {
-        self.segments
-            .get(path)
-            .map(Vec::as_slice)
-            .ok_or_else(|| Error::Corruption(format!("index on undeclared field {path}")))
     }
 
     /// Fail with [`Error::TypeMismatch`] if `doc` breaks any Strict Field.
     pub(crate) fn check_strict(&self, doc: &bson::RawDocument) -> Result<()> {
         for (path, field) in self.schema.iter().filter(|(_, f)| f.strict) {
-            schema::check_field(doc, path, self.segments(path)?, *field)?;
+            schema::check_field(doc, path, &schema::segments(path), *field)?;
         }
         Ok(())
     }

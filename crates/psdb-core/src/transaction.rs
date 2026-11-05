@@ -16,6 +16,7 @@ use crate::filter::Filter;
 use crate::index::{self, Source};
 use crate::keys;
 use crate::mvcc;
+use crate::schema;
 
 /// One entry of a Write Set: a logical key and its new value (`None`
 /// deletes).
@@ -228,10 +229,10 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         let doc_id = &key[keys::collection_prefix(db_id, entry.id).len()..];
         let mut writes = Vec::new();
         for ix in &entry.indexes {
-            let segments = entry.segments(&ix.path)?;
+            let segments = schema::segments(&ix.path);
             let ty = entry.schema[&ix.path].field_type;
             let component = |doc: Option<&bson::RawDocument>| match doc {
-                Some(doc) => index::component_of(doc, segments, ty),
+                Some(doc) => index::component_of(doc, &segments, ty),
                 None => Ok(None),
             };
             let (before, after) = (component(old)?, component(new_doc)?);
