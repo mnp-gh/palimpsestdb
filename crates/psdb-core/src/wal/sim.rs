@@ -13,7 +13,7 @@ use super::WalFile;
 /// them later.
 ///
 /// `SimDisk` is a cheap handle: clones share one disk. Hand
-/// [`file`](Self::file) to [`Database::open_with`](crate::Database::open_with),
+/// [`file`](Self::file) to [`Node::open_with`](crate::Node::open_with),
 /// crash it, then open a new `file` to recover. After a power loss, files
 /// handed out earlier fail every call, like a process that died with the
 /// machine.

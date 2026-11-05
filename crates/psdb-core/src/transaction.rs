@@ -6,12 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use bson::{Bson, Document};
 use psdb_storage::StorageEngine;
 
-use crate::database::Database;
 use crate::document;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
 use crate::keys;
 use crate::mvcc;
+use crate::node::Node;
 use crate::wal;
 
 /// One entry of a Write Set: a logical key and its new value (`None`
@@ -26,13 +26,13 @@ pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
     write_set.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
 }
 
-/// A Transaction: reads see the Snapshot taken at [`Database::begin`] plus
+/// A Transaction: reads see the Snapshot taken at [`Node::begin`] plus
 /// this Transaction's own writes; writes stay in its Write Set until
 /// [`commit`](Self::commit).
 ///
 /// Dropping a Transaction without committing aborts it.
-pub struct Transaction<'db, E: StorageEngine> {
-    pub(crate) db: &'db Database<E>,
+pub struct Transaction<'node, E: StorageEngine> {
+    pub(crate) node: &'node Node<E>,
     pub(crate) snapshot_ts: u64,
     /// Logical key → new value (`None` deletes). Ordered so scans can
     /// overlay it on the Snapshot.
@@ -42,10 +42,10 @@ pub struct Transaction<'db, E: StorageEngine> {
     pub(crate) catalog_reads: BTreeSet<Vec<u8>>,
 }
 
-impl<'db, E: StorageEngine> Transaction<'db, E> {
-    pub(crate) fn new(db: &'db Database<E>, snapshot_ts: u64) -> Self {
+impl<'node, E: StorageEngine> Transaction<'node, E> {
+    pub(crate) fn new(node: &'node Node<E>, snapshot_ts: u64) -> Self {
         Self {
-            db,
+            node,
             snapshot_ts,
             write_set: WriteSet::new(),
             catalog_reads: BTreeSet::new(),
@@ -61,7 +61,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     pub(crate) fn read(&self, logical: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.write_set.get(logical) {
             Some(own) => Ok(own.clone()),
-            None => mvcc::read_at(&self.db.engine, logical, self.snapshot_ts),
+            None => mvcc::read_at(&self.node.engine, logical, self.snapshot_ts),
         }
     }
 
@@ -74,7 +74,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     pub(crate) fn scan(&self, prefix: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
         let mut rows = BTreeMap::new();
         mvcc::scan_at(
-            &self.db.engine,
+            &self.node.engine,
             prefix,
             self.snapshot_ts,
             &mut |key, value| {
@@ -96,10 +96,10 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
 
     /// Insert a Document. If it has no `_id`, a UUIDv7 is generated.
     /// Returns the Document ID.
-    pub fn insert(&mut self, database: &str, collection: &str, doc: Document) -> Result<Bson> {
-        let (db_id, coll_id) = self.resolve_collection(database, collection)?;
-        let (id, bytes) = document::prepare(doc, None, &self.db.limits)?;
-        let key = keys::document_key(db_id, coll_id, &id)?;
+    pub fn insert(&mut self, namespace: &str, collection: &str, doc: Document) -> Result<Bson> {
+        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
+        let (id, bytes) = document::prepare(doc, None, &self.node.limits)?;
+        let key = keys::document_key(ns_id, coll_id, &id)?;
         if self.read(&key)?.is_some() {
             return Err(Error::DuplicateId(id.to_string()));
         }
@@ -108,9 +108,14 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     }
 
     /// The Document with this Document ID, if it exists.
-    pub fn get(&mut self, database: &str, collection: &str, id: &Bson) -> Result<Option<Document>> {
-        let (db_id, coll_id) = self.resolve_collection(database, collection)?;
-        let key = keys::document_key(db_id, coll_id, id)?;
+    pub fn get(
+        &mut self,
+        namespace: &str,
+        collection: &str,
+        id: &Bson,
+    ) -> Result<Option<Document>> {
+        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
+        let key = keys::document_key(ns_id, coll_id, id)?;
         self.read(&key)?
             .map(|bytes| document::decode(&bytes))
             .transpose()
@@ -121,26 +126,26 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     /// Document exists (nothing is written).
     pub fn replace(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         id: &Bson,
         doc: Document,
     ) -> Result<bool> {
-        let (db_id, coll_id) = self.resolve_collection(database, collection)?;
-        let key = keys::document_key(db_id, coll_id, id)?;
+        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
+        let key = keys::document_key(ns_id, coll_id, id)?;
         if self.read(&key)?.is_none() {
             return Ok(false);
         }
-        let (_, bytes) = document::prepare(doc, Some(id), &self.db.limits)?;
+        let (_, bytes) = document::prepare(doc, Some(id), &self.node.limits)?;
         self.write(key, Some(bytes));
         Ok(true)
     }
 
     /// Delete the Document with this Document ID. Returns `false` if no such
     /// Document exists.
-    pub fn delete(&mut self, database: &str, collection: &str, id: &Bson) -> Result<bool> {
-        let (db_id, coll_id) = self.resolve_collection(database, collection)?;
-        let key = keys::document_key(db_id, coll_id, id)?;
+    pub fn delete(&mut self, namespace: &str, collection: &str, id: &Bson) -> Result<bool> {
+        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
+        let key = keys::document_key(ns_id, coll_id, id)?;
         if self.read(&key)?.is_none() {
             return Ok(false);
         }
@@ -152,15 +157,15 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     /// ID order. Scans the whole Collection.
     pub fn find(
         &mut self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         filter: &Document,
     ) -> Result<Vec<Document>> {
         let filter = Filter::parse(filter)?;
-        let (db_id, coll_id) = self.resolve_collection(database, collection)?;
+        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
         let mut out = Vec::new();
         for bytes in self
-            .scan(&keys::collection_prefix(db_id, coll_id))?
+            .scan(&keys::collection_prefix(ns_id, coll_id))?
             .values()
         {
             let doc = document::decode(bytes)?;
@@ -178,15 +183,15 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
     /// committed a write to any key this one wrote, or with
     /// [`Error::CollectionChanged`] if a Catalog entry this one used changed
     /// since its Snapshot. Both are retryable. A Transaction that wrote
-    /// nothing always commits, unless the Database is poisoned.
+    /// nothing always commits, unless the Node is poisoned.
     ///
-    /// In a durable Database, fails with [`Error::TransactionTooLarge`] if
+    /// In a durable Node, fails with [`Error::TransactionTooLarge`] if
     /// its WAL Record would exceed 4 GiB, before anything is written. Fails
     /// with [`Error::CommitOutcomeUnknown`] if the WAL or the engine fails
-    /// partway, which poisons the Database: every later commit, read-only
+    /// partway, which poisons the Node: every later commit, read-only
     /// or not, fails with [`Error::Poisoned`].
     pub fn commit(self) -> Result<u64> {
-        let mut commits = self.db.commits.lock().expect("lock poisoned");
+        let mut commits = self.node.commits.lock().expect("lock poisoned");
         if commits.poisoned {
             return Err(Error::Poisoned);
         }
@@ -196,7 +201,7 @@ impl<'db, E: StorageEngine> Transaction<'db, E> {
         if self.write_set.is_empty() {
             return Ok(self.snapshot_ts);
         }
-        let engine = &self.db.engine;
+        let engine = &self.node.engine;
         let changed_since_snapshot = |key: &[u8]| -> Result<bool> {
             Ok(mvcc::latest_commit_ts(engine, key)?.is_some_and(|ts| ts > self.snapshot_ts))
         };

@@ -2,7 +2,7 @@
 
 Status: ready-for-human (implemented on `v0.2-durability`)
 
-The in-memory Storage Engine plus a WAL owned by the Document Layer is a durable database: every commit acknowledged as COMMITTED survives a crash. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0004](../../docs/adr/0004-document-layer-owns-wal.md).
+The in-memory Storage Engine plus a WAL owned by the Database Layer is a durable database: every commit acknowledged as COMMITTED survives a crash. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0004](../../docs/adr/0004-database-layer-owns-wal.md).
 
 ## Out of scope
 
@@ -32,14 +32,14 @@ The `applied_up_to` marker is written from v0.2, although nothing reads it back 
 
 ## Failure handling
 
-- A failed WAL write or fsync, or a failed engine apply after the record is Durable, poisons the `Database`: every later commit, including a read-only one, returns `Poisoned` until it is reopened. `begin` and reads inside a Transaction still work; only commits are refused. Never retry fsync: after a failure the kernel may already have dropped the dirty pages and would report success for data that never reached disk ("fsyncgate").
+- A failed WAL write or fsync, or a failed engine apply after the record is Durable, poisons the `Node`: every later commit, including a read-only one, returns `Poisoned` until it is reopened. `begin` and reads inside a Transaction still work; only commits are refused. Never retry fsync: after a failure the kernel may already have dropped the dirty pages and would report success for data that never reached disk ("fsyncgate").
 - A Transaction whose WAL Record would exceed 4 GiB fails with `TransactionTooLarge` before anything is written, and does not poison.
 - The CLI exits with a non-zero status on Commit Outcome Unknown or `Poisoned`, so a script piped into it stops.
 - The failing commit returns a new error, Commit Outcome Unknown. It is neither an Abort nor retryable, because the Transaction may or may not be present after a restart.
 
 ## Opening and recovery
 
-- `Database::open(engine, dir)` opens or creates the WAL (creating `dir` if needed, and syncing its parent on every open) and replays it into `engine`. `Database::open_with(engine, wal_file, limits)` does the same over any `WalFile`. `Database::new(engine)` stays as it is and means "no WAL".
+- `Node::open(engine, dir)` opens or creates the WAL (creating `dir` if needed, and syncing its parent on every open) and replays it into `engine`. `Node::open_with(engine, wal_file, limits)` does the same over any `WalFile`. `Node::new(engine)` stays as it is and means "no WAL".
 - `open` returns `EngineNotEmpty` if the engine holds any key at all, such as an `applied_up_to` marker.
 - Replay applies each record's Write Set straight to the engine, without conflict checks. It then sets the newest Commit Timestamp to the last replayed one, so new Snapshots see every recovered commit.
 - A record whose Commit Timestamp does not strictly increase over the previous one is corruption.
