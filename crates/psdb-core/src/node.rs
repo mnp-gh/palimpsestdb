@@ -12,7 +12,7 @@ use crate::mvcc;
 use crate::transaction::{self, Transaction};
 use crate::wal::{OsWalFile, Wal, WalFile};
 
-/// An embedded PalimpsestDB instance over the Storage Engine `E`.
+/// An embedded PalimpsestDB Node over the Storage Engine `E`.
 ///
 /// Every Namespace and Collection lives in the one engine
 /// (ADR 0005). [`open`](Self::open) makes it durable with a WAL (ADR 0004);
@@ -163,7 +163,7 @@ impl<E: StorageEngine> Node<E> {
 
     /// Autocommit [`Transaction::drop_collection`].
     pub fn drop_collection(&self, namespace: &str, name: &str) -> Result<()> {
-        self.run(|t: &mut Transaction<'_, E>| t.drop_collection(namespace, name))
+        self.run(|t| t.drop_collection(namespace, name))
     }
 
     /// Autocommit [`Transaction::list_collections`].

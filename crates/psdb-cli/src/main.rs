@@ -196,36 +196,34 @@ fn execute<'node>(
         "drop-ns" => with_txn(node, txn, |t| t.drop_namespace(rest))?,
         "colls" => print_names(&with_txn(node, txn, |t| t.list_collections(rest))?),
         "create-coll" => {
-            let (d, c) = collection_path(rest)?;
-            with_txn(node, txn, |t| t.create_collection(d, c))?;
+            let (ns, coll) = collection_path(rest)?;
+            with_txn(node, txn, |t| t.create_collection(ns, coll))?;
         }
         "drop-coll" => {
-            let (d, c) = collection_path(rest)?;
-            with_txn(node, txn, |t: &mut Transaction<'_, MemoryEngine>| {
-                t.drop_collection(d, c)
-            })?;
+            let (ns, coll) = collection_path(rest)?;
+            with_txn(node, txn, |t| t.drop_collection(ns, coll))?;
         }
 
         "insert" => {
-            let (coll, args) = split_collection_path(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let [doc] = values::<1>(args)?;
             let doc = as_document(doc)?;
-            let id = with_txn(node, txn, |t| t.insert(coll.0, coll.1, doc))?;
+            let id = with_txn(node, txn, |t| t.insert(ns, coll, doc))?;
             println!("{}", to_json(id));
         }
         "get" => {
-            let (coll, args) = split_collection_path(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let [id] = values::<1>(args)?;
-            match with_txn(node, txn, |t| t.get(coll.0, coll.1, &id))? {
+            match with_txn(node, txn, |t| t.get(ns, coll, &id))? {
                 Some(doc) => println!("{}", to_json(Bson::Document(doc))),
                 None => not_found(&id),
             }
         }
         "replace" => {
-            let (coll, args) = split_collection_path(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let [id, doc] = values::<2>(args)?;
             let doc = as_document(doc)?;
-            let replaced = with_txn(node, txn, |t| t.replace(coll.0, coll.1, &id, doc))?;
+            let replaced = with_txn(node, txn, |t| t.replace(ns, coll, &id, doc))?;
             if replaced {
                 println!("replaced");
             } else {
@@ -233,9 +231,9 @@ fn execute<'node>(
             }
         }
         "delete" => {
-            let (coll, args) = split_collection_path(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let [id] = values::<1>(args)?;
-            let deleted = with_txn(node, txn, |t| t.delete(coll.0, coll.1, &id))?;
+            let deleted = with_txn(node, txn, |t| t.delete(ns, coll, &id))?;
             if deleted {
                 println!("deleted");
             } else {
@@ -243,13 +241,13 @@ fn execute<'node>(
             }
         }
         "find" => {
-            let (coll, args) = split_collection_path(rest)?;
+            let ((ns, coll), args) = split_collection_path(rest)?;
             let filter = if args.is_empty() {
                 Document::new()
             } else {
                 as_document(values::<1>(args)?[0].clone())?
             };
-            let docs = with_txn(node, txn, |t| t.find(coll.0, coll.1, &filter))?;
+            let docs = with_txn(node, txn, |t| t.find(ns, coll, &filter))?;
             for doc in &docs {
                 println!("{}", to_json(Bson::Document(doc.clone())));
             }
@@ -266,7 +264,7 @@ fn execute<'node>(
 fn with_txn<'node, T>(
     node: &'node MemNode,
     txn: &mut Option<Txn<'node>>,
-    work: impl FnOnce(&mut Transaction<'_, MemoryEngine>) -> psdb_core::Result<T>,
+    work: impl FnOnce(&mut Txn<'_>) -> psdb_core::Result<T>,
 ) -> Result<T, String> {
     match txn {
         Some(open) => work(open),
@@ -290,10 +288,10 @@ fn collection_path(text: &str) -> Result<(&str, &str), String> {
         .ok_or_else(|| format!("expected <ns>.<coll>, got {text:?}"))
 }
 
-/// Split `<ns>.<coll> rest...` into the namespace and the rest.
+/// Split `<ns>.<coll> rest...` into the Collection path and the rest.
 fn split_collection_path(text: &str) -> Result<((&str, &str), &str), String> {
-    let (coll, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-    Ok((collection_path(coll)?, rest.trim()))
+    let (path, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    Ok((collection_path(path)?, rest.trim()))
 }
 
 /// Parse exactly `N` whitespace-separated Extended JSON values.
