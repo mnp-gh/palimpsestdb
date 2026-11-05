@@ -1,4 +1,4 @@
-//! The entry point: a [`Database`] over one Storage Engine.
+//! The entry point: a [`Node`] over one Storage Engine.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -14,23 +14,23 @@ use crate::wal::{OsWalFile, Wal, WalFile};
 
 /// An embedded PalimpsestDB instance over the Storage Engine `E`.
 ///
-/// Every Database (namespace) and Collection lives in the one engine
+/// Every Namespace and Collection lives in the one engine
 /// (ADR 0005). [`open`](Self::open) makes it durable with a WAL (ADR 0004);
 /// [`new`](Self::new) keeps nothing durable.
 ///
 /// ```
 /// use bson::doc;
-/// use psdb_core::Database;
+/// use psdb_core::Node;
 /// use psdb_storage_memory::MemoryEngine;
 ///
-/// let db = Database::new(MemoryEngine::new());
-/// db.create_database("shop")?;
-/// db.create_collection("shop", "orders")?;
-/// let id = db.insert("shop", "orders", doc! { "item": "book" })?;
-/// assert_eq!(db.get("shop", "orders", &id)?.unwrap().get_str("item")?, "book");
+/// let node = Node::new(MemoryEngine::new());
+/// node.create_namespace("shop")?;
+/// node.create_collection("shop", "orders")?;
+/// let id = node.insert("shop", "orders", doc! { "item": "book" })?;
+/// assert_eq!(node.get("shop", "orders", &id)?.unwrap().get_str("item")?, "book");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub struct Database<E: StorageEngine> {
+pub struct Node<E: StorageEngine> {
     pub(crate) engine: E,
     pub(crate) limits: Limits,
     /// Holding the lock serialises commits, which keeps them logged and
@@ -48,7 +48,7 @@ pub(crate) struct CommitState {
     pub(crate) poisoned: bool,
 }
 
-impl<E: StorageEngine> Database<E> {
+impl<E: StorageEngine> Node<E> {
     /// Open over an empty engine with default [`Limits`], keeping nothing
     /// durable.
     pub fn new(engine: E) -> Self {
@@ -61,23 +61,23 @@ impl<E: StorageEngine> Database<E> {
         Self::from_parts(engine, limits, 0, None)
     }
 
-    /// Open a durable Database whose WAL lives in `dir`, creating `dir` and
+    /// Open a durable Node whose WAL lives in `dir`, creating `dir` and
     /// the WAL if needed, and replay the WAL into `engine`, which must be
     /// empty.
     ///
     /// ```
     /// use bson::doc;
-    /// use psdb_core::Database;
+    /// use psdb_core::Node;
     /// use psdb_storage_memory::MemoryEngine;
     ///
     /// # let dir = std::env::temp_dir().join(format!("psdb-doc-{}", std::process::id()));
     /// # let _ = std::fs::remove_dir_all(&dir);
-    /// let db = Database::open(MemoryEngine::new(), &dir)?;
-    /// db.create_database("shop")?;
-    /// drop(db);
+    /// let node = Node::open(MemoryEngine::new(), &dir)?;
+    /// node.create_namespace("shop")?;
+    /// drop(node);
     ///
-    /// let db = Database::open(MemoryEngine::new(), &dir)?;
-    /// assert_eq!(db.list_databases()?, ["shop"]);
+    /// let node = Node::open(MemoryEngine::new(), &dir)?;
+    /// assert_eq!(node.list_namespaces()?, ["shop"]);
     /// # std::fs::remove_dir_all(&dir)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -85,7 +85,7 @@ impl<E: StorageEngine> Database<E> {
         Self::open_with(engine, OsWalFile::open(dir)?, Limits::default())
     }
 
-    /// Open a durable Database over any [`WalFile`], such as a
+    /// Open a durable Node over any [`WalFile`], such as a
     /// [`SimDisk`](crate::wal::SimDisk) file in tests, and replay it into
     /// `engine`, which must be empty.
     ///
@@ -141,69 +141,69 @@ impl<E: StorageEngine> Database<E> {
         Ok(out)
     }
 
-    /// Autocommit [`Transaction::create_database`].
-    pub fn create_database(&self, name: &str) -> Result<()> {
-        self.run(|t| t.create_database(name))
+    /// Autocommit [`Transaction::create_namespace`].
+    pub fn create_namespace(&self, name: &str) -> Result<()> {
+        self.run(|t| t.create_namespace(name))
     }
 
-    /// Autocommit [`Transaction::drop_database`].
-    pub fn drop_database(&self, name: &str) -> Result<()> {
-        self.run(|t| t.drop_database(name))
+    /// Autocommit [`Transaction::drop_namespace`].
+    pub fn drop_namespace(&self, name: &str) -> Result<()> {
+        self.run(|t| t.drop_namespace(name))
     }
 
-    /// Autocommit [`Transaction::list_databases`].
-    pub fn list_databases(&self) -> Result<Vec<String>> {
-        self.run(|t| t.list_databases())
+    /// Autocommit [`Transaction::list_namespaces`].
+    pub fn list_namespaces(&self) -> Result<Vec<String>> {
+        self.run(|t| t.list_namespaces())
     }
 
     /// Autocommit [`Transaction::create_collection`].
-    pub fn create_collection(&self, database: &str, name: &str) -> Result<()> {
-        self.run(|t| t.create_collection(database, name))
+    pub fn create_collection(&self, namespace: &str, name: &str) -> Result<()> {
+        self.run(|t| t.create_collection(namespace, name))
     }
 
     /// Autocommit [`Transaction::drop_collection`].
-    pub fn drop_collection(&self, database: &str, name: &str) -> Result<()> {
-        self.run(|t: &mut Transaction<'_, E>| t.drop_collection(database, name))
+    pub fn drop_collection(&self, namespace: &str, name: &str) -> Result<()> {
+        self.run(|t: &mut Transaction<'_, E>| t.drop_collection(namespace, name))
     }
 
     /// Autocommit [`Transaction::list_collections`].
-    pub fn list_collections(&self, database: &str) -> Result<Vec<String>> {
-        self.run(|t| t.list_collections(database))
+    pub fn list_collections(&self, namespace: &str) -> Result<Vec<String>> {
+        self.run(|t| t.list_collections(namespace))
     }
 
     /// Autocommit [`Transaction::insert`].
-    pub fn insert(&self, database: &str, collection: &str, doc: Document) -> Result<Bson> {
-        self.run(|t| t.insert(database, collection, doc))
+    pub fn insert(&self, namespace: &str, collection: &str, doc: Document) -> Result<Bson> {
+        self.run(|t| t.insert(namespace, collection, doc))
     }
 
     /// Autocommit [`Transaction::get`].
-    pub fn get(&self, database: &str, collection: &str, id: &Bson) -> Result<Option<Document>> {
-        self.run(|t| t.get(database, collection, id))
+    pub fn get(&self, namespace: &str, collection: &str, id: &Bson) -> Result<Option<Document>> {
+        self.run(|t| t.get(namespace, collection, id))
     }
 
     /// Autocommit [`Transaction::replace`].
     pub fn replace(
         &self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         id: &Bson,
         doc: Document,
     ) -> Result<bool> {
-        self.run(|t| t.replace(database, collection, id, doc))
+        self.run(|t| t.replace(namespace, collection, id, doc))
     }
 
     /// Autocommit [`Transaction::delete`].
-    pub fn delete(&self, database: &str, collection: &str, id: &Bson) -> Result<bool> {
-        self.run(|t| t.delete(database, collection, id))
+    pub fn delete(&self, namespace: &str, collection: &str, id: &Bson) -> Result<bool> {
+        self.run(|t| t.delete(namespace, collection, id))
     }
 
     /// Autocommit [`Transaction::find`].
     pub fn find(
         &self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         filter: &Document,
     ) -> Result<Vec<Document>> {
-        self.run(|t| t.find(database, collection, filter))
+        self.run(|t| t.find(namespace, collection, filter))
     }
 }

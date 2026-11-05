@@ -20,7 +20,7 @@
 //!
 //! The seam is a `Box<dyn WalFile>` rather than a generic parameter, an
 //! exception to the generics-at-seams rule in `docs/CONVENTIONS.md`: a
-//! generic would spread a second type parameter through `Database` and
+//! generic would spread a second type parameter through `Node` and
 //! `Transaction` for a virtual call that costs nothing next to an fsync.
 //! [`SimDisk`] is public, like `psdb_storage::conformance`, because the
 //! crash tests in `tests/` can only use public items.
