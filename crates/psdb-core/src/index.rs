@@ -7,7 +7,7 @@
 //! double under its floor and a `double` Index files an integer as the
 //! nearest double, because filters compare integers and doubles as numbers.
 //!
-//! An Index entry's logical key is `database_id ‖ collection_id ‖ 0x00 ‖
+//! An Index entry's logical key is `namespace_id ‖ collection_id ‖ 0x00 ‖
 //! index_id ‖ component ‖ document_id`, inside its Collection's range but
 //! below every Document, where the component encodes the Document's value in the
 //! indexed field (see [`crate::keys`]). A unique Index leaves the Document
@@ -88,13 +88,13 @@ pub(crate) fn component_of(
 /// The logical key of the entry for the Document with encoded ID `doc_id`
 /// under `component`.
 pub(crate) fn entry_key(
-    database_id: u32,
+    namespace_id: u32,
     collection_id: u32,
     index: &IndexDef,
     component: &[u8],
     doc_id: &[u8],
 ) -> Vec<u8> {
-    let mut key = keys::index_prefix(database_id, collection_id, index.id);
+    let mut key = keys::index_prefix(namespace_id, collection_id, index.id);
     key.extend_from_slice(component);
     if !index.unique || keys::is_null(component) {
         key.extend_from_slice(doc_id);
@@ -128,7 +128,7 @@ pub(crate) enum Source {
 /// cannot: that branch's Documents would be missed.
 pub(crate) fn plan(
     filter: &Filter,
-    database_id: u32,
+    namespace_id: u32,
     collection_id: u32,
     schema: &Schema,
     indexes: &[IndexDef],
@@ -140,12 +140,12 @@ pub(crate) fn plan(
         .into_iter()
         .filter_map(|(path, op, value)| {
             let source = if path == "_id" {
-                let base = keys::collection_prefix(database_id, collection_id);
+                let base = keys::collection_prefix(namespace_id, collection_id);
                 Source::Documents(bounds(base, id_type(value)?, op, value)?)
             } else {
                 let index = indexes.iter().find(|i| i.path == path)?;
                 let ty = schema.get(&index.path)?.field_type;
-                let base = keys::index_prefix(database_id, collection_id, index.id);
+                let base = keys::index_prefix(namespace_id, collection_id, index.id);
                 Source::Index(bounds(base, ty, op, value)?)
             };
             Some((path, op == CompareOp::Eq, source))
@@ -158,7 +158,7 @@ pub(crate) fn plan(
     if equality.is_none() {
         let union = ors.iter().find_map(|branches| {
             branches.iter().try_fold(Vec::new(), |mut sources, branch| {
-                sources.extend(plan(branch, database_id, collection_id, schema, indexes)?);
+                sources.extend(plan(branch, namespace_id, collection_id, schema, indexes)?);
                 Some(sources)
             })
         });

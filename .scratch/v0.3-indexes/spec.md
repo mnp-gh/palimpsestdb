@@ -25,14 +25,14 @@ Single-field secondary Indexes, typed by a Collection Schema, kept consistent wi
 
 - At most one per field path, listed in the Catalog entry as `indexes: [{ path, id, unique }]`. The ID is counted per Collection (`nextIndexId` in its Catalog entry) and never reused; taking one also skips IDs that hold data from a failed build.
 - Creating one needs the field's type declared; a unique one needs a Strict Field.
-- Entries are versioned like Documents: `database_id ‖ collection_id ‖ 0x00 ‖ index_id ‖ component ‖ document ID`, inside the Collection's range and below its Documents, value the encoded Document ID. A unique Index drops the Document ID from the key unless the value is null or missing, so concurrent duplicates write the same key and the second commit gets a Write Conflict.
+- Entries are versioned like Documents: `namespace_id ‖ collection_id ‖ 0x00 ‖ index_id ‖ component ‖ document ID`, inside the Collection's range and below its Documents, value the encoded Document ID. A unique Index drops the Document ID from the key unless the value is null or missing, so concurrent duplicates write the same key and the second commit gets a Write Conflict.
 - Components: null and missing share one, below every type. `int` files doubles under their floor (saturating); `double` files integers as the nearest double. Values of other types, and NaN, are left out.
 - Every write recomputes each Index's component for the old and new Version. An unchanged component writes nothing. A changed one writes a tombstone for the old entry and the new entry. A unique Index fails the write with Duplicate Value if another Document owns the new key. Nothing is written if any check fails.
 - Dropping an Index removes it from the Catalog entry; its entries stay behind.
 
 ## Building
 
-- `Database::create_index` holds the commit lock, reads the Collection at its Snapshot in chunks of at most 1024 Documents or 16 MiB of Documents, whichever comes first, and commits each chunk's entries as an ordinary fsynced commit. A final commit adds the Index to the Catalog entry. A duplicate in a unique build fails with Duplicate Value; committed chunks stay as orphans.
+- `Node::create_index` holds the commit lock, reads the Collection at its Snapshot in chunks of at most 1024 Documents or 16 MiB of Documents, whichever comes first, and commits each chunk's entries as an ordinary fsynced commit. A final commit adds the Index to the Catalog entry. A duplicate in a unique build fails with Duplicate Value; committed chunks stay as orphans.
 - `Transaction::create_index` works only on a Collection that is empty in the Transaction's view, as an ordinary Catalog write; otherwise it fails with Collection Not Empty, checked before anything is written so a refusal writes nothing. A Document committed concurrently makes it abort with Collection Changed.
 
 ## Queries

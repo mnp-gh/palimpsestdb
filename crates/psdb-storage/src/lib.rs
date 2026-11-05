@@ -2,7 +2,7 @@
 //!
 //! A Storage Engine is an ordered store of byte keys to byte values with
 //! atomic batched writes. It knows nothing about Documents, Versions or
-//! Transactions: those live in the Document Layer (see ADR 0001).
+//! Transactions: those live in the Database Layer (see ADR 0001).
 //!
 //! Every implementation must pass [`conformance::run_all`].
 
@@ -182,7 +182,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// The contract every Storage Engine must honour.
 ///
-/// The Document Layer relies on each rule below; [`conformance::run_all`]
+/// The Database Layer relies on each rule below; [`conformance::run_all`]
 /// checks them.
 ///
 /// 1. **Byte order.** Keys compare lexicographically as unsigned bytes
@@ -197,7 +197,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// 4. **Read your writes.** Reads reflect every batch whose `write_batch`
 ///    call has returned.
 /// 5. **Durability is optional.** `write_batch` need not reach disk;
-///    durability comes from the Document Layer's WAL (ADR 0004).
+///    durability comes from the Database Layer's WAL (ADR 0004).
 ///    [`flush`](Self::flush) makes everything written so far durable, if the
 ///    engine is persistent at all.
 ///

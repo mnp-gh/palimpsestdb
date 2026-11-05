@@ -1,4 +1,4 @@
-//! The entry point: a [`Database`] over one Storage Engine.
+//! The entry point: a [`Node`] over one Storage Engine.
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
@@ -25,25 +25,25 @@ const BUILD_CHUNK_DOCUMENTS: usize = 1024;
 /// so neither its memory nor its WAL Record grows with Document size.
 const BUILD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
-/// An embedded PalimpsestDB instance over the Storage Engine `E`.
+/// An embedded PalimpsestDB Node over the Storage Engine `E`.
 ///
-/// Every Database (namespace) and Collection lives in the one engine
+/// Every Namespace and Collection lives in the one engine
 /// (ADR 0005). [`open`](Self::open) makes it durable with a WAL (ADR 0004);
 /// [`new`](Self::new) keeps nothing durable.
 ///
 /// ```
 /// use bson::doc;
-/// use psdb_core::Database;
+/// use psdb_core::Node;
 /// use psdb_storage_memory::MemoryEngine;
 ///
-/// let db = Database::new(MemoryEngine::new());
-/// db.create_database("shop")?;
-/// db.create_collection("shop", "orders")?;
-/// let id = db.insert("shop", "orders", doc! { "item": "book" })?;
-/// assert_eq!(db.get("shop", "orders", &id)?.unwrap().get_str("item")?, "book");
+/// let node = Node::new(MemoryEngine::new());
+/// node.create_namespace("shop")?;
+/// node.create_collection("shop", "orders")?;
+/// let id = node.insert("shop", "orders", doc! { "item": "book" })?;
+/// assert_eq!(node.get("shop", "orders", &id)?.unwrap().get_str("item")?, "book");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub struct Database<E: StorageEngine> {
+pub struct Node<E: StorageEngine> {
     pub(crate) engine: E,
     pub(crate) limits: Limits,
     /// Holding the lock serialises commits, which keeps them logged and
@@ -61,7 +61,7 @@ pub(crate) struct CommitState {
     pub(crate) poisoned: bool,
 }
 
-impl<E: StorageEngine> Database<E> {
+impl<E: StorageEngine> Node<E> {
     /// Open over an empty engine with default [`Limits`], keeping nothing
     /// durable.
     pub fn new(engine: E) -> Self {
@@ -74,23 +74,23 @@ impl<E: StorageEngine> Database<E> {
         Self::from_parts(engine, limits, 0, None)
     }
 
-    /// Open a durable Database whose WAL lives in `dir`, creating `dir` and
+    /// Open a durable Node whose WAL lives in `dir`, creating `dir` and
     /// the WAL if needed, and replay the WAL into `engine`, which must be
     /// empty.
     ///
     /// ```
     /// use bson::doc;
-    /// use psdb_core::Database;
+    /// use psdb_core::Node;
     /// use psdb_storage_memory::MemoryEngine;
     ///
     /// # let dir = std::env::temp_dir().join(format!("psdb-doc-{}", std::process::id()));
     /// # let _ = std::fs::remove_dir_all(&dir);
-    /// let db = Database::open(MemoryEngine::new(), &dir)?;
-    /// db.create_database("shop")?;
-    /// drop(db);
+    /// let node = Node::open(MemoryEngine::new(), &dir)?;
+    /// node.create_namespace("shop")?;
+    /// drop(node);
     ///
-    /// let db = Database::open(MemoryEngine::new(), &dir)?;
-    /// assert_eq!(db.list_databases()?, ["shop"]);
+    /// let node = Node::open(MemoryEngine::new(), &dir)?;
+    /// assert_eq!(node.list_namespaces()?, ["shop"]);
     /// # std::fs::remove_dir_all(&dir)?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -98,7 +98,7 @@ impl<E: StorageEngine> Database<E> {
         Self::open_with(engine, OsWalFile::open(dir)?, Limits::default())
     }
 
-    /// Open a durable Database over any [`WalFile`], such as a
+    /// Open a durable Node over any [`WalFile`], such as a
     /// [`SimDisk`](crate::wal::SimDisk) file in tests, and replay it into
     /// `engine`, which must be empty.
     ///
@@ -185,22 +185,22 @@ impl<E: StorageEngine> Database<E> {
     ///
     /// ```
     /// use bson::doc;
-    /// use psdb_core::{Database, FieldSchema, FieldType};
+    /// use psdb_core::{Node, FieldSchema, FieldType};
     /// use psdb_storage_memory::MemoryEngine;
     ///
-    /// let db = Database::new(MemoryEngine::new());
-    /// db.create_database("shop")?;
-    /// db.create_collection("shop", "orders")?;
-    /// db.insert("shop", "orders", doc! { "total": 30 })?;
+    /// let node = Node::new(MemoryEngine::new());
+    /// node.create_namespace("shop")?;
+    /// node.create_collection("shop", "orders")?;
+    /// node.insert("shop", "orders", doc! { "total": 30 })?;
     /// let total = FieldSchema { field_type: FieldType::Int, strict: false };
-    /// db.set_field_type("shop", "orders", "total", total)?;
-    /// db.create_index("shop", "orders", "total", false)?;
-    /// assert_eq!(db.find("shop", "orders", &doc! { "total": { "$gt": 10 } })?.len(), 1);
+    /// node.set_field_type("shop", "orders", "total", total)?;
+    /// node.create_index("shop", "orders", "total", false)?;
+    /// assert_eq!(node.find("shop", "orders", &doc! { "total": { "$gt": 10 } })?.len(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn create_index(
         &self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         path: &str,
         unique: bool,
@@ -210,10 +210,10 @@ impl<E: StorageEngine> Database<E> {
             return Err(Error::Poisoned);
         }
         let mut txn = Transaction::new(self, commits.last);
-        let (db_id, mut entry, index) = txn.prepare_index(database, collection, path, unique)?;
-        self.build_index(&mut commits, db_id, &entry, &index, txn.snapshot_ts())?;
+        let (ns_id, mut entry, index) = txn.prepare_index(namespace, collection, path, unique)?;
+        self.build_index(&mut commits, ns_id, &entry, &index, txn.snapshot_ts())?;
         entry.indexes.push(index);
-        txn.write_collection_entry(db_id, &entry)?;
+        txn.write_collection_entry(ns_id, &entry)?;
         txn.commit_locked(&mut commits)?;
         Ok(())
     }
@@ -223,15 +223,15 @@ impl<E: StorageEngine> Database<E> {
     fn build_index(
         &self,
         commits: &mut CommitState,
-        db_id: u32,
+        ns_id: u32,
         entry: &CollectionEntry,
         index: &IndexDef,
         snapshot_ts: u64,
     ) -> Result<()> {
         let ty = entry.schema[&index.path].field_type;
         let segments = schema::segments(&index.path);
-        let prefix = keys::collection_prefix(db_id, entry.id);
-        let mut range = keys::documents_range(db_id, entry.id);
+        let prefix = keys::collection_prefix(ns_id, entry.id);
+        let mut range = keys::documents_range(ns_id, entry.id);
         loop {
             let mut page = Vec::new();
             let mut page_bytes = 0;
@@ -252,7 +252,7 @@ impl<E: StorageEngine> Database<E> {
                     continue;
                 };
                 let doc_id = &key[prefix.len()..];
-                let entry_key = index::entry_key(db_id, entry.id, index, &c, doc_id);
+                let entry_key = index::entry_key(ns_id, entry.id, index, &c, doc_id);
                 if index.unique
                     && !keys::is_null(&c)
                     && (chunk.contains_key(&entry_key)
@@ -292,104 +292,104 @@ impl<E: StorageEngine> Database<E> {
         Ok(out)
     }
 
-    /// Autocommit [`Transaction::create_database`].
-    pub fn create_database(&self, name: &str) -> Result<()> {
-        self.run(|t| t.create_database(name))
+    /// Autocommit [`Transaction::create_namespace`].
+    pub fn create_namespace(&self, name: &str) -> Result<()> {
+        self.run(|t| t.create_namespace(name))
     }
 
-    /// Autocommit [`Transaction::drop_database`].
-    pub fn drop_database(&self, name: &str) -> Result<()> {
-        self.run(|t| t.drop_database(name))
+    /// Autocommit [`Transaction::drop_namespace`].
+    pub fn drop_namespace(&self, name: &str) -> Result<()> {
+        self.run(|t| t.drop_namespace(name))
     }
 
-    /// Autocommit [`Transaction::list_databases`].
-    pub fn list_databases(&self) -> Result<Vec<String>> {
-        self.run(|t| t.list_databases())
+    /// Autocommit [`Transaction::list_namespaces`].
+    pub fn list_namespaces(&self) -> Result<Vec<String>> {
+        self.run(|t| t.list_namespaces())
     }
 
     /// Autocommit [`Transaction::create_collection`].
-    pub fn create_collection(&self, database: &str, name: &str) -> Result<()> {
-        self.run(|t| t.create_collection(database, name))
+    pub fn create_collection(&self, namespace: &str, name: &str) -> Result<()> {
+        self.run(|t| t.create_collection(namespace, name))
     }
 
     /// Autocommit [`Transaction::drop_collection`].
-    pub fn drop_collection(&self, database: &str, name: &str) -> Result<()> {
-        self.run(|t: &mut Transaction<'_, E>| t.drop_collection(database, name))
+    pub fn drop_collection(&self, namespace: &str, name: &str) -> Result<()> {
+        self.run(|t| t.drop_collection(namespace, name))
     }
 
     /// Autocommit [`Transaction::list_collections`].
-    pub fn list_collections(&self, database: &str) -> Result<Vec<String>> {
-        self.run(|t| t.list_collections(database))
+    pub fn list_collections(&self, namespace: &str) -> Result<Vec<String>> {
+        self.run(|t| t.list_collections(namespace))
     }
 
     /// Autocommit [`Transaction::insert`].
-    pub fn insert(&self, database: &str, collection: &str, doc: Document) -> Result<Bson> {
-        self.run(|t| t.insert(database, collection, doc))
+    pub fn insert(&self, namespace: &str, collection: &str, doc: Document) -> Result<Bson> {
+        self.run(|t| t.insert(namespace, collection, doc))
     }
 
     /// Autocommit [`Transaction::get`].
-    pub fn get(&self, database: &str, collection: &str, id: &Bson) -> Result<Option<Document>> {
-        self.run(|t| t.get(database, collection, id))
+    pub fn get(&self, namespace: &str, collection: &str, id: &Bson) -> Result<Option<Document>> {
+        self.run(|t| t.get(namespace, collection, id))
     }
 
     /// Autocommit [`Transaction::replace`].
     pub fn replace(
         &self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         id: &Bson,
         doc: Document,
     ) -> Result<bool> {
-        self.run(|t| t.replace(database, collection, id, doc))
+        self.run(|t| t.replace(namespace, collection, id, doc))
     }
 
     /// Autocommit [`Transaction::delete`].
-    pub fn delete(&self, database: &str, collection: &str, id: &Bson) -> Result<bool> {
-        self.run(|t| t.delete(database, collection, id))
+    pub fn delete(&self, namespace: &str, collection: &str, id: &Bson) -> Result<bool> {
+        self.run(|t| t.delete(namespace, collection, id))
     }
 
     /// Autocommit [`Transaction::set_field_type`].
     pub fn set_field_type(
         &self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         path: &str,
         field: FieldSchema,
     ) -> Result<()> {
-        self.run(|t| t.set_field_type(database, collection, path, field))
+        self.run(|t| t.set_field_type(namespace, collection, path, field))
     }
 
     /// Autocommit [`Transaction::remove_field_type`].
-    pub fn remove_field_type(&self, database: &str, collection: &str, path: &str) -> Result<()> {
-        self.run(|t| t.remove_field_type(database, collection, path))
+    pub fn remove_field_type(&self, namespace: &str, collection: &str, path: &str) -> Result<()> {
+        self.run(|t| t.remove_field_type(namespace, collection, path))
     }
 
     /// Autocommit [`Transaction::collection_schema`].
     pub fn collection_schema(
         &self,
-        database: &str,
+        namespace: &str,
         collection: &str,
     ) -> Result<BTreeMap<String, FieldSchema>> {
-        self.run(|t| t.collection_schema(database, collection))
+        self.run(|t| t.collection_schema(namespace, collection))
     }
 
     /// Autocommit [`Transaction::drop_index`].
-    pub fn drop_index(&self, database: &str, collection: &str, path: &str) -> Result<()> {
-        self.run(|t| t.drop_index(database, collection, path))
+    pub fn drop_index(&self, namespace: &str, collection: &str, path: &str) -> Result<()> {
+        self.run(|t| t.drop_index(namespace, collection, path))
     }
 
     /// Autocommit [`Transaction::list_indexes`].
-    pub fn list_indexes(&self, database: &str, collection: &str) -> Result<Vec<IndexInfo>> {
-        self.run(|t| t.list_indexes(database, collection))
+    pub fn list_indexes(&self, namespace: &str, collection: &str) -> Result<Vec<IndexInfo>> {
+        self.run(|t| t.list_indexes(namespace, collection))
     }
 
     /// Autocommit [`Transaction::find`].
     pub fn find(
         &self,
-        database: &str,
+        namespace: &str,
         collection: &str,
         filter: &Document,
     ) -> Result<Vec<Document>> {
-        self.run(|t| t.find(database, collection, filter))
+        self.run(|t| t.find(namespace, collection, filter))
     }
 }

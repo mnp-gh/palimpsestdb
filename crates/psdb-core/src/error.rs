@@ -1,37 +1,37 @@
-//! Errors returned by the Document Layer.
+//! Errors returned by the Database Layer.
 
 use std::fmt;
 
 use psdb_storage::StorageError;
 
-/// Result type for Document Layer operations.
+/// Result type for Database Layer operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Everything that can go wrong in the Document Layer.
+/// Everything that can go wrong in the Database Layer.
 #[derive(Debug)]
 pub enum Error {
     /// Abort: a concurrent Transaction committed a write to the same key
     /// first (first-committer-wins). Retryable.
     WriteConflict,
-    /// Abort: a Collection or Database this Transaction used was dropped or
+    /// Abort: a Collection or Namespace this Transaction used was dropped or
     /// changed after its Snapshot (ADR 0006). Retryable.
     CollectionChanged,
-    /// No Database with this name exists at the Transaction's Snapshot.
-    NoSuchDatabase(String),
-    /// No Collection with this name exists in the Database at the
+    /// No Namespace with this name exists at the Transaction's Snapshot.
+    NoSuchNamespace(String),
+    /// No Collection with this name exists in the Namespace at the
     /// Transaction's Snapshot.
     NoSuchCollection {
-        /// The Database name.
-        database: String,
+        /// The Namespace name.
+        namespace: String,
         /// The Collection name.
         collection: String,
     },
-    /// A Database with this name already exists.
-    DatabaseExists(String),
-    /// A Collection with this name already exists in the Database.
+    /// A Namespace with this name already exists.
+    NamespaceExists(String),
+    /// A Collection with this name already exists in the Namespace.
     CollectionExists {
-        /// The Database name.
-        database: String,
+        /// The Namespace name.
+        namespace: String,
         /// The Collection name.
         collection: String,
     },
@@ -48,8 +48,8 @@ pub enum Error {
     InvalidSchema(String),
     /// The Collection already has an Index on this field.
     IndexExists {
-        /// The Database name.
-        database: String,
+        /// The Namespace name.
+        namespace: String,
         /// The Collection name.
         collection: String,
         /// The field path.
@@ -57,8 +57,8 @@ pub enum Error {
     },
     /// The Collection has no Index on this field.
     NoSuchIndex {
-        /// The Database name.
-        database: String,
+        /// The Namespace name.
+        namespace: String,
         /// The Collection name.
         collection: String,
         /// The field path.
@@ -66,15 +66,15 @@ pub enum Error {
     },
     /// An Index can only be created inside a Transaction while its
     /// Collection is empty; otherwise use
-    /// [`Database::create_index`](crate::Database::create_index), which
+    /// [`Node::create_index`](crate::Node::create_index), which
     /// builds it on its own (ADR 0010).
     CollectionNotEmpty {
-        /// The Database name.
-        database: String,
+        /// The Namespace name.
+        namespace: String,
         /// The Collection name.
         collection: String,
     },
-    /// A Database or Collection name breaks the naming rules.
+    /// A Namespace or Collection name breaks the naming rules.
     InvalidName(String),
     /// A value cannot be used as a Document ID.
     InvalidId(String),
@@ -86,7 +86,7 @@ pub enum Error {
     Corruption(String),
     /// The Storage Engine failed.
     Storage(StorageError),
-    /// Reading or writing the WAL failed while opening a Database.
+    /// Reading or writing the WAL failed while opening a Node.
     Io(std::io::Error),
     /// The WAL file has the wrong magic number or an unknown format
     /// version. It was left untouched.
@@ -96,16 +96,16 @@ pub enum Error {
     /// (the write is not made), or the WAL Record would exceed 4 GiB
     /// (nothing is committed). Not an Abort, and not retryable.
     TransactionTooLarge,
-    /// [`Database::open`](crate::Database::open) was given an engine that
+    /// [`Node::open`](crate::Node::open) was given an engine that
     /// already holds data; the WAL is replayed into an empty engine.
     EngineNotEmpty,
     /// The commit could not be confirmed Durable, or was Durable but could
     /// not be Applied: the Transaction may or may not be present after the
-    /// Database is reopened. Not an Abort, and not retryable. The Database
+    /// Node is reopened. Not an Abort, and not retryable. The Node
     /// is now poisoned.
     CommitOutcomeUnknown(Box<Error>),
     /// An earlier commit ended in [`Error::CommitOutcomeUnknown`], so
-    /// nothing more can commit until the Database is reopened.
+    /// nothing more can commit until the Node is reopened.
     Poisoned,
 }
 
@@ -116,7 +116,7 @@ impl Error {
         matches!(self, Error::WriteConflict | Error::CollectionChanged)
     }
 
-    /// Whether the Database can no longer commit until it is reopened.
+    /// Whether the Node can no longer commit until it is reopened.
     pub fn requires_reopen(&self) -> bool {
         matches!(self, Error::CommitOutcomeUnknown(_) | Error::Poisoned)
     }
@@ -131,27 +131,27 @@ impl fmt::Display for Error {
             Error::CollectionChanged => {
                 f.write_str("collection changed: a collection used by this transaction was dropped or altered; retry")
             }
-            Error::NoSuchDatabase(db) => write!(f, "database {db:?} does not exist"),
-            Error::NoSuchCollection { database, collection } => {
-                write!(f, "collection {database}.{collection} does not exist")
+            Error::NoSuchNamespace(namespace) => write!(f, "namespace {namespace:?} does not exist"),
+            Error::NoSuchCollection { namespace, collection } => {
+                write!(f, "collection {namespace}.{collection} does not exist")
             }
-            Error::DatabaseExists(db) => write!(f, "database {db:?} already exists"),
-            Error::CollectionExists { database, collection } => {
-                write!(f, "collection {database}.{collection} already exists")
+            Error::NamespaceExists(namespace) => write!(f, "namespace {namespace:?} already exists"),
+            Error::CollectionExists { namespace, collection } => {
+                write!(f, "collection {namespace}.{collection} already exists")
             }
             Error::DuplicateId(id) => write!(f, "a document with _id {id} already exists"),
             Error::DuplicateValue(msg) => write!(f, "duplicate value: {msg}"),
             Error::TypeMismatch(msg) => write!(f, "type mismatch: {msg}"),
             Error::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
-            Error::IndexExists { database, collection, path } => {
-                write!(f, "collection {database}.{collection} already has an index on {path}")
+            Error::IndexExists { namespace, collection, path } => {
+                write!(f, "collection {namespace}.{collection} already has an index on {path}")
             }
-            Error::NoSuchIndex { database, collection, path } => {
-                write!(f, "collection {database}.{collection} has no index on {path}")
+            Error::NoSuchIndex { namespace, collection, path } => {
+                write!(f, "collection {namespace}.{collection} has no index on {path}")
             }
-            Error::CollectionNotEmpty { database, collection } => write!(
+            Error::CollectionNotEmpty { namespace, collection } => write!(
                 f,
-                "collection {database}.{collection} holds documents, so its index must be built outside a transaction"
+                "collection {namespace}.{collection} holds documents, so its index must be built outside a transaction"
             ),
             Error::InvalidName(msg) => write!(f, "invalid name: {msg}"),
             Error::InvalidId(msg) => write!(f, "invalid _id: {msg}"),
@@ -169,10 +169,10 @@ impl fmt::Display for Error {
             }
             Error::CommitOutcomeUnknown(cause) => write!(
                 f,
-                "commit outcome unknown ({cause}); the transaction may or may not survive a reopen, and the database must be reopened"
+                "commit outcome unknown ({cause}); the transaction may or may not survive a reopen, and the node must be reopened"
             ),
             Error::Poisoned => f.write_str(
-                "an earlier commit's outcome is unknown, so nothing more can commit; reopen the database",
+                "an earlier commit's outcome is unknown, so nothing more can commit; reopen the node",
             ),
         }
     }
