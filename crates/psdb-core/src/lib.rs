@@ -14,8 +14,10 @@
 //! Start with [`Node`].
 
 mod catalog;
+mod collection_path;
 mod document;
 mod error;
+mod field_path;
 mod filter;
 mod index;
 mod keys;
@@ -25,8 +27,10 @@ mod schema;
 mod transaction;
 pub mod wal;
 
+pub use collection_path::CollectionPath;
 pub use document::{Limits, MAX_NAME_BYTES};
 pub use error::{Error, Result};
+pub use field_path::FieldPath;
 pub use filter::{CompareOp, Filter};
 pub use index::IndexInfo;
 pub use keys::MAX_ID_BYTES;

@@ -16,7 +16,7 @@ Every component is self-delimiting, so no logical key is a prefix of another and
 |---|---|---|
 | Null or missing (Index keys only) | `0x05` | none |
 | Integer (BSON int32 and int64, one class) | `0x10` | i64 with the sign bit flipped, big-endian |
-| Double (Index keys only, in `double` Indexes) | `0x11` | IEEE 754 bits, big-endian: sign bit set if positive, all bits inverted if negative; -0.0 written as 0.0 |
+| Double (Index keys only, in Indexes on `double` fields) | `0x11` | IEEE 754 bits, big-endian: sign bit set if positive, all bits inverted if negative; -0.0 written as 0.0 |
 | String | `0x20` | UTF-8 with `0x00` escaped as `0x00 0xFF`, terminated by `0x00 0x00` |
 | Binary (including UUIDs, subtype 4) | `0x30` | subtype byte, then bytes escaped and terminated as for String |
 | ObjectId | `0x40` | the 12 raw bytes |

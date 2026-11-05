@@ -2,6 +2,8 @@
 
 mod common;
 
+use common::collection;
+
 use std::collections::BTreeMap;
 
 use bson::{Bson, doc};
@@ -38,28 +40,28 @@ proptest! {
         for op in ops {
             match op {
                 Op::Insert(id, v) => {
-                    let result = node.insert("shop", "orders", doc! { "_id": id, "v": v });
+                    let result = node.insert(&collection("shop.orders"), doc! { "_id": id, "v": v });
                     prop_assert_eq!(result.is_ok(), !model.contains_key(&id));
                     model.entry(id).or_insert(v);
                 }
                 Op::Replace(id, v) => {
-                    let replaced = node.replace("shop", "orders", &Bson::Int32(id), doc! { "v": v }).unwrap();
+                    let replaced = node.replace(&collection("shop.orders"), &Bson::Int32(id), doc! { "v": v }).unwrap();
                     prop_assert_eq!(replaced, model.contains_key(&id));
                     if let Some(slot) = model.get_mut(&id) {
                         *slot = v;
                     }
                 }
                 Op::Delete(id) => {
-                    let deleted = node.delete("shop", "orders", &Bson::Int32(id)).unwrap();
+                    let deleted = node.delete(&collection("shop.orders"), &Bson::Int32(id)).unwrap();
                     prop_assert_eq!(deleted, model.remove(&id).is_some());
                 }
                 Op::Get(id) => {
-                    let got = node.get("shop", "orders", &Bson::Int32(id)).unwrap();
+                    let got = node.get(&collection("shop.orders"), &Bson::Int32(id)).unwrap();
                     prop_assert_eq!(got, model.get(&id).map(|v| doc! { "_id": id, "v": *v }));
                 }
                 Op::FindGreater(min) => {
                     let got: Vec<i32> = node
-                        .find("shop", "orders", &doc! { "v": { "$gt": min } })
+                        .find(&collection("shop.orders"), &doc! { "v": { "$gt": min } })
                         .unwrap()
                         .iter()
                         .map(|d| d.get_i32("_id").unwrap())

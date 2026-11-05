@@ -2,8 +2,8 @@
 //! is a Strict Field (ADR 0011).
 //!
 //! Collections are schemaless, so the schema exists mainly to give
-//! Indexes their types: an Index on a field takes its type from here (see
-//! [`crate::index`]). The schema itself knows nothing about Indexes, and
+//! indexed fields their Field Types: an Index has no type of its own and
+//! reads its field's from here (see [`crate::index`]). The schema itself knows nothing about Indexes, and
 //! alone decides which writes a Strict Field rejects, whether or not the
 //! field is indexed.
 
@@ -14,6 +14,7 @@ use std::str::FromStr;
 use bson::{Bson, RawDocument};
 
 use crate::error::{Error, Result};
+use crate::field_path::FieldPath;
 use crate::filter::{TWO_63, lookup_raw};
 
 /// The kind of value a field holds, declared in the Collection Schema.
@@ -64,20 +65,30 @@ impl FieldType {
         }
     }
 
+    /// The Field Type of `value`, if it has one: the one place BSON types
+    /// map to Field Types. Both integer widths are `int`.
+    pub(crate) fn of(value: &Bson) -> Option<FieldType> {
+        Some(match value {
+            Bson::Int32(_) | Bson::Int64(_) => FieldType::Int,
+            Bson::Double(_) => FieldType::Double,
+            Bson::String(_) => FieldType::String,
+            Bson::DateTime(_) => FieldType::Date,
+            Bson::Boolean(_) => FieldType::Bool,
+            Bson::ObjectId(_) => FieldType::ObjectId,
+            Bson::Binary(_) => FieldType::Binary,
+            _ => return None,
+        })
+    }
+
+    /// Whether this is `int` or `double`, which filters compare with each
+    /// other, as numbers.
+    pub(crate) fn is_number(self) -> bool {
+        matches!(self, FieldType::Int | FieldType::Double)
+    }
+
     /// Whether filters can compare `value` with values of this type.
-    /// Integers and doubles compare with each other, as numbers.
     pub(crate) fn compares_with(self, value: &Bson) -> bool {
-        matches!(
-            (self, value),
-            (
-                FieldType::Int | FieldType::Double,
-                Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)
-            ) | (FieldType::String, Bson::String(_))
-                | (FieldType::Date, Bson::DateTime(_))
-                | (FieldType::Bool, Bson::Boolean(_))
-                | (FieldType::ObjectId, Bson::ObjectId(_))
-                | (FieldType::Binary, Bson::Binary(_))
-        )
+        FieldType::of(value).is_some_and(|t| t == self || (t.is_number() && self.is_number()))
     }
 }
 
@@ -113,42 +124,13 @@ pub struct FieldSchema {
     pub strict: bool,
 }
 
-/// A Collection Schema: field path → its declaration.
-pub(crate) type Schema = BTreeMap<String, FieldSchema>;
+/// A Collection Schema: Field path → its declaration.
+pub(crate) type Schema = BTreeMap<FieldPath, FieldSchema>;
 
-/// Split and check a field path for the Collection Schema: non-empty
-/// segments, none starting with `$`, and not `_id`, which is already the
-/// key of every Document.
-pub(crate) fn split_path(path: &str) -> Result<Vec<String>> {
-    let segments = segments(path);
-    if segments.iter().any(|s| s.is_empty() || s.starts_with('$')) {
-        return Err(Error::InvalidSchema(format!(
-            "{path:?} is not a field path"
-        )));
-    }
-    if segments[0] == "_id" {
-        return Err(Error::InvalidSchema(
-            "_id cannot be declared or indexed; Documents are already keyed by it".into(),
-        ));
-    }
-    Ok(segments)
-}
-
-/// A declared path's segments, without checking them: the Catalog only
-/// holds paths that passed [`split_path`].
-pub(crate) fn segments(path: &str) -> Vec<String> {
-    path.split('.').map(str::to_owned).collect()
-}
-
-/// Fail with [`Error::TypeMismatch`] unless the value at `path` (split into
-/// `segments`) is missing, null, or converts exactly to the field's type.
-pub(crate) fn check_field(
-    doc: &RawDocument,
-    path: &str,
-    segments: &[String],
-    field: FieldSchema,
-) -> Result<()> {
-    match lookup_raw(doc, segments)? {
+/// Fail with [`Error::TypeMismatch`] unless the value at `path` is missing,
+/// null, or converts exactly to the field's type.
+pub(crate) fn check_field(doc: &RawDocument, path: &FieldPath, field: FieldSchema) -> Result<()> {
+    match lookup_raw(doc, &path.segments())? {
         None | Some(Bson::Null) => Ok(()),
         Some(v) if fits_exactly(&v, field.field_type) => Ok(()),
         Some(v) => Err(Error::TypeMismatch(format!(
@@ -169,12 +151,7 @@ fn fits_exactly(value: &Bson, ty: FieldType) -> bool {
         (Bson::Int32(_), FieldType::Double) => true,
         (Bson::Int64(n), FieldType::Double) => n.unsigned_abs() <= TWO_53,
         (Bson::Double(f), FieldType::Double) => !f.is_nan(),
-        (Bson::String(_), FieldType::String)
-        | (Bson::DateTime(_), FieldType::Date)
-        | (Bson::Boolean(_), FieldType::Bool)
-        | (Bson::ObjectId(_), FieldType::ObjectId)
-        | (Bson::Binary(_), FieldType::Binary) => true,
-        _ => false,
+        _ => FieldType::of(value) == Some(ty),
     }
 }
 
@@ -195,16 +172,5 @@ mod tests {
         assert!(!fits_exactly(&Bson::String("x".into()), Int));
         assert!(fits_exactly(&Bson::String("x".into()), String));
         assert!(!fits_exactly(&Bson::Null, String));
-    }
-
-    #[test]
-    fn paths() {
-        assert_eq!(split_path("a.b").unwrap(), ["a", "b"]);
-        for bad in ["", "a..b", "$a", "a.$b", "_id", "_id.x"] {
-            assert!(
-                matches!(split_path(bad), Err(Error::InvalidSchema(_))),
-                "{bad:?}"
-            );
-        }
     }
 }

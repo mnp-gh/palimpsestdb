@@ -5,18 +5,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use std::ops::ControlFlow;
 
-use bson::{Bson, Document};
+use bson::{Bson, Document, RawDocument};
 use psdb_storage::{KeyRange, StorageEngine};
 
 use crate::catalog::CollectionEntry;
+use crate::collection_path::CollectionPath;
 use crate::document;
 use crate::error::{Error, Result};
 use crate::filter::Filter;
-use crate::index::{self, Source};
+use crate::index::{self, CandidateRange};
 use crate::keys;
 use crate::mvcc;
 use crate::node::{CommitState, Node};
-use crate::schema;
 
 /// One entry of a Write Set: a logical key and its new value (`None`
 /// deletes).
@@ -133,13 +133,13 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// Every live value whose logical key is in `range`: the Snapshot with
     /// own writes overlaid, in key order.
     pub(crate) fn scan_range(&self, range: &KeyRange) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        let mut rows = BTreeMap::new();
+        let mut live = BTreeMap::new();
         mvcc::scan_range_at(
             &self.node.engine,
             range,
             self.snapshot_ts,
             &mut |key, value| {
-                rows.insert(key.to_vec(), value);
+                live.insert(key.to_vec(), value);
                 ControlFlow::Continue(())
             },
         )?;
@@ -149,34 +149,29 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             .take_while(|(k, _)| range.contains(k));
         for (key, value) in own {
             match value {
-                Some(v) => rows.insert(key.clone(), v.clone()),
-                None => rows.remove(key),
+                Some(v) => live.insert(key.clone(), v.clone()),
+                None => live.remove(key),
             };
         }
-        Ok(rows)
+        Ok(live)
     }
 
     /// Insert a Document. If it has no `_id`, a UUIDv7 is generated.
     /// Returns the Document ID.
-    pub fn insert(&mut self, namespace: &str, collection: &str, doc: Document) -> Result<Bson> {
-        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
+    pub fn insert(&mut self, collection: &CollectionPath, doc: Document) -> Result<Bson> {
+        let entry = self.collection_entry(collection)?;
         let (id, bytes) = document::prepare(doc, None, &self.node.limits)?;
-        let key = keys::document_key(ns_id, entry.id, &id)?;
+        let key = keys::document_key(entry.namespace_id, entry.id, &id)?;
         if self.read(&key)?.is_some() {
             return Err(Error::DuplicateId(id.to_string()));
         }
-        self.write_document(ns_id, &entry, key, None, Some(bytes))?;
+        self.write_document(&entry, key, None, Some(bytes))?;
         Ok(id)
     }
 
     /// The Document with this Document ID, if it exists.
-    pub fn get(
-        &mut self,
-        namespace: &str,
-        collection: &str,
-        id: &Bson,
-    ) -> Result<Option<Document>> {
-        let (ns_id, coll_id) = self.resolve_collection(namespace, collection)?;
+    pub fn get(&mut self, collection: &CollectionPath, id: &Bson) -> Result<Option<Document>> {
+        let (ns_id, coll_id) = self.resolve_collection(collection)?;
         let key = keys::document_key(ns_id, coll_id, id)?;
         self.read(&key)?
             .map(|bytes| document::decode(&bytes))
@@ -188,30 +183,29 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// Document exists (nothing is written).
     pub fn replace(
         &mut self,
-        namespace: &str,
-        collection: &str,
+        collection: &CollectionPath,
         id: &Bson,
         doc: Document,
     ) -> Result<bool> {
-        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
-        let key = keys::document_key(ns_id, entry.id, id)?;
+        let entry = self.collection_entry(collection)?;
+        let key = keys::document_key(entry.namespace_id, entry.id, id)?;
         let Some(old) = self.read(&key)? else {
             return Ok(false);
         };
         let (_, bytes) = document::prepare(doc, Some(id), &self.node.limits)?;
-        self.write_document(ns_id, &entry, key, Some(&old), Some(bytes))?;
+        self.write_document(&entry, key, Some(&old), Some(bytes))?;
         Ok(true)
     }
 
     /// Delete the Document with this Document ID. Returns `false` if no such
     /// Document exists.
-    pub fn delete(&mut self, namespace: &str, collection: &str, id: &Bson) -> Result<bool> {
-        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
-        let key = keys::document_key(ns_id, entry.id, id)?;
+    pub fn delete(&mut self, collection: &CollectionPath, id: &Bson) -> Result<bool> {
+        let entry = self.collection_entry(collection)?;
+        let key = keys::document_key(entry.namespace_id, entry.id, id)?;
         let Some(old) = self.read(&key)? else {
             return Ok(false);
         };
-        self.write_document(ns_id, &entry, key, Some(&old), None)?;
+        self.write_document(&entry, key, Some(&old), None)?;
         Ok(true)
     }
 
@@ -220,7 +214,6 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// Fields and unique Indexes. Nothing is written if any check fails.
     fn write_document(
         &mut self,
-        ns_id: u32,
         entry: &CollectionEntry,
         key: Vec<u8>,
         old: Option<&[u8]>,
@@ -231,29 +224,25 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         if let Some(doc) = new_doc {
             entry.check_strict(doc)?;
         }
-        let doc_id = &key[keys::collection_prefix(ns_id, entry.id).len()..];
+        let doc_id = &key[entry.prefix().len()..];
         let mut writes = Vec::new();
         for ix in &entry.indexes {
-            let segments = schema::segments(&ix.path);
-            let ty = entry.schema[&ix.path].field_type;
-            let component = |doc: Option<&bson::RawDocument>| match doc {
-                Some(doc) => index::component_of(doc, &segments, ty),
+            let index_entry = |doc: Option<&RawDocument>| match doc {
+                Some(doc) => entry.index_entry(ix, doc, doc_id),
                 None => Ok(None),
             };
-            let (before, after) = (component(old)?, component(new_doc)?);
+            let (before, after) = (index_entry(old)?, index_entry(new_doc)?);
             // An unchanged value keeps its entry: it points to the Document
             // ID, not to a Version (ADR 0011).
             if before == after {
                 continue;
             }
-            if let Some(c) = before {
-                writes.push((index::entry_key(ns_id, entry.id, ix, &c, doc_id), None));
+            if let Some(before) = before {
+                writes.push((before.key, None));
             }
-            if let Some(c) = after {
-                let entry_key = index::entry_key(ns_id, entry.id, ix, &c, doc_id);
-                if ix.unique
-                    && !keys::is_null(&c)
-                    && let Some(owner) = self.read(&entry_key)?
+            if let Some(after) = after {
+                if after.unique
+                    && let Some(owner) = self.read(&after.key)?
                     && owner != doc_id
                 {
                     return Err(Error::DuplicateValue(format!(
@@ -261,7 +250,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                         ix.path
                     )));
                 }
-                writes.push((entry_key, Some(doc_id.to_vec())));
+                writes.push((after.key, Some(doc_id.to_vec())));
             }
         }
         writes.push((key, new));
@@ -275,36 +264,34 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// against the whole filter.
     pub fn find(
         &mut self,
-        namespace: &str,
-        collection: &str,
+        collection: &CollectionPath,
         filter: &Document,
     ) -> Result<Vec<Document>> {
         let filter = Filter::parse(filter)?;
-        let (ns_id, entry) = self.collection_entry(namespace, collection)?;
-        let prefix = keys::collection_prefix(ns_id, entry.id);
-        let candidates = match index::plan(&filter, ns_id, entry.id, &entry.schema, &entry.indexes)
-        {
-            None => self.scan_range(&keys::documents_range(ns_id, entry.id))?,
-            Some(sources) => {
+        let entry = self.collection_entry(collection)?;
+        let prefix = entry.prefix();
+        let candidates = match index::plan(&filter, &entry) {
+            None => self.scan_range(&entry.documents())?,
+            Some(ranges) => {
                 // Keyed by Document key, so a Document found through several
                 // ranges is read once, and results stay in Document ID order.
-                let mut rows = BTreeMap::new();
-                for source in &sources {
-                    match source {
-                        Source::Documents(range) => rows.extend(self.scan_range(range)?),
-                        Source::Index(range) => {
+                let mut docs = BTreeMap::new();
+                for range in &ranges {
+                    match range {
+                        CandidateRange::Documents(range) => docs.extend(self.scan_range(range)?),
+                        CandidateRange::Index(range) => {
                             for doc_id in self.scan_range(range)?.into_values() {
                                 let key = [prefix.as_slice(), &doc_id].concat();
-                                if !rows.contains_key(&key)
+                                if !docs.contains_key(&key)
                                     && let Some(bytes) = self.read(&key)?
                                 {
-                                    rows.insert(key, bytes);
+                                    docs.insert(key, bytes);
                                 }
                             }
                         }
                     }
                 }
-                rows
+                docs
             }
         };
         let mut out = Vec::new();

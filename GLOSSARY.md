@@ -36,6 +36,10 @@ _Avoid_: Secondary key, lookup table
 The optional declarations a Collection makes about its fields; for now, each field's Field Type and whether it is a Strict Field. Collections are schemaless, so it exists mainly to give Indexes their types: an Index reads its field's type from it, and it knows nothing about Indexes. A Collection without one accepts any Document, and Documents are never changed to fit it.
 _Avoid_: Index schema, validator
 
+**Field path**:
+The dotted path to a field inside a Document, such as `address.city`: each segment names a field of the embedded document before it. The Collection Schema declares fields, and Indexes cover them, by Field path. A Field path is never `_id` or under it, because Documents are already keyed by `_id`.
+_Avoid_: Column, key path
+
 **Field Type**:
 The kind of value a field holds, declared in the Collection Schema. An Index has no type of its own: it covers values of its field's Field Type. Whether a Document is in the Index follows each of its Versions: while its field holds another kind of value it is left out, and a later write giving the field a value of the Field Type brings it in (and back out again if the type changes away). The Document itself is never changed.
 _Avoid_: Index Type, column type
