@@ -23,6 +23,7 @@ cargo test --workspace
 ## Design docs
 
 - [GLOSSARY.md](GLOSSARY.md): the project's vocabulary
+- [ARCHITECTURE.md](ARCHITECTURE.md): a map of the code, its main flows and invariants
 - [docs/adr/](docs/adr/): architecture decisions
 - [docs/CONVENTIONS.md](docs/CONVENTIONS.md): how the code is shaped
 - [docs/ROADMAP.md](docs/ROADMAP.md): what each version adds

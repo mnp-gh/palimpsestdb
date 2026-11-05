@@ -58,6 +58,27 @@ impl KeyRange {
     pub fn contains(&self, key: &[u8]) -> bool {
         key >= self.start.as_slice() && self.end.as_deref().is_none_or(|end| key < end)
     }
+
+    /// The keys in both `self` and `other`. An unbounded end counts as
+    /// above every key. The result may be empty (`end <= start`).
+    ///
+    /// ```
+    /// use psdb_storage::KeyRange;
+    /// let r = KeyRange::new(b"b", b"d").intersect(&KeyRange::prefix(b"c"));
+    /// assert_eq!(r, KeyRange::new(b"c", b"d"));
+    /// assert_eq!(KeyRange::all().intersect(&r), r);
+    /// ```
+    pub fn intersect(&self, other: &KeyRange) -> KeyRange {
+        let end = match (&self.end, &other.end) {
+            (Some(a), Some(b)) => Some(a.min(b).clone()),
+            (Some(e), None) | (None, Some(e)) => Some(e.clone()),
+            (None, None) => None,
+        };
+        KeyRange {
+            start: self.start.clone().max(other.start.clone()),
+            end,
+        }
+    }
 }
 
 /// The smallest key greater than every key starting with `prefix`, or `None`
@@ -127,16 +148,6 @@ impl WriteBatch {
     /// Consume the batch, yielding its ops in order.
     pub fn into_ops(self) -> Vec<WriteOp> {
         self.ops
-    }
-
-    /// Number of ops in the batch.
-    pub fn len(&self) -> usize {
-        self.ops.len()
-    }
-
-    /// Whether the batch has no ops.
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
     }
 }
 
@@ -209,7 +220,8 @@ pub trait StorageEngine: Send + Sync {
 
     /// Visit every key in `range` in ascending order, calling `visit` with
     /// each key and value. Return [`ControlFlow::Break`] from `visit` to stop
-    /// early.
+    /// early. An empty range (`end <= start`), such as one from
+    /// [`KeyRange::intersect`], visits nothing.
     ///
     /// `visit` must not call back into the engine.
     fn scan(&self, range: &KeyRange, visit: &mut ScanVisitor<'_>) -> Result<()>;

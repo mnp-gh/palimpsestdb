@@ -18,7 +18,7 @@ _Avoid_: Table, bucket
 
 **Namespace**:
 A named group of Collections, and the unit to which permissions are granted.
-_Avoid_: Database (the Database Layer is the software, not a group of Collections), Schema, keyspace, tenant
+_Avoid_: Database (the Database Layer is the software, not a group of Collections), Schema (that is the Collection Schema), keyspace, tenant
 
 **Collection path**:
 The name of a Collection together with the name of its Namespace, written `<namespace>.<collection>` (e.g. `shop.orders`); it identifies one Collection on the Node.
@@ -29,8 +29,24 @@ The authoritative record of which Namespaces and Collections exist and how their
 _Avoid_: Metadata store, schema registry
 
 **Index**:
-A secondary lookup over one field of a Collection's Documents, consistent with those Documents at every Snapshot.
+A secondary lookup over one field of a Collection's Documents, covering values of its field's Field Type, consistent with those Documents at every Snapshot. A unique Index also forbids two Documents from sharing a value in that field.
 _Avoid_: Secondary key, lookup table
+
+**Collection Schema**:
+The optional declarations a Collection makes about its fields; for now, each field's Field Type and whether it is a Strict Field. Collections are schemaless, so it exists mainly to give Indexes their types: an Index reads its field's type from it, and it knows nothing about Indexes. A Collection without one accepts any Document, and Documents are never changed to fit it.
+_Avoid_: Index schema, validator
+
+**Field path**:
+The dotted path to a field inside a Document, such as `address.city`: each segment names a field of the embedded document before it. Filters compare fields, the Collection Schema declares them, and Indexes cover them, by Field path. The Collection Schema never declares `_id` or a field under it, so no Index covers one, because Documents are already keyed by `_id`.
+_Avoid_: Column, key path
+
+**Field Type**:
+The kind of value a field holds, declared in the Collection Schema. An Index has no type of its own: it covers values of its field's Field Type. Whether a Document is in the Index follows each of its Versions: while its field holds another kind of value it is left out, and a later write giving the field a value of the Field Type brings it in (and back out again if the type changes away). The Document itself is never changed.
+_Avoid_: Index Type, column type
+
+**Strict Field**:
+A field whose Field Type the Collection Schema enforces: a write giving it a value of another type fails with Type Mismatch. Only a Strict Field can have a unique Index.
+_Avoid_: Required field (a Strict Field may be missing), typed column
 
 ## Access
 
@@ -63,7 +79,7 @@ A unit of reads and writes that commits or aborts as a whole.
 The consistent view of every Namespace on the Node that a Transaction reads, fixed at the moment the Transaction begins.
 
 **Write Set**:
-The Documents a Transaction has written but not yet committed; visible only to that Transaction.
+The writes a Transaction has made but not yet committed (Documents, their Index entries and Catalog entries); visible only to that Transaction.
 _Avoid_: Buffer, pending writes
 
 **Commit Timestamp**:
@@ -71,7 +87,7 @@ A counter, not clock time, that orders committed Transactions: each commit takes
 _Avoid_: Version number, LSN, wall-clock time
 
 **Version**:
-One committed state of a Document, identified by its Commit Timestamp.
+One committed state of a key (a Document, an Index entry or a Catalog entry), identified by its Commit Timestamp.
 _Avoid_: Revision
 
 **Snapshot Isolation**:
@@ -91,17 +107,29 @@ The outcome of a Transaction whose writes are discarded. Aborts caused by concur
 _Avoid_: Rollback (that is what the client asks for; Abort is the outcome)
 
 **Write Conflict**:
-An Abort because a concurrent Transaction committed a write to the same Document first.
+An Abort because a concurrent Transaction committed a write to the same key first: the same Document, the same value in a unique Index, or the same Catalog entry.
 
 **Serialization Failure**:
 An Abort because committing would produce an outcome not equivalent to any serial order.
 
 **Collection Changed**:
-An Abort because a Collection the Transaction used was dropped, renamed or re-indexed after its Snapshot.
+An Abort because, after the Transaction's Snapshot, a Collection it used was dropped, renamed, or had its Collection Schema or Indexes changed; or a Document was committed into a Collection whose every Document it relied on (a schema change, or an Index created on an empty Collection).
 
 **Commit Outcome Unknown**:
 The result of a commit whose durability could not be confirmed: the Transaction may or may not survive a restart. Not an Abort, and not safely retryable.
 _Avoid_: Failed commit, I/O error
+
+**Transaction Too Large**:
+The failure of a Transaction whose Write Set grows past the configured cap. Not an Abort, and not retryable: the same Transaction would fail again.
+_Avoid_: Overflow, out of memory
+
+**Duplicate Value**:
+The failure of a write that would give two Documents the same value in a unique Index. Not an Abort, and not retryable.
+_Avoid_: Constraint violation, duplicate key
+
+**Type Mismatch**:
+The failure of a write that gives a Strict Field a value of another type. Not an Abort, and not retryable.
+_Avoid_: Schema violation, validation error
 
 **Node**:
 One running instance of PalimpsestDB. Until replication exists, PalimpsestDB runs as exactly one Node.

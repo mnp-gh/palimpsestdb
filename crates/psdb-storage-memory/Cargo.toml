@@ -3,6 +3,7 @@ name = "psdb-storage-memory"
 description = "In-memory Storage Engine for PalimpsestDB."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]

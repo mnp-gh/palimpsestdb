@@ -1,6 +1,6 @@
 //! An in-memory [`StorageEngine`] backed by a `BTreeMap`.
 //!
-//! Nothing reaches disk: a restart loses everything unless the Document
+//! Nothing reaches disk: a restart loses everything unless the Database
 //! Layer's WAL replays it (ADR 0004).
 
 use std::collections::BTreeMap;

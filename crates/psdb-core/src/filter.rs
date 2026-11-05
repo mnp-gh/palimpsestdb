@@ -13,12 +13,15 @@
 
 use std::cmp::Ordering;
 
-use bson::{Bson, Document};
+use bson::{Bson, Document, RawDocument, RawDocumentBuf};
 
+use crate::document::lookup_raw;
 use crate::error::{Error, Result};
+use crate::field_path::FieldPath;
 
 /// A parsed filter.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Filter {
     /// Every sub-filter matches. An empty `And` matches everything.
     And(Vec<Filter>),
@@ -26,8 +29,8 @@ pub enum Filter {
     Or(Vec<Filter>),
     /// The value at `path` compares to `value` as `op` requires.
     Compare {
-        /// The field path, split on `.`.
-        path: Vec<String>,
+        /// The field compared.
+        path: FieldPath,
         /// The comparison.
         op: CompareOp,
         /// The value compared against.
@@ -59,9 +62,10 @@ impl Filter {
     /// use bson::doc;
     /// use psdb_core::Filter;
     ///
-    /// let filter = Filter::parse(&doc! { "age": { "$gte": 18 }, "address.city": "Paris" }).unwrap();
-    /// assert!(filter.matches(&doc! { "age": 30, "address": { "city": "Paris" } }));
-    /// assert!(!filter.matches(&doc! { "age": 12, "address": { "city": "Paris" } }));
+    /// let filter = Filter::parse(&doc! { "age": { "$gte": 18 }, "address.city": "Paris" })?;
+    /// assert!(filter.matches(&doc! { "age": 30, "address": { "city": "Paris" } })?);
+    /// assert!(!filter.matches(&doc! { "age": 12, "address": { "city": "Paris" } })?);
+    /// # Ok::<(), psdb_core::Error>(())
     /// ```
     pub fn parse(filter: &Document) -> Result<Filter> {
         let mut clauses = Vec::new();
@@ -84,13 +88,38 @@ impl Filter {
         })
     }
 
-    /// Whether `doc` matches this filter.
-    pub fn matches(&self, doc: &Document) -> bool {
-        match self {
-            Filter::And(fs) => fs.iter().all(|f| f.matches(doc)),
-            Filter::Or(fs) => fs.iter().any(|f| f.matches(doc)),
-            Filter::Compare { path, op, value } => compare_at(lookup(doc, path), *op, value),
-        }
+    /// Whether `doc` matches this filter. Fails with
+    /// [`Error::InvalidDocument`] if `doc` cannot be encoded as BSON.
+    pub fn matches(&self, doc: &Document) -> Result<bool> {
+        let raw = RawDocumentBuf::try_from(doc)
+            .map_err(|e| Error::InvalidDocument(format!("cannot encode as BSON: {e}")))?;
+        self.matches_raw(&raw)
+    }
+
+    /// Whether a stored Document matches, reading only the fields the
+    /// filter names instead of decoding the whole Document.
+    pub(crate) fn matches_raw(&self, doc: &RawDocument) -> Result<bool> {
+        Ok(match self {
+            Filter::And(fs) => {
+                for f in fs {
+                    if !f.matches_raw(doc)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            Filter::Or(fs) => {
+                for f in fs {
+                    if f.matches_raw(doc)? {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+            Filter::Compare { path, op, value } => {
+                compare_at(lookup_raw(doc, path)?.as_ref(), *op, value)
+            }
+        })
     }
 }
 
@@ -117,14 +146,11 @@ fn parse_list(op: &str, value: &Bson) -> Result<Vec<Filter>> {
 }
 
 fn parse_field(path: &str, value: &Bson) -> Result<Vec<Filter>> {
-    let segments: Vec<String> = path.split('.').map(str::to_owned).collect();
-    if segments.iter().any(String::is_empty) {
-        return Err(Error::InvalidFilter(format!(
-            "empty segment in path {path:?}"
-        )));
-    }
+    let path: FieldPath = path
+        .parse()
+        .map_err(|_| Error::InvalidFilter(format!("{path:?} is not a field path")))?;
     let compare = |op, value: &Bson| Filter::Compare {
-        path: segments.clone(),
+        path: path.clone(),
         op,
         value: value.clone(),
     };
@@ -156,19 +182,6 @@ fn parse_field(path: &str, value: &Bson) -> Result<Vec<Filter>> {
         .collect()
 }
 
-/// The value at `path`, descending through nested documents only.
-fn lookup<'a>(doc: &'a Document, path: &[String]) -> Option<&'a Bson> {
-    let (first, rest) = path.split_first()?;
-    let mut current = doc.get(first)?;
-    for segment in rest {
-        match current {
-            Bson::Document(d) => current = d.get(segment)?,
-            _ => return None,
-        }
-    }
-    Some(current)
-}
-
 fn compare_at(found: Option<&Bson>, op: CompareOp, target: &Bson) -> bool {
     // As in MongoDB, a missing field equals null.
     let equal = match found {
@@ -194,24 +207,39 @@ fn compare_at(found: Option<&Bson>, op: CompareOp, target: &Bson) -> bool {
 }
 
 /// Order two values of the same comparable type. Numbers compare across
-/// int32, int64 and double. Documents and arrays only compare for equality.
-/// Values of different types are incomparable, so range operators never
-/// match across types.
+/// int32, int64 and double, exactly: an integer is never rounded to a
+/// double. NaN equals nothing, itself included. Documents, arrays and
+/// binary only compare for equality: documents with the same keys in the
+/// same order and equal values, arrays with equal elements, each compared
+/// by these rules (as in MongoDB). Values of different types are
+/// incomparable, so range operators never match across types.
 fn compare(a: &Bson, b: &Bson) -> Option<Ordering> {
     use Bson::*;
     match (a, b) {
         (Int32(_) | Int64(_), Int32(_) | Int64(_)) => Some(as_i64(a)?.cmp(&as_i64(b)?)),
-        (Int32(_) | Int64(_) | Double(_), Int32(_) | Int64(_) | Double(_)) => {
-            as_f64(a)?.partial_cmp(&as_f64(b)?)
-        }
+        (Int32(_) | Int64(_), Double(f)) => cmp_int_double(as_i64(a)?, *f),
+        (Double(f), Int32(_) | Int64(_)) => Some(cmp_int_double(as_i64(b)?, *f)?.reverse()),
+        (Double(x), Double(y)) => x.partial_cmp(y),
         (String(x), String(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
         (Boolean(x), Boolean(y)) => Some(x.cmp(y)),
         (DateTime(x), DateTime(y)) => Some(x.cmp(y)),
         (ObjectId(x), ObjectId(y)) => Some(x.bytes().cmp(&y.bytes())),
         (Null, Null) => Some(Ordering::Equal),
+        (Document(x), Document(y)) => (x.len() == y.len()
+            && x.iter()
+                .zip(y)
+                .all(|((kx, vx), (ky, vy))| kx == ky && equal(vx, vy)))
+        .then_some(Ordering::Equal),
+        (Array(x), Array(y)) => (x.len() == y.len()
+            && x.iter().zip(y).all(|(vx, vy)| equal(vx, vy)))
+        .then_some(Ordering::Equal),
         _ if a == b => Some(Ordering::Equal),
         _ => None,
     }
+}
+
+fn equal(a: &Bson, b: &Bson) -> bool {
+    compare(a, b) == Some(Ordering::Equal)
 }
 
 fn as_i64(v: &Bson) -> Option<i64> {
@@ -222,23 +250,39 @@ fn as_i64(v: &Bson) -> Option<i64> {
     }
 }
 
-fn as_f64(v: &Bson) -> Option<f64> {
-    match v {
-        Bson::Int32(n) => Some(f64::from(*n)),
-        Bson::Int64(n) => Some(*n as f64),
-        Bson::Double(n) => Some(*n),
-        _ => None,
+/// 2⁶³ as a double, which is exact. Every i64 lies in [-2⁶³, 2⁶³), so a
+/// double in that range has a whole part that converts to i64 exactly.
+pub(crate) const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+
+/// Compare an integer with a double without converting the integer, which
+/// would round integers above 2⁵³ and make equality non-transitive.
+fn cmp_int_double(i: i64, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
     }
+    if f >= TWO_63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_63 {
+        return Some(Ordering::Greater);
+    }
+    // In range, so the whole part converts to i64 exactly.
+    let whole = f.trunc();
+    Some(i.cmp(&(whole as i64)).then_with(|| {
+        // Same whole part: the fraction decides.
+        0.0f64.partial_cmp(&(f - whole)).expect("finite")
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use bson::doc;
+    use proptest::prelude::*;
 
     use super::*;
 
     fn matches(filter: Document, doc: Document) -> bool {
-        Filter::parse(&filter).unwrap().matches(&doc)
+        Filter::parse(&filter).unwrap().matches(&doc).unwrap()
     }
 
     #[test]
@@ -249,6 +293,26 @@ mod tests {
             "numbers compare across types"
         );
         assert!(!matches(doc! { "a": 1 }, doc! { "a": "1" }));
+        assert!(
+            matches(doc! { "a": { "b": 1 } }, doc! { "a": { "b": 1i64 } }),
+            "numbers compare across types inside documents"
+        );
+        assert!(
+            matches(doc! { "a": [1, [2]] }, doc! { "a": [1.0, [2i64]] }),
+            "and inside arrays"
+        );
+        assert!(
+            !matches(
+                doc! { "a": { "b": 1, "c": 2 } },
+                doc! { "a": { "c": 2, "b": 1 } }
+            ),
+            "key order matters"
+        );
+        assert!(!matches(doc! { "a": [1] }, doc! { "a": [1, 2] }));
+        assert!(!matches(
+            doc! { "a": { "b": 1 } },
+            doc! { "a": { "b": 1, "c": 2 } }
+        ));
         assert!(
             matches(doc! { "a": null }, doc! { "b": 1 }),
             "missing equals null"
@@ -261,6 +325,56 @@ mod tests {
             matches(doc! {}, doc! { "x": 1 }),
             "empty filter matches everything"
         );
+    }
+
+    #[test]
+    fn integers_and_doubles_compare_exactly() {
+        let big = 9_007_199_254_740_993i64; // 2⁵³ + 1, not a double
+        let near = 9_007_199_254_740_992.0f64; // 2⁵³
+        assert!(
+            !matches(doc! { "a": near }, doc! { "a": big }),
+            "2⁵³ + 1 is not 2⁵³"
+        );
+        assert!(matches(doc! { "a": { "$gt": near } }, doc! { "a": big }));
+        assert!(matches(doc! { "a": near }, doc! { "a": big - 1 }));
+        assert!(matches(doc! { "a": { "$lt": 3.5 } }, doc! { "a": 3 }));
+        assert!(matches(doc! { "a": { "$gt": -3.5 } }, doc! { "a": -3 }));
+        assert!(matches(doc! { "a": { "$lt": -3.5 } }, doc! { "a": -4 }));
+        assert!(matches(doc! { "a": -0.0 }, doc! { "a": 0 }));
+        assert!(matches(
+            doc! { "a": { "$lt": 1e300 } },
+            doc! { "a": i64::MAX }
+        ));
+        assert!(matches(
+            doc! { "a": { "$gt": f64::NEG_INFINITY } },
+            doc! { "a": i64::MIN }
+        ));
+        // The edges of the i64 range, where casting the double would saturate.
+        assert!(matches(
+            doc! { "a": { "$lt": TWO_63 } },
+            doc! { "a": i64::MAX }
+        ));
+        assert!(matches(doc! { "a": -TWO_63 }, doc! { "a": i64::MIN }));
+        assert!(
+            !matches(doc! { "a": f64::NAN }, doc! { "a": f64::NAN }),
+            "NaN equals nothing"
+        );
+        assert!(!matches(doc! { "a": { "$lt": f64::NAN } }, doc! { "a": 1 }));
+    }
+
+    proptest! {
+        #[test]
+        fn int_double_order_agrees_with_exact_arithmetic(i: i64, f in prop::num::f64::NORMAL | prop::num::f64::ZERO) {
+            // An i128 holds every i64 and every integral double in range exactly.
+            let exact = if f.fract() == 0.0 && f.abs() < 1e38 {
+                Some((i as i128).cmp(&(f as i128)))
+            } else {
+                None
+            };
+            if let Some(want) = exact {
+                prop_assert_eq!(cmp_int_double(i, f), Some(want));
+            }
+        }
     }
 
     #[test]

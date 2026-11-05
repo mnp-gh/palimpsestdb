@@ -8,6 +8,10 @@
 //! crash: simulated power loss on a [`SimDisk`], which drops unsynced bytes,
 //! and killing a real child process, which exercises the real filesystem.
 
+mod common;
+
+use common::{collection, open};
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -16,7 +20,7 @@ use std::process::{Command, Stdio};
 use bson::{Bson, doc};
 use proptest::prelude::*;
 use psdb_core::wal::SimDisk;
-use psdb_core::{Limits, Node, Transaction};
+use psdb_core::{Node, Transaction};
 use psdb_storage_memory::MemoryEngine;
 
 /// What a Node holds: whether `shop` exists, and `shop.orders` as
@@ -35,10 +39,6 @@ type Op = (i32, Option<i32>);
 /// how many commits survived.
 const SEQUENCE_ID: i32 = -1;
 
-fn open(disk: &SimDisk) -> psdb_core::Result<Node<MemoryEngine>> {
-    Node::open_with(MemoryEngine::new(), disk.file(), Limits::default())
-}
-
 fn state(node: &Node<MemoryEngine>) -> State {
     let shop = node
         .list_namespaces()
@@ -50,7 +50,7 @@ fn state(node: &Node<MemoryEngine>) -> State {
             .unwrap()
             .contains(&"orders".to_string());
     let orders = has_orders.then(|| {
-        node.find("shop", "orders", &doc! {})
+        node.find(&collection("shop.orders"), &doc! {})
             .unwrap()
             .into_iter()
             .map(|d| (d.get_i32("_id").unwrap(), d.get_i32("v").unwrap()))
@@ -61,8 +61,12 @@ fn state(node: &Node<MemoryEngine>) -> State {
 
 /// Set `_id` to `v` in `shop.orders`, inserting or replacing.
 fn upsert(t: &mut Transaction<'_, MemoryEngine>, id: i32, v: i32) -> psdb_core::Result<()> {
-    if !t.replace("shop", "orders", &Bson::Int32(id), doc! { "v": v })? {
-        t.insert("shop", "orders", doc! { "_id": id, "v": v })?;
+    if !t.replace(
+        &collection("shop.orders"),
+        &Bson::Int32(id),
+        doc! { "v": v },
+    )? {
+        t.insert(&collection("shop.orders"), doc! { "_id": id, "v": v })?;
     }
     Ok(())
 }
@@ -75,7 +79,7 @@ fn run(node: &Node<MemoryEngine>, sequence: i32, txn: &[Op]) -> psdb_core::Resul
         match value {
             Some(v) => upsert(&mut t, id, v)?,
             None => {
-                t.delete("shop", "orders", &Bson::Int32(id))?;
+                t.delete(&collection("shop.orders"), &Bson::Int32(id))?;
             }
         }
     }
@@ -121,7 +125,7 @@ proptest! {
         if let Ok(node) = open(&disk) {
             let setup: [&dyn Fn() -> psdb_core::Result<()>; 2] = [
                 &|| node.create_namespace("shop"),
-                &|| node.create_collection("shop", "orders"),
+                &|| node.create_collection(&collection("shop.orders")),
             ];
             let commits = setup
                 .iter()
@@ -151,7 +155,7 @@ proptest! {
         let node = open(&disk).unwrap();
         prop_assert_eq!(state(&node), recovered.clone());
         if recovered.orders.is_some() {
-            node.insert("shop", "orders", doc! { "_id": 99, "v": 0 }).unwrap();
+            node.insert(&collection("shop.orders"), doc! { "_id": 99, "v": 0 }).unwrap();
             drop(node);
             let orders = state(&open(&disk).unwrap()).orders.unwrap();
             prop_assert_eq!(orders.get(&99).copied(), Some(0));
@@ -172,10 +176,10 @@ fn kill_child() {
     };
     let node = Node::open(MemoryEngine::new(), dir).unwrap();
     node.create_namespace("shop").unwrap();
-    node.create_collection("shop", "orders").unwrap();
+    node.create_collection(&collection("shop.orders")).unwrap();
     let mut out = std::io::stdout().lock();
     for id in 0.. {
-        node.insert("shop", "orders", doc! { "_id": id, "v": 0 })
+        node.insert(&collection("shop.orders"), doc! { "_id": id, "v": 0 })
             .unwrap();
         writeln!(out, "acknowledged {id}").unwrap();
         out.flush().unwrap();
