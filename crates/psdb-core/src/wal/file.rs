@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 /// The one file the WAL lives in, and the directory that holds it.
 ///
 /// The WAL does all its I/O through this trait so tests can substitute
-/// [`SimDisk`](super::SimDisk), which simulates power loss.
+/// `SimDisk` (feature `testing`), which simulates power loss.
 ///
 /// Contract:
 ///

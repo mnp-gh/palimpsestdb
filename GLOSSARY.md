@@ -37,7 +37,7 @@ The optional declarations a Collection makes about its fields; for now, each fie
 _Avoid_: Index schema, validator
 
 **Field path**:
-The dotted path to a field inside a Document, such as `address.city`: each segment names a field of the embedded document before it. The Collection Schema declares fields, and Indexes cover them, by Field path. A Field path is never `_id` or under it, because Documents are already keyed by `_id`.
+The dotted path to a field inside a Document, such as `address.city`: each segment names a field of the embedded document before it. Filters compare fields, the Collection Schema declares them, and Indexes cover them, by Field path. The Collection Schema never declares `_id` or a field under it, so no Index covers one, because Documents are already keyed by `_id`.
 _Avoid_: Column, key path
 
 **Field Type**:

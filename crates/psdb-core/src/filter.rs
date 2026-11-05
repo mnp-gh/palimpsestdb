@@ -17,9 +17,11 @@ use bson::{Bson, Document, RawDocument, RawDocumentBuf};
 
 use crate::document::lookup_raw;
 use crate::error::{Error, Result};
+use crate::field_path::FieldPath;
 
 /// A parsed filter.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Filter {
     /// Every sub-filter matches. An empty `And` matches everything.
     And(Vec<Filter>),
@@ -27,8 +29,8 @@ pub enum Filter {
     Or(Vec<Filter>),
     /// The value at `path` compares to `value` as `op` requires.
     Compare {
-        /// The field path, split on `.`.
-        path: Vec<String>,
+        /// The field compared.
+        path: FieldPath,
         /// The comparison.
         op: CompareOp,
         /// The value compared against.
@@ -144,14 +146,11 @@ fn parse_list(op: &str, value: &Bson) -> Result<Vec<Filter>> {
 }
 
 fn parse_field(path: &str, value: &Bson) -> Result<Vec<Filter>> {
-    let segments: Vec<String> = path.split('.').map(str::to_owned).collect();
-    if segments.iter().any(String::is_empty) {
-        return Err(Error::InvalidFilter(format!(
-            "empty segment in path {path:?}"
-        )));
-    }
+    let path: FieldPath = path
+        .parse()
+        .map_err(|_| Error::InvalidFilter(format!("{path:?} is not a field path")))?;
     let compare = |op, value: &Bson| Filter::Compare {
-        path: segments.clone(),
+        path: path.clone(),
         op,
         value: value.clone(),
     };

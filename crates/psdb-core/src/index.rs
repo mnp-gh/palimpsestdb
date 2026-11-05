@@ -47,7 +47,8 @@ const BUILD_CHUNK_DOCUMENTS: usize = 1024;
 /// ...and of at most this many bytes of Documents, so neither its memory
 /// nor its WAL Record grows with Document size. A chunk always holds at
 /// least one Document, so one larger than this, allowed by raising
-/// [`Limits::max_document_bytes`], is a chunk of its own.
+/// [`Limits::max_document_bytes`](crate::Limits::max_document_bytes), is a
+/// chunk of its own.
 const BUILD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// An Index as clients see it.
@@ -145,14 +146,14 @@ pub(crate) fn plan(filter: &Filter, collection: &CollectionEntry) -> Option<Vec<
     let mut comparisons = Vec::new();
     let mut ors = Vec::new();
     collect_conjuncts(filter, &mut comparisons, &mut ors);
-    let candidates: Vec<(String, bool, CandidateRange)> = comparisons
+    let candidates: Vec<(&FieldPath, bool, CandidateRange)> = comparisons
         .into_iter()
         .filter_map(|(path, op, value)| {
-            let range = if path == "_id" {
+            let range = if path.as_str() == "_id" {
                 let base = collection.prefix();
                 CandidateRange::Documents(bounds(base, id_type(value)?, op, value)?)
             } else {
-                let index = collection.index_on(&path)?;
+                let index = collection.index_on(path)?;
                 let ty = collection.schema.get(&index.path)?.field_type;
                 CandidateRange::Index(bounds(collection.index_prefix(index), ty, op, value)?)
             };
@@ -161,7 +162,7 @@ pub(crate) fn plan(filter: &Filter, collection: &CollectionEntry) -> Option<Vec<
         .collect();
     let equality = candidates
         .iter()
-        .find(|(path, eq, _)| *eq && path == "_id")
+        .find(|(path, eq, _)| *eq && path.as_str() == "_id")
         .or_else(|| candidates.iter().find(|(_, eq, _)| *eq));
     if equality.is_none() {
         let union = ors.iter().find_map(|branches| {
@@ -179,12 +180,7 @@ pub(crate) fn plan(filter: &Filter, collection: &CollectionEntry) -> Option<Vec<
     for (path, _, other) in &candidates {
         if *path == chosen {
             let (CandidateRange::Index(other) | CandidateRange::Documents(other)) = other;
-            if other.start > range.start {
-                range.start = other.start.clone();
-            }
-            if other.end < range.end {
-                range.end = other.end.clone();
-            }
+            *range = range.intersect(other);
         }
     }
     Some(vec![candidate])
@@ -202,17 +198,17 @@ fn id_type(value: &Bson) -> Option<FieldType> {
 }
 
 /// Every comparison and every `$or` that must hold for `filter` to match:
-/// comparisons as (dotted path, operator, value), `$or`s as their branches.
+/// comparisons as (Field path, operator, value), `$or`s as their branches.
 fn collect_conjuncts<'f>(
     filter: &'f Filter,
-    comparisons: &mut Vec<(String, CompareOp, &'f Bson)>,
+    comparisons: &mut Vec<(&'f FieldPath, CompareOp, &'f Bson)>,
     ors: &mut Vec<&'f [Filter]>,
 ) {
     match filter {
         Filter::And(fs) => fs
             .iter()
             .for_each(|f| collect_conjuncts(f, comparisons, ors)),
-        Filter::Compare { path, op, value } => comparisons.push((path.join("."), *op, value)),
+        Filter::Compare { path, op, value } => comparisons.push((path, *op, value)),
         Filter::Or(branches) => ors.push(branches),
     }
 }
@@ -243,10 +239,9 @@ fn bounds(base: Vec<u8>, ty: FieldType, op: CompareOp, value: &Bson) -> Option<K
 }
 
 impl CollectionEntry {
-    /// The Index on the field at `path`, which may come from a filter and
-    /// so is not always a valid Field path.
-    pub(crate) fn index_on(&self, path: &str) -> Option<&IndexDef> {
-        self.indexes.iter().find(|ix| ix.path.as_str() == path)
+    /// The Index on the field at `path`.
+    pub(crate) fn index_on(&self, path: &FieldPath) -> Option<&IndexDef> {
+        self.indexes.iter().find(|ix| ix.path == *path)
     }
 
     /// The prefix of every entry in `index`.
@@ -263,7 +258,7 @@ impl CollectionEntry {
         doc_id: &[u8],
     ) -> Result<Option<IndexEntry>> {
         let ty = self.schema[&index.path].field_type;
-        let value = lookup_raw(doc, &index.path.segments())?;
+        let value = lookup_raw(doc, &index.path)?;
         Ok(key_component(value.as_ref(), ty)
             .map(|component| IndexEntry::new(self.index_prefix(index), index, &component, doc_id)))
     }
@@ -278,7 +273,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// Documents: use [`Node::create_index`](crate::Node::create_index),
     /// which builds the Index on its own. A Document committed concurrently
     /// makes this Transaction abort with Collection Changed.
-    pub fn create_index(
+    pub fn create_index_on_empty(
         &mut self,
         collection: &CollectionPath,
         path: &FieldPath,
@@ -288,7 +283,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         if self.any_live_in(&entry.documents())? {
             return Err(Error::CollectionNotEmpty(collection.clone()));
         }
-        self.collection_reads.insert(entry.prefix());
+        self.depend_on_whole_collection(entry.prefix());
         entry.indexes.push(index);
         self.write_collection_entry(&entry)
     }
@@ -308,7 +303,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
                 "declare the type of {path} in the collection schema before indexing it"
             )));
         };
-        if entry.index_on(path.as_str()).is_some() {
+        if entry.index_on(path).is_some() {
             return Err(Error::IndexExists {
                 collection: collection.clone(),
                 path: path.clone(),
@@ -381,7 +376,7 @@ impl<E: StorageEngine> Node<E> {
     /// use psdb_core::{Node, FieldSchema, FieldType};
     /// use psdb_storage_memory::MemoryEngine;
     ///
-    /// let node = Node::new(MemoryEngine::new());
+    /// let node = Node::new(MemoryEngine::new())?;
     /// node.create_namespace("shop")?;
     /// let orders = "shop.orders".parse()?;
     /// node.create_collection(&orders)?;

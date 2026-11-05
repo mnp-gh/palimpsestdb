@@ -223,7 +223,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         let value = self
             .read(&key)?
             .ok_or_else(|| Error::NoSuchNamespace(name.to_owned()))?;
-        self.catalog_reads.insert(key);
+        self.depend_on_catalog_entry(key);
         entry_id(&value)
     }
 
@@ -246,7 +246,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
         let value = self
             .read(&key)?
             .ok_or_else(|| Error::NoSuchCollection(collection.clone()))?;
-        self.catalog_reads.insert(key);
+        self.depend_on_catalog_entry(key);
         CollectionEntry::decode(ns_id, &value)
     }
 
@@ -296,9 +296,7 @@ fn pick_unused(
             return Ok(id);
         }
     }
-    Err(Error::Corruption(format!(
-        "no unused catalog ID in {ATTEMPTS} random draws"
-    )))
+    Err(Error::IdsExhausted)
 }
 
 /// A random 32-bit ID.
@@ -345,7 +343,7 @@ mod tests {
 
     #[test]
     fn id_of_an_empty_namespace_is_in_use() {
-        let node = Node::new(MemoryEngine::new());
+        let node = Node::new(MemoryEngine::new()).unwrap();
         node.create_namespace("shop").unwrap();
         let mut txn = node.begin();
         let taken = txn.resolve_namespace("shop").unwrap();
@@ -354,7 +352,7 @@ mod tests {
 
     #[test]
     fn id_of_an_empty_collection_is_in_use() {
-        let node = Node::new(MemoryEngine::new());
+        let node = Node::new(MemoryEngine::new()).unwrap();
         node.create_namespace("shop").unwrap();
         let orders = "shop.orders".parse().unwrap();
         node.create_collection(&orders).unwrap();
@@ -365,7 +363,7 @@ mod tests {
 
     #[test]
     fn index_ids_are_counted_per_collection_and_never_reused() {
-        let node = Node::new(MemoryEngine::new());
+        let node = Node::new(MemoryEngine::new()).unwrap();
         node.create_namespace("shop").unwrap();
         let orders = "shop.orders".parse().unwrap();
         node.create_collection(&orders).unwrap();
@@ -389,7 +387,7 @@ mod tests {
 
     #[test]
     fn concurrent_draws_of_one_id_conflict() {
-        let node = Node::new(MemoryEngine::new());
+        let node = Node::new(MemoryEngine::new()).unwrap();
         let (mut t1, mut t2) = (node.begin(), node.begin());
         t1.allocate_id_from([7], None).unwrap();
         t2.allocate_id_from([7], None).unwrap();
@@ -405,6 +403,9 @@ mod tests {
 
     #[test]
     fn pick_unused_gives_up_eventually() {
-        assert!(pick_unused(std::iter::repeat(5), |_| Ok(true)).is_err());
+        assert!(matches!(
+            pick_unused(std::iter::repeat(5), |_| Ok(true)),
+            Err(Error::IdsExhausted)
+        ));
     }
 }

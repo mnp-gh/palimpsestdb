@@ -33,7 +33,7 @@ Single-field secondary Indexes, typed by a Collection Schema, kept consistent wi
 ## Building
 
 - `Node::create_index` holds the commit lock, reads the Collection at its Snapshot in chunks of at most 1024 Documents or 16 MiB of Documents, whichever comes first, and commits each chunk's entries as an ordinary fsynced commit. A final commit adds the Index to the Catalog entry. A duplicate in a unique build fails with Duplicate Value; committed chunks stay as orphans.
-- `Transaction::create_index` works only on a Collection that is empty in the Transaction's view, as an ordinary Catalog write; otherwise it fails with Collection Not Empty, checked before anything is written so a refusal writes nothing. A Document committed concurrently makes it abort with Collection Changed.
+- `Transaction::create_index_on_empty` works only on a Collection that is empty in the Transaction's view, as an ordinary Catalog write; otherwise it fails with Collection Not Empty, checked before anything is written so a refusal writes nothing. A Document committed concurrently makes it abort with Collection Changed.
 
 ## Queries
 

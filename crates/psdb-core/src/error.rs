@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use bson::Bson;
 use psdb_storage::StorageError;
 
 use crate::collection_path::CollectionPath;
@@ -11,7 +12,11 @@ use crate::field_path::FieldPath;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Everything that can go wrong in the Database Layer.
+///
+/// New kinds of failure arrive with new features, so a `match` on it needs
+/// a `_` arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Abort: a concurrent Transaction committed a write to the same key
     /// first (first-committer-wins). Retryable.
@@ -29,7 +34,7 @@ pub enum Error {
     /// A Collection with this name already exists in the Namespace.
     CollectionExists(CollectionPath),
     /// A Document with this Document ID already exists in the Collection.
-    DuplicateId(String),
+    DuplicateId(Bson),
     /// Duplicate Value: the write would give two Documents the same value
     /// in a unique Index. Not an Abort, and not retryable.
     DuplicateValue(String),
@@ -68,9 +73,14 @@ pub enum Error {
     InvalidFilter(String),
     /// Stored data could not be decoded.
     Corruption(String),
+    /// No unused Namespace or Collection ID turned up in a bounded number
+    /// of random draws (ADR 0006): almost every ID has been used.
+    IdsExhausted,
     /// The Storage Engine failed.
     Storage(StorageError),
-    /// Reading or writing the WAL failed while opening a Node.
+    /// Reading or writing the WAL failed. While opening a Node this is
+    /// returned as is; during a commit it is the cause inside
+    /// [`Error::CommitOutcomeUnknown`].
     Io(std::io::Error),
     /// The WAL file has the wrong magic number or an unknown format
     /// version. It was left untouched.
@@ -80,8 +90,11 @@ pub enum Error {
     /// (the write is not made), or the WAL Record would exceed 4 GiB
     /// (nothing is committed). Not an Abort, and not retryable.
     TransactionTooLarge,
-    /// [`Node::open`](crate::Node::open) was given an engine that
-    /// already holds data; the WAL is replayed into an empty engine.
+    /// A Node was opened over an engine that already holds data. Every
+    /// way of opening one starts from an empty engine: [`Node::open`]
+    /// replays its WAL into it.
+    ///
+    /// [`Node::open`]: crate::Node::open
     EngineNotEmpty,
     /// The commit could not be confirmed Durable, or was Durable but could
     /// not be Applied: the Transaction may or may not be present after the
@@ -142,6 +155,9 @@ impl fmt::Display for Error {
             Error::InvalidDocument(msg) => write!(f, "invalid document: {msg}"),
             Error::InvalidFilter(msg) => write!(f, "invalid filter: {msg}"),
             Error::Corruption(msg) => write!(f, "corrupted data: {msg}"),
+            Error::IdsExhausted => f.write_str(
+                "no unused namespace or collection ID found; almost every ID has been used",
+            ),
             Error::Storage(e) => write!(f, "{e}"),
             Error::Io(e) => write!(f, "WAL I/O error: {e}"),
             Error::UnrecognisedWal(msg) => write!(f, "unrecognised WAL: {msg}"),
@@ -149,7 +165,7 @@ impl fmt::Display for Error {
                 "transaction too large: its write set would exceed the configured limit or its WAL record 4 GiB",
             ),
             Error::EngineNotEmpty => {
-                f.write_str("the storage engine already holds data; open a WAL into an empty engine")
+                f.write_str("the storage engine already holds data; open a node over an empty engine")
             }
             Error::CommitOutcomeUnknown(cause) => write!(
                 f,

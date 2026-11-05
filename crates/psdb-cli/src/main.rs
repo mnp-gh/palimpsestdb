@@ -69,15 +69,19 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let (node, mode) = match &data_dir {
-        Some(dir) => match Node::open(MemoryEngine::new(), dir) {
-            Ok(node) => (node, format!("data in {}", dir.display())),
-            Err(e) => {
-                eprintln!("error: opening {}: {e}", dir.display());
-                std::process::exit(1);
-            }
-        },
+    let (opened, mode) = match &data_dir {
+        Some(dir) => (
+            Node::open(MemoryEngine::new(), dir),
+            format!("data in {}", dir.display()),
+        ),
         None => (Node::new(MemoryEngine::new()), "in-memory".to_string()),
+    };
+    let node = match opened {
+        Ok(node) => node,
+        Err(e) => {
+            eprintln!("error: opening ({mode}): {e}");
+            std::process::exit(1);
+        }
     };
     let mut txn: Option<Txn<'_>> = None;
     let mut input = Input::open();
@@ -308,7 +312,7 @@ fn execute<'node>(
             };
             let path = field_path(path)?;
             match txn {
-                Some(open) => open.create_index(&coll, &path, unique),
+                Some(open) => open.create_index_on_empty(&coll, &path, unique),
                 // Builds from existing Documents, committing on its own.
                 None => node.create_index(&coll, &path, unique),
             }

@@ -28,7 +28,7 @@ use crate::wal::{self, OsWalFile, Wal, WalFile};
 /// use psdb_core::Node;
 /// use psdb_storage_memory::MemoryEngine;
 ///
-/// let node = Node::new(MemoryEngine::new());
+/// let node = Node::new(MemoryEngine::new())?;
 /// node.create_namespace("shop")?;
 /// let orders = "shop.orders".parse()?;
 /// node.create_collection(&orders)?;
@@ -56,15 +56,20 @@ pub(crate) struct CommitState {
 
 impl<E: StorageEngine> Node<E> {
     /// Open over an empty engine with default [`Limits`], keeping nothing
-    /// durable.
-    pub fn new(engine: E) -> Self {
+    /// durable. Fails with [`Error::EngineNotEmpty`] if the engine holds
+    /// data: its Versions would clash with the Commit Timestamps this Node
+    /// gives out, which start again from the beginning.
+    pub fn new(engine: E) -> Result<Self> {
         Self::with_limits(engine, Limits::default())
     }
 
     /// Open over an empty engine with custom [`Limits`], keeping nothing
-    /// durable.
-    pub fn with_limits(engine: E, limits: Limits) -> Self {
-        Self::from_parts(engine, limits, 0, None)
+    /// durable. Fails as [`new`](Self::new) does.
+    pub fn with_limits(engine: E, limits: Limits) -> Result<Self> {
+        if mvcc::any_version_under(&engine, &[])? {
+            return Err(Error::EngineNotEmpty);
+        }
+        Ok(Self::from_parts(engine, limits, 0, None))
     }
 
     /// Open a durable Node whose WAL lives in `dir`, creating `dir` and
@@ -91,8 +96,8 @@ impl<E: StorageEngine> Node<E> {
         Self::open_with(engine, OsWalFile::open(dir)?, Limits::default())
     }
 
-    /// Open a durable Node over any [`WalFile`], such as a
-    /// [`SimDisk`](crate::wal::SimDisk) file in tests, and replay it into
+    /// Open a durable Node over any [`WalFile`], such as a `SimDisk` file
+    /// in tests (feature `testing`), and replay it into
     /// `engine`, which must be empty.
     ///
     /// Fails with [`Error::EngineNotEmpty`], [`Error::UnrecognisedWal`] or

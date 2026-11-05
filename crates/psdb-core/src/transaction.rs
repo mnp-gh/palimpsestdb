@@ -37,20 +37,21 @@ pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
 /// Dropping a Transaction without committing aborts it.
 pub struct Transaction<'node, E: StorageEngine> {
     pub(crate) node: &'node Node<E>,
-    pub(crate) snapshot_ts: u64,
+    snapshot_ts: u64,
     /// Logical key → new value (`None` deletes). Ordered so scans can
     /// overlay it on the Snapshot.
-    pub(crate) write_set: WriteSet,
+    write_set: WriteSet,
     /// Bytes of every key and value in the Write Set, checked against
     /// [`Limits::max_write_set_bytes`](crate::Limits::max_write_set_bytes).
     write_set_bytes: usize,
     /// Catalog entries this Transaction depended on; checked at commit
-    /// (ADR 0006).
-    pub(crate) catalog_reads: BTreeSet<Vec<u8>>,
+    /// (ADR 0006). Added only through
+    /// [`depend_on_catalog_entry`](Self::depend_on_catalog_entry).
+    catalog_reads: BTreeSet<Vec<u8>>,
     /// Collections whose every Document a schema change or Index creation
-    /// depended on (by key prefix). Any Document committed into one since
-    /// the Snapshot makes the commit abort with Collection Changed.
-    pub(crate) collection_reads: BTreeSet<Vec<u8>>,
+    /// depended on (by key prefix). Added only through
+    /// [`depend_on_whole_collection`](Self::depend_on_whole_collection).
+    collection_reads: BTreeSet<Vec<u8>>,
 }
 
 impl<'node, E: StorageEngine> Transaction<'node, E> {
@@ -68,6 +69,20 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// The Commit Timestamp this Transaction's Snapshot was taken at.
     pub fn snapshot_ts(&self) -> u64 {
         self.snapshot_ts
+    }
+
+    /// Record that this Transaction used the Catalog entry at `key`, so the
+    /// commit aborts with Collection Changed if another commit changes it
+    /// after the Snapshot (ADR 0006).
+    pub(crate) fn depend_on_catalog_entry(&mut self, key: Vec<u8>) {
+        self.catalog_reads.insert(key);
+    }
+
+    /// Record that this Transaction relied on every Document under
+    /// `prefix`, so the commit aborts with Collection Changed if any
+    /// Document there is committed after the Snapshot.
+    pub(crate) fn depend_on_whole_collection(&mut self, prefix: Vec<u8>) {
+        self.collection_reads.insert(prefix);
     }
 
     /// Read a logical key: own writes first, then the Snapshot.
@@ -163,7 +178,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         let (id, bytes) = document::prepare(doc, None, &self.node.limits)?;
         let key = keys::document_key(entry.namespace_id, entry.id, &id)?;
         if self.read(&key)?.is_some() {
-            return Err(Error::DuplicateId(id.to_string()));
+            return Err(Error::DuplicateId(id));
         }
         self.write_document(&entry, key, None, Some(bytes))?;
         Ok(id)

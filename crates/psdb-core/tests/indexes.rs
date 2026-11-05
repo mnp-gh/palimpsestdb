@@ -11,7 +11,7 @@ use bson::{Binary, Bson, DateTime, Document, doc};
 use proptest::prelude::*;
 use psdb_core::wal::SimDisk;
 use psdb_core::{
-    CollectionPath, Error, FieldPath, FieldSchema, FieldType, IndexInfo, Limits, Node, Transaction,
+    CollectionPath, Error, FieldSchema, FieldType, IndexInfo, Limits, Node, Transaction,
 };
 use psdb_storage_memory::MemoryEngine;
 
@@ -640,11 +640,20 @@ fn schema_rules_around_indexes() {
     ));
     node.remove_field_type(&collection("shop.orders"), &field_path("n"))
         .unwrap();
-    // `_id` is never declared: it cannot even be made into a Field path.
-    assert!(matches!(
-        "_id".parse::<FieldPath>(),
-        Err(Error::InvalidSchema(_))
-    ));
+    // `_id` is never declared, so it is never indexed either.
+    for path in ["_id", "_id.x"] {
+        assert!(
+            matches!(
+                node.set_field_type(
+                    &collection("shop.orders"),
+                    &field_path(path),
+                    field(FieldType::Int, false)
+                ),
+                Err(Error::InvalidSchema(_))
+            ),
+            "{path}"
+        );
+    }
 }
 
 #[test]
@@ -660,7 +669,7 @@ fn index_inside_a_transaction_needs_an_empty_collection() {
         .unwrap();
     let mut txn = node.begin();
     assert!(matches!(
-        txn.create_index(&collection("shop.orders"), &field_path("n"), false),
+        txn.create_index_on_empty(&collection("shop.orders"), &field_path("n"), false),
         Err(Error::CollectionNotEmpty { .. })
     ));
     drop(txn);
@@ -673,7 +682,7 @@ fn index_inside_a_transaction_needs_an_empty_collection() {
             &field_path("age"),
             field(FieldType::Int, false),
         )?;
-        t.create_index(&collection("shop.users"), &field_path("age"), false)?;
+        t.create_index_on_empty(&collection("shop.users"), &field_path("age"), false)?;
         t.insert(&collection("shop.users"), doc! { "_id": 1, "age": 40 })
     })
     .unwrap();
@@ -695,7 +704,7 @@ fn concurrent_insert_aborts_an_index_created_on_an_empty_collection() {
     )
     .unwrap();
     let mut txn = node.begin();
-    txn.create_index(&collection("shop.orders"), &field_path("n"), false)
+    txn.create_index_on_empty(&collection("shop.orders"), &field_path("n"), false)
         .unwrap();
     node.insert(&collection("shop.orders"), doc! { "n": 1 })
         .unwrap();
@@ -803,11 +812,8 @@ fn built_index_survives_reopen() {
 
 #[test]
 fn write_set_cap_fails_the_write_that_crosses_it() {
-    let limits = Limits {
-        max_write_set_bytes: 2000,
-        ..Limits::default()
-    };
-    let node = Node::with_limits(MemoryEngine::new(), limits);
+    let limits = Limits::default().with_max_write_set_bytes(2000);
+    let node = Node::with_limits(MemoryEngine::new(), limits).unwrap();
     node.create_namespace("d").unwrap();
     node.create_collection(&collection("d.c")).unwrap();
     let mut txn = node.begin();
@@ -892,7 +898,7 @@ fn refused_index_in_a_transaction_writes_nothing() {
     let mut txn = node.begin();
     let snapshot = txn.snapshot_ts();
     assert!(matches!(
-        txn.create_index(&collection("shop.orders"), &field_path("n"), false),
+        txn.create_index_on_empty(&collection("shop.orders"), &field_path("n"), false),
         Err(Error::CollectionNotEmpty { .. })
     ));
     // Still read-only: committing returns the Snapshot, not a new timestamp.
@@ -912,7 +918,7 @@ fn deleting_the_last_document_lets_a_transaction_create_an_index() {
         .unwrap();
     node.run(|t| {
         t.delete(&collection("shop.orders"), &Bson::Int32(1))?;
-        t.create_index(&collection("shop.orders"), &field_path("n"), false)
+        t.create_index_on_empty(&collection("shop.orders"), &field_path("n"), false)
     })
     .unwrap();
 }
@@ -948,7 +954,7 @@ fn orphaned_index_entries_do_not_make_a_collection_look_non_empty() {
             .unwrap()
             .is_empty()
     );
-    node.run(|t| t.create_index(&collection("shop.orders"), &field_path("n"), true))
+    node.run(|t| t.create_index_on_empty(&collection("shop.orders"), &field_path("n"), true))
         .unwrap();
 }
 

@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 repository.workspace = true
 
+[features]
+# Public test support: `wal::SimDisk` and `wal::conformance`.
+testing = []
+
 [dependencies]
 psdb-storage.workspace = true
 bson.workspace = true
@@ -13,6 +17,8 @@ getrandom.workspace = true
 crc32c.workspace = true
 
 [dev-dependencies]
+# Turns on `testing` for this crate's own integration tests and doc tests.
+psdb-core = { path = ".", features = ["testing"] }
 psdb-storage-memory.workspace = true
 proptest.workspace = true
 
