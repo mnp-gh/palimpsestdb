@@ -343,14 +343,13 @@ impl<E: StorageEngine> Transaction<'_, E> {
         path: &str,
         unique: bool,
     ) -> Result<()> {
-        let (db_id, entry) = self.collection_entry(database, collection)?;
+        let (db_id, mut entry, index) = self.prepare_index(database, collection, path, unique)?;
         if self.any_live_in(&keys::documents_range(db_id, entry.id))? {
             return Err(Error::CollectionNotEmpty {
                 database: database.to_owned(),
                 collection: collection.to_owned(),
             });
         }
-        let (db_id, mut entry, index) = self.prepare_index(database, collection, path, unique)?;
         self.collection_reads
             .insert(keys::collection_prefix(db_id, entry.id));
         entry.indexes.push(index);
@@ -441,10 +440,8 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// The first of `candidates` whose ID key was never written, at any
-    /// timestamp, and under which no data exists, such as Index entries
-    /// left by a build that never committed. Writes the ID key, so a
-    /// concurrent Transaction that draws the same ID fails to commit with a
-    /// Write Conflict.
+    /// timestamp. Writes the ID key, so a concurrent Transaction that draws
+    /// the same ID fails to commit with a Write Conflict.
     fn allocate_id_from(
         &mut self,
         candidates: impl IntoIterator<Item = u32>,
@@ -454,14 +451,8 @@ impl<E: StorageEngine> Transaction<'_, E> {
             None => keys::database_id_key(id),
             Some(db_id) => keys::collection_id_key(db_id, id),
         };
-        let data_prefix = |id: u32| match database {
-            None => id.to_be_bytes().to_vec(),
-            Some(db_id) => keys::collection_prefix(db_id, id),
-        };
-        let engine = &self.db.engine;
         let id = pick_unused(candidates, |id| {
-            Ok(mvcc::any_version_under(engine, &id_key(id))?
-                || mvcc::any_version_under(engine, &data_prefix(id))?)
+            mvcc::any_version_under(&self.db.engine, &id_key(id))
         })?;
         self.write(id_key(id), Some(Vec::new()))?;
         Ok(id)

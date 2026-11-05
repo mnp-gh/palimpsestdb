@@ -113,14 +113,6 @@ pub(crate) enum Source {
     Documents(KeyRange),
 }
 
-impl Source {
-    fn range_mut(&mut self) -> &mut KeyRange {
-        match self {
-            Source::Index(r) | Source::Documents(r) => r,
-        }
-    }
-}
-
 /// The ranges to read for `filter`, or `None` to scan the whole
 /// Collection. Every Document the filter can match is in at least one
 /// range; ranges may overlap.
@@ -175,7 +167,7 @@ pub(crate) fn plan(
         }
     }
     let (chosen, _, mut source) = equality.or_else(|| candidates.first())?.clone();
-    let range = source.range_mut();
+    let (Source::Index(range) | Source::Documents(range)) = &mut source;
     for (path, _, other) in &candidates {
         if *path == chosen {
             let (Source::Index(other) | Source::Documents(other)) = other;
