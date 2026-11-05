@@ -1,7 +1,7 @@
 //! Document and name rules: limits, Document IDs, Namespace and Collection
-//! names.
+//! names, and reading a field of a stored Document.
 
-use bson::{Binary, Bson, Document, RawDocument, spec::BinarySubtype};
+use bson::{Binary, Bson, Document, RawBsonRef, RawDocument, spec::BinarySubtype};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -136,6 +136,23 @@ pub(crate) fn raw(bytes: &[u8]) -> Result<&RawDocument> {
 /// Decode a stored Document.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Document> {
     Document::from_reader(bytes).map_err(|e| Error::Corruption(format!("stored document: {e}")))
+}
+
+/// The value at `path` in a stored Document, descending through nested
+/// documents only.
+pub(crate) fn lookup_raw(doc: &RawDocument, path: &[String]) -> Result<Option<Bson>> {
+    let corrupt = |e: bson::error::Error| Error::Corruption(format!("stored document: {e}"));
+    let Some((first, rest)) = path.split_first() else {
+        return Ok(None);
+    };
+    let mut current = doc.get(first).map_err(corrupt)?;
+    for segment in rest {
+        current = match current {
+            Some(RawBsonRef::Document(d)) => d.get(segment).map_err(corrupt)?,
+            _ => return Ok(None),
+        };
+    }
+    current.map(Bson::try_from).transpose().map_err(corrupt)
 }
 
 #[cfg(test)]

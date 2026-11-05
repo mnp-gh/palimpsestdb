@@ -1,5 +1,5 @@
-//! Indexes: Index entry keys, and choosing an Index or a range of `_id`s
-//! for a filter (ADR 0010, ADR 0011).
+//! Indexes: creating, building and dropping them, their entry keys, and
+//! choosing an Index or a range of `_id`s for a filter (ADR 0010, ADR 0011).
 //!
 //! An Index has no type of its own: it covers values of its field's Field
 //! Type, read from the Collection Schema (see [`crate::schema`]). Values of
@@ -24,14 +24,31 @@
 //! `int` field files `30.5` under `30`, and range scans include their
 //! bounds.
 
-use bson::Bson;
-use psdb_storage::KeyRange;
+use std::ops::ControlFlow;
+
+use bson::{Bson, RawDocument};
+use psdb_storage::{KeyRange, StorageEngine};
 
 use crate::catalog::CollectionEntry;
+use crate::collection_path::CollectionPath;
+use crate::document::{self, lookup_raw};
+use crate::error::{Error, Result};
 use crate::field_path::FieldPath;
 use crate::filter::{CompareOp, Filter};
 use crate::keys;
+use crate::mvcc;
+use crate::node::{CommitState, Node};
 use crate::schema::FieldType;
+use crate::transaction::{Transaction, WriteSet};
+
+/// An Index build commits the entries for at most this many Documents at a
+/// time...
+const BUILD_CHUNK_DOCUMENTS: usize = 1024;
+/// ...and of at most this many bytes of Documents, so neither its memory
+/// nor its WAL Record grows with Document size. A chunk always holds at
+/// least one Document, so one larger than this, allowed by raising
+/// [`Limits::max_document_bytes`], is a chunk of its own.
+const BUILD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// An Index as clients see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +239,234 @@ fn bounds(base: Vec<u8>, ty: FieldType, op: CompareOp, value: &Bson) -> Option<K
         _ if ty == FieldType::Binary || value == &Bson::Null => None,
         CompareOp::Gt | CompareOp::Gte => Some(KeyRange::new(exact.start, end(whole_type))),
         CompareOp::Lt | CompareOp::Lte => Some(KeyRange::new(whole_type.start, end(exact))),
+    }
+}
+
+impl CollectionEntry {
+    /// The Index on the field at `path`, which may come from a filter and
+    /// so is not always a valid Field path.
+    pub(crate) fn index_on(&self, path: &str) -> Option<&IndexDef> {
+        self.indexes.iter().find(|ix| ix.path.as_str() == path)
+    }
+
+    /// The prefix of every entry in `index`.
+    pub(crate) fn index_prefix(&self, index: &IndexDef) -> Vec<u8> {
+        keys::index_prefix(self.namespace_id, self.id, index.id)
+    }
+
+    /// The entry the stored Document `doc`, with encoded ID `doc_id`, has in
+    /// `index`, or `None` if the Index leaves its value out.
+    pub(crate) fn index_entry(
+        &self,
+        index: &IndexDef,
+        doc: &RawDocument,
+        doc_id: &[u8],
+    ) -> Result<Option<IndexEntry>> {
+        let ty = self.schema[&index.path].field_type;
+        let value = lookup_raw(doc, &index.path.segments())?;
+        Ok(key_component(value.as_ref(), ty)
+            .map(|component| IndexEntry::new(self.index_prefix(index), index, &component, doc_id)))
+    }
+}
+
+impl<E: StorageEngine> Transaction<'_, E> {
+    /// Create an Index on a field of an empty Collection, as part of this
+    /// Transaction (ADR 0010). There is nothing to build, so it commits or
+    /// aborts with the rest of the Transaction.
+    ///
+    /// Fails with [`Error::CollectionNotEmpty`] if the Collection holds
+    /// Documents: use [`Node::create_index`](crate::Node::create_index),
+    /// which builds the Index on its own. A Document committed concurrently
+    /// makes this Transaction abort with Collection Changed.
+    pub fn create_index(
+        &mut self,
+        collection: &CollectionPath,
+        path: &FieldPath,
+        unique: bool,
+    ) -> Result<()> {
+        let (mut entry, index) = self.prepare_index(collection, path, unique)?;
+        if self.any_live_in(&entry.documents())? {
+            return Err(Error::CollectionNotEmpty(collection.clone()));
+        }
+        self.collection_reads.insert(entry.prefix());
+        entry.indexes.push(index);
+        self.write_collection_entry(&entry)
+    }
+
+    /// Check that an Index may be created and give it the Collection's next
+    /// Index ID. The caller fills the Index and adds it to the returned
+    /// entry, whose counter has moved past the ID.
+    pub(crate) fn prepare_index(
+        &mut self,
+        collection: &CollectionPath,
+        path: &FieldPath,
+        unique: bool,
+    ) -> Result<(CollectionEntry, IndexDef)> {
+        let mut entry = self.collection_entry(collection)?;
+        let Some(field) = entry.schema.get(path) else {
+            return Err(Error::InvalidSchema(format!(
+                "declare the type of {path} in the collection schema before indexing it"
+            )));
+        };
+        if entry.index_on(path.as_str()).is_some() {
+            return Err(Error::IndexExists {
+                collection: collection.clone(),
+                path: path.clone(),
+            });
+        }
+        if unique && !field.strict {
+            return Err(Error::InvalidSchema(format!(
+                "a unique index needs a strict field; declare {path} strict first"
+            )));
+        }
+        // Skip IDs holding entries from a build that never committed: the
+        // counter moves only when the Index is added (ADR 0010).
+        let mut index = IndexDef {
+            path: path.clone(),
+            id: entry.next_index_id,
+            unique,
+        };
+        while mvcc::any_version_under(&self.node.engine, &entry.index_prefix(&index))? {
+            index.id += 1;
+        }
+        entry.next_index_id = index.id + 1;
+        Ok((entry, index))
+    }
+
+    /// Drop the Index on a field. Its entries become unreachable and stay
+    /// behind until garbage collection exists.
+    pub fn drop_index(&mut self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
+        let mut entry = self.collection_entry(collection)?;
+        let before = entry.indexes.len();
+        entry.indexes.retain(|ix| ix.path != *path);
+        if entry.indexes.len() == before {
+            return Err(Error::NoSuchIndex {
+                collection: collection.clone(),
+                path: path.clone(),
+            });
+        }
+        self.write_collection_entry(&entry)
+    }
+
+    /// The Collection's Indexes, in the order they were created.
+    pub fn list_indexes(&mut self, collection: &CollectionPath) -> Result<Vec<IndexInfo>> {
+        Ok(self
+            .collection_entry(collection)?
+            .indexes
+            .into_iter()
+            .map(|ix| IndexInfo {
+                path: ix.path,
+                unique: ix.unique,
+            })
+            .collect())
+    }
+}
+
+impl<E: StorageEngine> Node<E> {
+    /// Create an Index on a field and build it from the Documents already in
+    /// the Collection (ADR 0010). The field's type must be declared in the
+    /// Collection Schema; a unique Index needs a Strict Field.
+    ///
+    /// The build runs in the foreground, holding the commit lock, so no
+    /// other commit happens until it finishes. It commits the entries in
+    /// chunks, each an ordinary fsynced commit, so it never holds more than
+    /// one chunk in memory; the entries stay unreachable until a final
+    /// commit adds the Index to the Catalog. If the build fails, for
+    /// example with [`Error::DuplicateValue`], or the Node crashes, the
+    /// committed chunks are left behind under an Index ID that is never
+    /// reused in the Collection, until garbage collection exists.
+    ///
+    /// ```
+    /// use bson::doc;
+    /// use psdb_core::{Node, FieldSchema, FieldType};
+    /// use psdb_storage_memory::MemoryEngine;
+    ///
+    /// let node = Node::new(MemoryEngine::new());
+    /// node.create_namespace("shop")?;
+    /// let orders = "shop.orders".parse()?;
+    /// node.create_collection(&orders)?;
+    /// node.insert(&orders, doc! { "total": 30 })?;
+    /// let total = FieldSchema { field_type: FieldType::Int, strict: false };
+    /// let total_path = "total".parse()?;
+    /// node.set_field_type(&orders, &total_path, total)?;
+    /// node.create_index(&orders, &total_path, false)?;
+    /// assert_eq!(node.find(&orders, &doc! { "total": { "$gt": 10 } })?.len(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn create_index(
+        &self,
+        collection: &CollectionPath,
+        path: &FieldPath,
+        unique: bool,
+    ) -> Result<()> {
+        let mut commits = self.commits.lock().expect("lock poisoned");
+        if commits.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let mut txn = Transaction::new(self, commits.last);
+        let (mut entry, index) = txn.prepare_index(collection, path, unique)?;
+        self.build_index(&mut commits, &entry, &index, txn.snapshot_ts())?;
+        entry.indexes.push(index);
+        txn.write_collection_entry(&entry)?;
+        txn.commit_locked(&mut commits)?;
+        Ok(())
+    }
+
+    /// Commit an entry in `index` for every Document of the Collection at
+    /// `snapshot_ts`, one chunk at a time.
+    fn build_index(
+        &self,
+        commits: &mut CommitState,
+        entry: &CollectionEntry,
+        index: &IndexDef,
+        snapshot_ts: u64,
+    ) -> Result<()> {
+        let prefix_len = entry.prefix().len();
+        let mut range = entry.documents();
+        loop {
+            let mut docs = Vec::new();
+            let mut docs_bytes = 0;
+            // The first Document of the next chunk, if this one filled up
+            // before the Collection ended.
+            let mut next_chunk_start = None;
+            mvcc::scan_range_at(&self.engine, &range, snapshot_ts, &mut |key, value| {
+                let full = docs.len() == BUILD_CHUNK_DOCUMENTS
+                    || (!docs.is_empty() && docs_bytes + value.len() > BUILD_CHUNK_BYTES);
+                if full {
+                    next_chunk_start = Some(key.to_vec());
+                    return ControlFlow::Break(());
+                }
+                docs_bytes += value.len();
+                docs.push((key.to_vec(), value));
+                ControlFlow::Continue(())
+            })?;
+            let mut chunk = WriteSet::new();
+            for (key, bytes) in &docs {
+                let doc_id = &key[prefix_len..];
+                let Some(index_entry) = entry.index_entry(index, document::raw(bytes)?, doc_id)?
+                else {
+                    continue;
+                };
+                if index_entry.unique
+                    && (chunk.contains_key(&index_entry.key)
+                        || mvcc::read_at(&self.engine, &index_entry.key, commits.last)?.is_some())
+                {
+                    return Err(Error::DuplicateValue(format!(
+                        "two documents share a value of {}, so it cannot have a unique index",
+                        index.path
+                    )));
+                }
+                chunk.insert(index_entry.key, Some(doc_id.to_vec()));
+            }
+            if !chunk.is_empty() {
+                self.apply_commit(commits, &chunk)?;
+            }
+            let Some(start) = next_chunk_start else {
+                return Ok(());
+            };
+            // The newest Version of a key sorts first, at timestamp u64::MAX.
+            range.start = keys::physical_key(&start, u64::MAX);
+        }
     }
 }
 

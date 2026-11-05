@@ -13,8 +13,9 @@
 
 use std::cmp::Ordering;
 
-use bson::{Bson, Document, RawBsonRef, RawDocument, RawDocumentBuf};
+use bson::{Bson, Document, RawDocument, RawDocumentBuf};
 
+use crate::document::lookup_raw;
 use crate::error::{Error, Result};
 
 /// A parsed filter.
@@ -180,23 +181,6 @@ fn parse_field(path: &str, value: &Bson) -> Result<Vec<Filter>> {
             Ok(compare(op, v))
         })
         .collect()
-}
-
-/// The value at `path` in a stored Document, descending through nested
-/// documents only.
-pub(crate) fn lookup_raw(doc: &RawDocument, path: &[String]) -> Result<Option<Bson>> {
-    let corrupt = |e: bson::error::Error| Error::Corruption(format!("stored document: {e}"));
-    let Some((first, rest)) = path.split_first() else {
-        return Ok(None);
-    };
-    let mut current = doc.get(first).map_err(corrupt)?;
-    for segment in rest {
-        current = match current {
-            Some(RawBsonRef::Document(d)) => d.get(segment).map_err(corrupt)?,
-            _ => return Ok(None),
-        };
-    }
-    current.map(Bson::try_from).transpose().map_err(corrupt)
 }
 
 fn compare_at(found: Option<&Bson>, op: CompareOp, target: &Bson) -> bool {

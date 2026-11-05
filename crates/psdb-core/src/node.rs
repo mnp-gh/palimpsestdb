@@ -1,33 +1,21 @@
 //! The entry point: a [`Node`] over one Storage Engine.
 
 use std::collections::BTreeMap;
-use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Mutex;
 
 use bson::{Bson, Document};
 use psdb_storage::StorageEngine;
 
-use crate::catalog::CollectionEntry;
 use crate::collection_path::CollectionPath;
-use crate::document::{self, Limits};
+use crate::document::Limits;
 use crate::error::{Error, Result};
 use crate::field_path::FieldPath;
-use crate::index::{IndexDef, IndexInfo};
-use crate::keys;
+use crate::index::IndexInfo;
 use crate::mvcc;
 use crate::schema::FieldSchema;
 use crate::transaction::{self, Transaction, WriteSet};
 use crate::wal::{self, OsWalFile, Wal, WalFile};
-
-/// An Index build commits the entries for at most this many Documents at a
-/// time...
-const BUILD_CHUNK_DOCUMENTS: usize = 1024;
-/// ...and of at most this many bytes of Documents, so neither its memory
-/// nor its WAL Record grows with Document size. A chunk always holds at
-/// least one Document, so one larger than this, allowed by raising
-/// [`Limits::max_document_bytes`], is a chunk of its own.
-const BUILD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// An embedded PalimpsestDB Node over the Storage Engine `E`.
 ///
@@ -173,112 +161,6 @@ impl<E: StorageEngine> Node<E> {
         }
         commits.last = commit_ts;
         Ok(commit_ts)
-    }
-
-    /// Create an Index on a field and build it from the Documents already in
-    /// the Collection (ADR 0010). The field's type must be declared in the
-    /// Collection Schema; a unique Index needs a Strict Field.
-    ///
-    /// The build runs in the foreground, holding the commit lock, so no
-    /// other commit happens until it finishes. It commits the entries in
-    /// chunks, each an ordinary fsynced commit, so it never holds more than
-    /// one chunk in memory; the entries stay unreachable until a final
-    /// commit adds the Index to the Catalog. If the build fails, for
-    /// example with [`Error::DuplicateValue`], or the Node crashes, the
-    /// committed chunks are left behind under an Index ID that is never
-    /// reused in the Collection, until garbage collection exists.
-    ///
-    /// ```
-    /// use bson::doc;
-    /// use psdb_core::{Node, FieldSchema, FieldType};
-    /// use psdb_storage_memory::MemoryEngine;
-    ///
-    /// let node = Node::new(MemoryEngine::new());
-    /// node.create_namespace("shop")?;
-    /// let orders = "shop.orders".parse()?;
-    /// node.create_collection(&orders)?;
-    /// node.insert(&orders, doc! { "total": 30 })?;
-    /// let total = FieldSchema { field_type: FieldType::Int, strict: false };
-    /// let total_path = "total".parse()?;
-    /// node.set_field_type(&orders, &total_path, total)?;
-    /// node.create_index(&orders, &total_path, false)?;
-    /// assert_eq!(node.find(&orders, &doc! { "total": { "$gt": 10 } })?.len(), 1);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn create_index(
-        &self,
-        collection: &CollectionPath,
-        path: &FieldPath,
-        unique: bool,
-    ) -> Result<()> {
-        let mut commits = self.commits.lock().expect("lock poisoned");
-        if commits.poisoned {
-            return Err(Error::Poisoned);
-        }
-        let mut txn = Transaction::new(self, commits.last);
-        let (mut entry, index) = txn.prepare_index(collection, path, unique)?;
-        self.build_index(&mut commits, &entry, &index, txn.snapshot_ts())?;
-        entry.indexes.push(index);
-        txn.write_collection_entry(&entry)?;
-        txn.commit_locked(&mut commits)?;
-        Ok(())
-    }
-
-    /// Commit an entry in `index` for every Document of the Collection at
-    /// `snapshot_ts`, one chunk at a time.
-    fn build_index(
-        &self,
-        commits: &mut CommitState,
-        entry: &CollectionEntry,
-        index: &IndexDef,
-        snapshot_ts: u64,
-    ) -> Result<()> {
-        let prefix_len = entry.prefix().len();
-        let mut range = entry.documents();
-        loop {
-            let mut docs = Vec::new();
-            let mut docs_bytes = 0;
-            // The first Document of the next chunk, if this one filled up
-            // before the Collection ended.
-            let mut next_chunk_start = None;
-            mvcc::scan_range_at(&self.engine, &range, snapshot_ts, &mut |key, value| {
-                let full = docs.len() == BUILD_CHUNK_DOCUMENTS
-                    || (!docs.is_empty() && docs_bytes + value.len() > BUILD_CHUNK_BYTES);
-                if full {
-                    next_chunk_start = Some(key.to_vec());
-                    return ControlFlow::Break(());
-                }
-                docs_bytes += value.len();
-                docs.push((key.to_vec(), value));
-                ControlFlow::Continue(())
-            })?;
-            let mut chunk = WriteSet::new();
-            for (key, bytes) in &docs {
-                let doc_id = &key[prefix_len..];
-                let Some(index_entry) = entry.index_entry(index, document::raw(bytes)?, doc_id)?
-                else {
-                    continue;
-                };
-                if index_entry.unique
-                    && (chunk.contains_key(&index_entry.key)
-                        || mvcc::read_at(&self.engine, &index_entry.key, commits.last)?.is_some())
-                {
-                    return Err(Error::DuplicateValue(format!(
-                        "two documents share a value of {}, so it cannot have a unique index",
-                        index.path
-                    )));
-                }
-                chunk.insert(index_entry.key, Some(doc_id.to_vec()));
-            }
-            if !chunk.is_empty() {
-                self.apply_commit(commits, &chunk)?;
-            }
-            let Some(start) = next_chunk_start else {
-                return Ok(());
-            };
-            // The newest Version of a key sorts first, at timestamp u64::MAX.
-            range.start = keys::physical_key(&start, u64::MAX);
-        }
     }
 
     /// Begin a Transaction with a Snapshot of everything committed so far.
