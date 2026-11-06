@@ -8,6 +8,7 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | v0.2 | Durability | Done |
 | v0.3 | Indexes | Done |
 | v0.4 | Concurrency | Planned |
+| v0.4.1 | Persistent engine | Planned |
 | v0.5 | Serializable | Planned |
 | v0.6 | Server | Planned |
 | v0.7 | Access | Planned |
@@ -54,13 +55,17 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.4: Concurrency
 
 - Thread-safe Database Layer; single in-order applier; visibility watermark
-- Background Index builds, so a long build no longer stops every other commit ([ADR 0010](./adr/0010-index-builds-commit-in-chunks.md))
+- Background Index builds, so a long build no longer stops every other commit: the Index is Building while writers maintain it, and the build takes the commit lock one chunk at a time ([ADR 0010](./adr/0010-index-builds-commit-in-chunks.md), [ADR 0013](./adr/0013-building-indexes-take-the-lock-per-chunk.md))
 - In-RAM Catalog cache (v0.1 reads Catalog entries from the engine on every operation)
-- Garbage collection of old Versions below the oldest active Snapshot
-- Reclaim dropped Collections, dropped Indexes and orphaned Index build chunks: range-delete an ID's keys once no active Snapshot can see a Catalog entry naming it. Version-by-version collection never removes them, because their newest Versions are still live. This also bounds the commit-time check for strict-field changes and Index creation on empty Collections, which today reads every Version ever written under the Collection while holding the commit lock
+- Garbage Collection of old Versions below the oldest active Snapshot, run by an explicit `Node::collect_garbage()`, not logged in the WAL ([ADR 0012](./adr/0012-garbage-collection-is-not-logged.md)); running it automatically comes later
+- Reclaim dropped Collections, dropped Indexes and orphaned Index build chunks: scan an ID's key range and delete its keys in batches (no range-delete operation in the Storage Engine until an engine benefits from one) once no active Snapshot can see a Catalog entry naming it. Version-by-version collection never removes them, because their newest Versions are still live. This also bounds the commit-time check for strict-field changes and Index creation on empty Collections, which today reads every Version ever written under the Collection while holding the commit lock
+- Clock and I/O seams; deterministic simulator
+
+## v0.4.1: Persistent engine
+
 - `fjall` Storage Engine, passing the conformance suite, with block compression (LZ4 or zstd) enabled
 - Streaming scans: `find` iterates instead of loading the whole Collection into memory
-- Clock and I/O seams; deterministic simulator
+- Recovery replays only WAL Records above the engine's `applied_up_to` (today it replays the whole WAL into an empty engine)
 
 ## v0.5: Serializable
 
@@ -98,6 +103,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## Unscheduled
 
+- Bulk writes larger than the Write Set cap. Until then a client splits them into many Transactions. Either a non-atomic `insert_many`-style API that commits in chunks like an Index build, or truly atomic huge Transactions (Write Set spilled to disk, or pending Versions written to the engine as PostgreSQL does)
 - Query planner statistics (sampled per-path counts and histograms) and a cost model for choosing between Indexes
 - Index hints: the client names the Index a query should use
 - Sparse Indexes, as an opt-in: leave out Documents whose field is null or missing, so an Index on a rarely set field stays small; `{field: null}` then scans the whole Collection. Indexes keep null and missing by default
