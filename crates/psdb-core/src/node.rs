@@ -14,8 +14,8 @@ use crate::field_path::FieldPath;
 use crate::index::IndexInfo;
 use crate::mvcc;
 use crate::schema::FieldSchema;
-use crate::transaction::{self, Transaction, WriteSet};
-use crate::wal::{self, OsWalFile, Wal, WalFile};
+use crate::transaction::{self, CommitState, Transaction};
+use crate::wal::{OsWalFile, Wal, WalFile};
 
 /// An embedded PalimpsestDB Node over the Storage Engine `E`.
 ///
@@ -42,16 +42,6 @@ pub struct Node<E: StorageEngine> {
     /// Holding the lock serialises commits, which keeps them logged and
     /// applied in Commit Timestamp order.
     pub(crate) commits: Mutex<CommitState>,
-}
-
-/// The state commits serialise on.
-pub(crate) struct CommitState {
-    /// The newest Commit Timestamp; new Snapshots are taken here.
-    pub(crate) last: u64,
-    /// `None` when nothing is durable.
-    pub(crate) wal: Option<Wal>,
-    /// Set when a commit's outcome is unknown; nothing more may commit.
-    pub(crate) poisoned: bool,
 }
 
 impl<E: StorageEngine> Node<E> {
@@ -124,11 +114,7 @@ impl<E: StorageEngine> Node<E> {
         Self {
             engine,
             limits,
-            commits: Mutex::new(CommitState {
-                last,
-                wal,
-                poisoned: false,
-            }),
+            commits: Mutex::new(CommitState::new(last, wal)),
         }
     }
 
@@ -137,40 +123,9 @@ impl<E: StorageEngine> Node<E> {
         &self.limits
     }
 
-    /// Log, Apply and publish a Write Set that has passed its conflict
-    /// checks, at the next Commit Timestamp.
-    pub(crate) fn apply_commit(
-        &self,
-        commits: &mut CommitState,
-        write_set: &WriteSet,
-    ) -> Result<u64> {
-        let commit_ts = commits.last + 1;
-        let Some(wal) = &mut commits.wal else {
-            self.engine.write_batch(mvcc::commit_batch(
-                commit_ts,
-                transaction::writes(write_set),
-            ))?;
-            commits.last = commit_ts;
-            return Ok(commit_ts);
-        };
-        let record = wal::encode_record(commit_ts, transaction::writes(write_set))?;
-        // Once the record may be in the WAL, any failure leaves the outcome
-        // unknown, and retrying fsync is unsafe (ADR 0004).
-        let outcome = wal.append(&record).map_err(Error::Io).and_then(|()| {
-            let batch = mvcc::commit_batch(commit_ts, transaction::writes(write_set));
-            Ok(self.engine.write_batch(batch)?)
-        });
-        if let Err(cause) = outcome {
-            commits.poisoned = true;
-            return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
-        }
-        commits.last = commit_ts;
-        Ok(commit_ts)
-    }
-
     /// Begin a Transaction with a Snapshot of everything committed so far.
     pub fn begin(&self) -> Transaction<'_, E> {
-        let snapshot_ts = self.commits.lock().expect("lock poisoned").last;
+        let snapshot_ts = self.commits.lock().expect("lock poisoned").last();
         Transaction::new(self, snapshot_ts)
     }
 

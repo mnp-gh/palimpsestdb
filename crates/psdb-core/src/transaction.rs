@@ -16,7 +16,8 @@ use crate::filter::Filter;
 use crate::index::{self, CandidateRange};
 use crate::keys;
 use crate::mvcc;
-use crate::node::{CommitState, Node};
+use crate::node::Node;
+use crate::wal::{self, Wal};
 
 /// One entry of a Write Set: a logical key and its new value (`None`
 /// deletes).
@@ -28,6 +29,57 @@ pub(crate) type WriteSet = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 /// Every entry of `write_set`, borrowed, in key order.
 pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
     write_set.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
+}
+
+/// The state commits serialise on, behind [`Node`]'s commit lock. Only
+/// [`Transaction::commit_locked`] changes it, so every commit is checked,
+/// logged and Applied in one place.
+pub(crate) struct CommitState {
+    /// The newest Commit Timestamp; new Snapshots are taken here.
+    last: u64,
+    /// `None` when nothing is durable.
+    wal: Option<Wal>,
+    /// Set when a commit's outcome is unknown; nothing more may commit.
+    poisoned: bool,
+}
+
+impl CommitState {
+    pub(crate) fn new(last: u64, wal: Option<Wal>) -> Self {
+        Self {
+            last,
+            wal,
+            poisoned: false,
+        }
+    }
+
+    /// The newest Commit Timestamp.
+    pub(crate) fn last(&self) -> u64 {
+        self.last
+    }
+
+    /// Log, Apply and publish a Write Set that has passed its conflict
+    /// checks, at the next Commit Timestamp.
+    fn apply<E: StorageEngine>(&mut self, engine: &E, write_set: &WriteSet) -> Result<u64> {
+        let commit_ts = self.last + 1;
+        let Some(wal) = &mut self.wal else {
+            engine.write_batch(mvcc::commit_batch(commit_ts, writes(write_set)))?;
+            self.last = commit_ts;
+            return Ok(commit_ts);
+        };
+        let record = wal::encode_record(commit_ts, writes(write_set))?;
+        // Once the record may be in the WAL, any failure leaves the outcome
+        // unknown, and retrying fsync is unsafe (ADR 0004).
+        let outcome = wal.append(&record).map_err(Error::Io).and_then(|()| {
+            let batch = mvcc::commit_batch(commit_ts, writes(write_set));
+            Ok(engine.write_batch(batch)?)
+        });
+        if let Err(cause) = outcome {
+            self.poisoned = true;
+            return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
+        }
+        self.last = commit_ts;
+        Ok(commit_ts)
+    }
 }
 
 /// A Transaction: reads see the Snapshot taken at [`Node::begin`] plus
@@ -63,6 +115,19 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             write_set_bytes: 0,
             catalog_reads: BTreeSet::new(),
             collection_reads: BTreeSet::new(),
+        }
+    }
+
+    /// A Transaction whose Write Set is `write_set`, outside the Write Set
+    /// cap: a chunk of an Index build (ADR 0010).
+    pub(crate) fn with_write_set(
+        node: &'node Node<E>,
+        snapshot_ts: u64,
+        write_set: WriteSet,
+    ) -> Self {
+        Self {
+            write_set,
+            ..Self::new(node, snapshot_ts)
         }
     }
 
@@ -375,7 +440,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 return Err(Error::WriteConflict);
             }
         }
-        self.node.apply_commit(commits, &self.write_set)
+        commits.apply(engine, &self.write_set)
     }
 
     /// Abort, discarding the Write Set. Same as dropping the Transaction.

@@ -35,7 +35,7 @@ Modules are cut by concept, not by type. `Node`, `Transaction` and `CollectionEn
 |---|---|
 | How is a key laid out? | `keys` (ADR 0008) |
 | Which Version does a Snapshot see? | `mvcc` |
-| How does a commit get checked and logged? | `transaction` (`commit`), `node` (`apply_commit`) |
+| How does a commit get checked and logged? | `transaction` (`commit_locked`, `CommitState`) |
 | What does a Catalog entry hold? | `catalog` (`CollectionEntry`) |
 | What may change in a Collection Schema? | `schema` |
 | How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `create_index_on_empty`, `build_index`) |
@@ -71,14 +71,14 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 1. Fails if the Node is poisoned. A Transaction that wrote nothing commits at once.
 2. Aborts with Collection Changed if a Catalog entry it read, or a Collection it read whole, changed since its Snapshot.
 3. Aborts with Write Conflict if any key it writes was committed since its Snapshot (first-committer-wins).
-4. Calls `Node::apply_commit`, which takes the next Commit Timestamp, appends and fsyncs the WAL record, then writes one engine batch: every Version plus `applied_up_to`. A failure after the append poisons the Node with Commit Outcome Unknown (ADR 0004).
+4. Calls `CommitState::apply`, which takes the next Commit Timestamp, appends and fsyncs the WAL record, then writes one engine batch: every Version plus `applied_up_to`. A failure after the append poisons the Node with Commit Outcome Unknown (ADR 0004).
 
 **Catalog changes** (creating or dropping Namespaces and Collections, schema and Index changes) are ordinary writes to Catalog keys, so they commit or abort with the rest of their Transaction (ADR 0006). Changing a schema or the Indexes rewrites the Collection's entry. A concurrent writer recorded a read of that entry, so it aborts at commit.
 
 **An Index build** (`Node::create_index`) holds the commit lock throughout:
 
 1. `prepare_index` gives the Index the next unused ID.
-2. `build_index` reads the Collection at one Snapshot, in chunks of at most 1024 Documents or 16 MiB, and commits each chunk's entries through `apply_commit` directly, outside any Write Set and its cap.
+2. `build_index` reads the Collection at one Snapshot, in chunks of at most 1024 Documents or 16 MiB, and commits each chunk's entries as a Transaction of its own through `commit_locked`, like any other commit, but outside the Write Set cap.
 3. A final commit adds the Index to the Collection's entry, which makes the entries reachable.
 
 `Transaction::create_index_on_empty` only works on an empty Collection, where there is nothing to build (ADR 0010).
@@ -87,7 +87,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 - **Versions are never changed in place.** A write adds a Version, and a delete adds a tombstone. Nothing is garbage-collected yet (v0.4).
 - **The engine stays unaware of Versions.** MVCC, Transactions and the Catalog all live above the `StorageEngine` trait (ADR 0001).
-- **Commits are serialised.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order.
+- **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState`'s fields are private to `transaction`, and `Transaction::commit_locked` is the only way to change them, Index build chunks included.
 - **The WAL comes first.** A commit is in the WAL and fsynced before the engine sees it. If the outcome is unknown, nothing more commits until the Node is reopened.
 - **A Document and its Index entries change in one Write Set.** Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.
 - **IDs are never reused.** Namespace and Collection IDs are random, and their ID keys outlive a drop. Index IDs come from a per-Collection counter that only grows (ADR 0006).
