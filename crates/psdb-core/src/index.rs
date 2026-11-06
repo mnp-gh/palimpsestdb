@@ -37,9 +37,9 @@ use crate::field_path::FieldPath;
 use crate::filter::{CompareOp, Filter};
 use crate::keys;
 use crate::mvcc;
-use crate::node::{CommitState, Node};
+use crate::node::Node;
 use crate::schema::FieldType;
-use crate::transaction::{Transaction, WriteSet};
+use crate::transaction::{CommitState, Transaction, WriteSet};
 
 /// An Index build commits the entries for at most this many Documents at a
 /// time...
@@ -395,10 +395,7 @@ impl<E: StorageEngine> Node<E> {
         unique: bool,
     ) -> Result<()> {
         let mut commits = self.commits.lock().expect("lock poisoned");
-        if commits.poisoned {
-            return Err(Error::Poisoned);
-        }
-        let mut txn = Transaction::new(self, commits.last);
+        let mut txn = Transaction::new(self, commits.last());
         let (mut entry, index) = txn.prepare_index(collection, path, unique)?;
         self.build_index(&mut commits, &entry, &index, txn.snapshot_ts())?;
         entry.indexes.push(index);
@@ -444,7 +441,7 @@ impl<E: StorageEngine> Node<E> {
                 };
                 if index_entry.unique
                     && (chunk.contains_key(&index_entry.key)
-                        || mvcc::read_at(&self.engine, &index_entry.key, commits.last)?.is_some())
+                        || mvcc::read_at(&self.engine, &index_entry.key, commits.last())?.is_some())
                 {
                     return Err(Error::DuplicateValue(format!(
                         "two documents share a value of {}, so it cannot have a unique index",
@@ -454,7 +451,9 @@ impl<E: StorageEngine> Node<E> {
                 chunk.insert(index_entry.key, Some(doc_id.to_vec()));
             }
             if !chunk.is_empty() {
-                self.apply_commit(commits, &chunk)?;
+                // Its keys are under an Index ID nothing else writes, so the
+                // conflict checks pass; they run so every commit takes one path.
+                Transaction::with_write_set(self, commits.last(), chunk).commit_locked(commits)?;
             }
             let Some(start) = next_chunk_start else {
                 return Ok(());
