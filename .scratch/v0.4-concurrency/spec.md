@@ -1,0 +1,59 @@
+# v0.4: Concurrency
+
+Status: ready-for-agent
+
+A thread-safe Database Layer for embedded use with plain threads: Transactions begin and run in parallel, commits stay one at a time, Index builds no longer stop the world, and old Versions are collected. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0004](../../docs/adr/0004-database-layer-owns-wal.md), [ADR 0007](../../docs/adr/0007-runtime-model.md), [ADR 0012](../../docs/adr/0012-garbage-collection-is-not-logged.md) and [ADR 0013](../../docs/adr/0013-building-indexes-take-the-lock-per-chunk.md).
+
+## Out of scope
+
+- `fjall`, streaming scans, and Recovery from `applied_up_to` (v0.4.1).
+- Splitting the commit into a pipeline; group commit (v0.6).
+- Running Garbage Collection automatically (later; v0.4 has only `Node::collect_garbage()`).
+- A range-delete operation in the Storage Engine (when an engine benefits, likely v0.9).
+- Resuming an Index build after a crash.
+- Bulk writes larger than the Write Set cap; clients split them (Unscheduled).
+- The async front end (v0.6).
+
+## Threads
+
+- `Node` is `Send + Sync`, shared across threads by `Arc` or scoped threads; a `Transaction` is `Send` and used by one thread at a time. A compile-time assertion checks both for `Node<MemoryEngine>`.
+- One commit lock still covers the conflict check, WAL append and fsync, and the apply. Its holder is the single in-order applier (ADR 0004).
+- Visibility watermark: `visible: AtomicU64`, stored with `Release` after the apply, still under the commit lock. `begin()` never takes the commit lock.
+- Snapshot registry: `begin()` takes a small registry lock, loads `visible` with `Acquire`, registers that Snapshot and releases the lock; dropping the Transaction (committed, aborted or abandoned) unregisters it. The horizon is the oldest registered Snapshot, or `visible` when none is, read under the same lock, so no Snapshot can register below a horizon already handed out.
+
+## Catalog cache
+
+- Holds the newest Version of each Catalog entry with its Commit Timestamp, updated under the commit lock when a commit writes Catalog entries (Index build chunks write none).
+- A Transaction whose Snapshot is at or after an entry's timestamp reads it from the cache; an older Snapshot reads the engine. A Transaction's own Write Set still wins over both.
+- Catalog dependency checks at commit are unchanged.
+
+## Garbage Collection
+
+- `Node::collect_garbage()` takes the horizon, scans the whole keyspace in batches without the commit lock, and for each logical key deletes every Version older than the newest Version at or below the horizon. If that newest Version is a tombstone, it is deleted too.
+- Deletes go straight to the engine and are not logged (ADR 0012).
+- Reclaim: once the horizon is past the commit that dropped a Collection or an Index, scan the dropped ID's key range and delete its keys in batches. Index IDs that hold data but no Catalog entry names (orphaned build chunks, Indexes dropped by Recovery) are reclaimed the same way.
+- After reclaim, the commit-time check for strict-field changes and Index creation on empty Collections reads only live data.
+
+## Index builds
+
+- `Node::create_index` first commits the Index to the Catalog entry as Building (`state` in `indexes`; entries written before v0.4 read as Ready).
+- From that commit on, every write maintains a Building Index's entries and enforces its uniqueness (Duplicate Value); `find` plans only with Ready Indexes. A Transaction whose Snapshot predates the Building commit aborts with Collection Changed through the existing dependency on the Collection's Catalog entry; this is what makes skipping a catch-up pass safe (ADR 0013), so a test must cover it.
+- The build then takes the commit lock per chunk (1024 Documents or 16 MiB), reads that chunk at the newest Commit Timestamp, resuming after the last key it built, and commits its entries. A final commit marks the Index Ready. The calling thread runs the build; other threads commit between chunks.
+- A Building Index counts as its field's Index: a second `create_index` fails with Index Exists. Dropping the Collection makes the next chunk stop with Collection Changed; dropping the Index cancels the build the same way. A duplicate found by a unique build fails it with Duplicate Value and one commit removes the Catalog entry.
+- Recovery drops every Index still Building, in a commit, when the Node opens.
+
+## Seams and simulator
+
+- Clock seam for UUIDv7 Document IDs, and a seeded random source for Catalog IDs, both injectable through `Node::open_with`.
+- A deterministic simulator: a seeded, single-threaded scheduler interleaving steps of many Transactions, Index build chunks and Garbage Collection passes over `SimDisk`, checking invariants after every step: each Snapshot's reads never change, Indexes agree with their Documents at every Snapshot, and crash plus Recovery keeps every acknowledged commit.
+- A stress test on real threads (not deterministic) to catch data races in the locking.
+
+## Tests
+
+- Unit tests for the registry and horizon, the cache's fallback to the engine, and collection of tombstones.
+- Integration tests: a long build while other threads commit; drop during a build; crash during a build; Garbage Collection never removing a Version an open Snapshot reads.
+- The simulator and the stress test above.
+
+## CLI
+
+`gc` runs `Node::collect_garbage()` and prints how many Versions it removed. `indexes` shows Building or Ready.

@@ -29,7 +29,7 @@ The authoritative record of which Namespaces and Collections exist and how their
 _Avoid_: Metadata store, schema registry
 
 **Index**:
-A secondary lookup over one field of a Collection's Documents, covering values of its field's Field Type, consistent with those Documents at every Snapshot. A unique Index also forbids two Documents from sharing a value in that field.
+A secondary lookup over one field of a Collection's Documents, covering values of its field's Field Type, consistent with those Documents at every Snapshot. A unique Index also forbids two Documents from sharing a value in that field. While it is Building, writes keep it up to date (and enforce its uniqueness) but queries do not use it; it becomes Ready when its build finishes.
 _Avoid_: Secondary key, lookup table
 
 **Collection Schema**:
@@ -97,6 +97,10 @@ _Avoid_: SI as a synonym for Serializable
 **Serializable**:
 The isolation level where every outcome matches some serial order of the committed Transactions. Achieved via Serializable Snapshot Isolation.
 _Avoid_: Strict, strong (unqualified)
+
+**Garbage Collection**:
+Removing Versions that no active Snapshot can read any more: Versions older than the newest one each key had at the oldest active Snapshot, and every Version under a dropped Collection or Index once no active Snapshot can see it. It never changes what any Transaction sees.
+_Avoid_: Vacuum, compaction (that is a Storage Engine's own housekeeping), cleanup
 
 **Read Marker**:
 A record that a Transaction read a key, a range or a whole Collection, kept so Serializable can detect dangerous interleavings. It never blocks anyone.
