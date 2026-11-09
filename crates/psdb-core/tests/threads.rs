@@ -1,0 +1,146 @@
+//! Multi-threaded Node, Snapshot registry, Horizon tracking, and thread-safety tests.
+
+mod common;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use bson::{doc, Bson};
+use common::collection;
+use psdb_core::{Node, Transaction};
+use psdb_storage_memory::MemoryEngine;
+
+#[test]
+fn compile_time_send_sync_assertions() {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+
+    assert_send::<Node<MemoryEngine>>();
+    assert_sync::<Node<MemoryEngine>>();
+    assert_send::<Transaction<'static, MemoryEngine>>();
+}
+
+#[test]
+fn horizon_tracks_active_snapshots_and_advances_on_drop() {
+    let node = common::shop();
+
+    // Begin a reader; horizon stays pinned to reader's snapshot.
+    let reader1 = node.begin();
+    let snap1 = reader1.snapshot_ts();
+    assert_eq!(node.horizon(), snap1);
+
+    // Commit writes; newest_visible_ts advances, but horizon remains at snap1.
+    node.insert(&collection("shop.orders"), doc! { "item": "book" })
+        .unwrap();
+    assert_eq!(node.horizon(), snap1);
+
+    // Begin a second reader at the new visible commit.
+    let reader2 = node.begin();
+    let snap2 = reader2.snapshot_ts();
+    assert!(snap2 > snap1);
+    assert_eq!(node.horizon(), snap1);
+
+    // Dropping the first reader advances horizon to reader2's snapshot.
+    drop(reader1);
+    assert_eq!(node.horizon(), snap2);
+
+    // Dropping reader2 advances horizon to newest_visible_ts.
+    drop(reader2);
+    assert!(node.horizon() >= snap2);
+}
+
+#[test]
+fn horizon_advances_when_transaction_aborts_or_panics() {
+    let node = Arc::new(common::shop());
+
+    // Explicit abort unregisters.
+    let txn = node.begin();
+    let snap = txn.snapshot_ts();
+    assert_eq!(node.horizon(), snap);
+    txn.abort();
+
+    // Panic on a thread unregisters via Drop.
+    let node_clone = Arc::clone(&node);
+    let handle = thread::spawn(move || {
+        let _txn = node_clone.begin();
+        panic!("simulated worker thread panic");
+    });
+    let _ = handle.join();
+
+    // Horizon should not be pinned by the panicked thread.
+    node.insert(&collection("shop.orders"), doc! { "item": "pen" })
+        .unwrap();
+    let next_txn = node.begin();
+    assert_eq!(node.horizon(), next_txn.snapshot_ts());
+}
+
+#[test]
+fn begin_fails_fast_when_commit_lock_is_poisoned() {
+    let node = common::shop();
+
+    // Poison the commit lock by panicking while holding it.
+    node.poison_commit_lock_for_test();
+
+    // begin() must detect the poisoned commit lock and panic.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        node.begin();
+    }));
+    assert!(result.is_err(), "begin() must fail fast on poisoned commit lock");
+}
+
+#[test]
+fn concurrent_threads_stress_test() {
+    let node = Arc::new(common::shop());
+    let orders = collection("shop.orders");
+    let running = Arc::new(AtomicBool::new(true));
+
+    let mut handles = Vec::new();
+
+    // 4 Writer threads
+    for thread_id in 0..4 {
+        let node = Arc::clone(&node);
+        let orders = orders.clone();
+        let running = Arc::clone(&running);
+        handles.push(thread::spawn(move || {
+            let mut i = 0;
+            while running.load(Ordering::Relaxed) {
+                i += 1;
+                let id = Bson::String(format!("t{thread_id}_{i}"));
+                let _ = node.insert(&orders, doc! { "_id": id, "count": i });
+                thread::yield_now();
+            }
+        }));
+    }
+
+    // 4 Reader threads
+    for _ in 0..4 {
+        let node = Arc::clone(&node);
+        let orders = orders.clone();
+        let running = Arc::clone(&running);
+        handles.push(thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                let mut txn = node.begin();
+                let snap = txn.snapshot_ts();
+                // Horizon must never exceed any active transaction's snapshot.
+                assert!(node.horizon() <= snap);
+                let _ = txn.find(&orders, &doc! {});
+                thread::yield_now();
+            }
+        }));
+    }
+
+    // Let threads run for 200ms
+    thread::sleep(Duration::from_millis(200));
+    running.store(false, Ordering::Relaxed);
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    // After all threads exit, horizon equals latest visible.
+    let h = node.horizon();
+    let txn = node.begin();
+    assert_eq!(h, txn.snapshot_ts());
+}

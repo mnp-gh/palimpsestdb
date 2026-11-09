@@ -5,7 +5,7 @@
 //! under Snapshot Isolation. See `GLOSSARY.md` for the vocabulary and
 //! `docs/adr/` for the decisions behind the design.
 //!
-//! v0.3 is embedded and single-threaded in intent. A Node opened with
+//! v0.4 is thread-safe for embedded use with plain threads. A Node opened with
 //! [`Node::open`] is durable through a WAL replayed into an empty
 //! engine on every open. Old Versions are never collected. `find` reads
 //! candidates from a single-field Index when one fits the filter (see
