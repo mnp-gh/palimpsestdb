@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use bson::{Bson, Document};
@@ -42,6 +43,11 @@ pub struct Node<E: StorageEngine> {
     /// Holding the lock serialises commits, which keeps them logged and
     /// applied in Commit Timestamp order.
     pub(crate) commits: Mutex<CommitState>,
+    /// The newest Commit Timestamp Applied to the engine; new Snapshots are
+    /// taken here without taking the commit lock.
+    pub(crate) newest_visible_ts: AtomicU64,
+    /// Active Snapshot timestamps mapped to how many open Transactions read them.
+    pub(crate) snapshot_registry: Mutex<BTreeMap<u64, usize>>,
 }
 
 impl<E: StorageEngine> Node<E> {
@@ -115,6 +121,8 @@ impl<E: StorageEngine> Node<E> {
             engine,
             limits,
             commits: Mutex::new(CommitState::new(last, wal)),
+            newest_visible_ts: AtomicU64::new(last),
+            snapshot_registry: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -123,10 +131,45 @@ impl<E: StorageEngine> Node<E> {
         &self.limits
     }
 
+    /// The oldest Snapshot any active Transaction reads, or the newest Visible
+    /// commit when no Transaction is active (see `GLOSSARY.md`).
+    pub fn horizon(&self) -> u64 {
+        let reg = self.snapshot_registry.lock().expect("registry poisoned");
+        reg.keys().next().copied().unwrap_or_else(|| {
+            self.newest_visible_ts.load(Ordering::Acquire)
+        })
+    }
+
+    pub(crate) fn register_snapshot(&self) -> u64 {
+        let mut reg = self.snapshot_registry.lock().expect("registry poisoned");
+        let ts = self.newest_visible_ts.load(Ordering::Acquire);
+        *reg.entry(ts).or_default() += 1;
+        ts
+    }
+
+    pub(crate) fn register_snapshot_at(&self, ts: u64) {
+        let mut reg = self.snapshot_registry.lock().expect("registry poisoned");
+        *reg.entry(ts).or_default() += 1;
+    }
+
+    pub(crate) fn unregister_snapshot(&self, snapshot_ts: u64) {
+        let mut reg = self.snapshot_registry.lock().expect("registry poisoned");
+        if let std::collections::btree_map::Entry::Occupied(mut entry) = reg.entry(snapshot_ts) {
+            if *entry.get() <= 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+    }
+
     /// Begin a Transaction with a Snapshot of everything committed so far.
     pub fn begin(&self) -> Transaction<'_, E> {
-        let snapshot_ts = self.commits.lock().expect("lock poisoned").last();
-        Transaction::new(self, snapshot_ts)
+        if self.commits.is_poisoned() {
+            panic!("commit lock poisoned");
+        }
+        let snapshot_ts = self.register_snapshot();
+        Transaction::from_registered(self, snapshot_ts)
     }
 
     /// Run `work` in a new Transaction and commit it if `work` succeeds.
@@ -225,4 +268,22 @@ impl<E: StorageEngine> Node<E> {
     pub fn find(&self, collection: &CollectionPath, filter: &Document) -> Result<Vec<Document>> {
         self.run(|t| t.find(collection, filter))
     }
+
+    /// Induces a panic while holding the commit lock to poison it for testing.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn poison_commit_lock_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.commits.lock().unwrap();
+            panic!("test induced panic to poison commit lock");
+        }));
+    }
+}
+
+#[allow(dead_code)]
+fn assert_send_sync<E: StorageEngine + 'static>() {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    assert_send::<Node<E>>();
+    assert_sync::<Node<E>>();
+    assert_send::<Transaction<'static, E>>();
 }

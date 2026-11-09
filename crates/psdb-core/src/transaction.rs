@@ -2,8 +2,8 @@
 //! wins Snapshot Isolation at commit.
 
 use std::collections::{BTreeMap, BTreeSet};
-
 use std::ops::ControlFlow;
+use std::sync::atomic::Ordering;
 
 use bson::{Bson, Document, RawDocument};
 use psdb_storage::{KeyRange, StorageEngine};
@@ -108,6 +108,11 @@ pub struct Transaction<'node, E: StorageEngine> {
 
 impl<'node, E: StorageEngine> Transaction<'node, E> {
     pub(crate) fn new(node: &'node Node<E>, snapshot_ts: u64) -> Self {
+        node.register_snapshot_at(snapshot_ts);
+        Self::from_registered(node, snapshot_ts)
+    }
+
+    pub(crate) fn from_registered(node: &'node Node<E>, snapshot_ts: u64) -> Self {
         Self {
             node,
             snapshot_ts,
@@ -125,9 +130,14 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         snapshot_ts: u64,
         write_set: WriteSet,
     ) -> Self {
+        node.register_snapshot_at(snapshot_ts);
         Self {
+            node,
+            snapshot_ts,
             write_set,
-            ..Self::new(node, snapshot_ts)
+            write_set_bytes: 0,
+            catalog_reads: BTreeSet::new(),
+            collection_reads: BTreeSet::new(),
         }
     }
 
@@ -440,9 +450,19 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 return Err(Error::WriteConflict);
             }
         }
-        commits.apply(engine, &self.write_set)
+        let commit_ts = commits.apply(engine, &self.write_set)?;
+        self.node
+            .newest_visible_ts
+            .store(commit_ts, Ordering::Release);
+        Ok(commit_ts)
     }
 
     /// Abort, discarding the Write Set. Same as dropping the Transaction.
     pub fn abort(self) {}
+}
+
+impl<'node, E: StorageEngine> Drop for Transaction<'node, E> {
+    fn drop(&mut self) {
+        self.node.unregister_snapshot(self.snapshot_ts);
+    }
 }
