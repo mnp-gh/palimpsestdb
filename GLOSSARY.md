@@ -99,8 +99,12 @@ The isolation level where every outcome matches some serial order of the committ
 _Avoid_: Strict, strong (unqualified)
 
 **Garbage Collection**:
-Removing Versions that no active Snapshot can read any more: Versions older than the newest one each key had at the oldest active Snapshot, and every Version under a dropped Collection or Index once no active Snapshot can see it. It never changes what any Transaction sees.
+Removing Versions that no active Snapshot can read any more: Versions older than the newest one each key had at the Horizon, and every Version under a dropped Collection or Index once the Horizon is past its drop. It never changes what any Transaction sees.
 _Avoid_: Vacuum, compaction (that is a Storage Engine's own housekeeping), cleanup
+
+**Horizon**:
+The oldest Snapshot any active Transaction reads, or the newest Visible commit when no Transaction is active. Every Snapshot now open or taken later is at or after it, so Garbage Collection may remove whatever no Snapshot at or after the Horizon can read. It only moves forward.
+_Avoid_: Low-water mark, oldest snapshot (when the Horizon is meant), watermark
 
 **Read Marker**:
 A record that a Transaction read a key, a range or a whole Collection, kept so Serializable can detect dangerous interleavings. It never blocks anyone.
