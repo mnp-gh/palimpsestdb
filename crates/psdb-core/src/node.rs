@@ -42,7 +42,7 @@ pub struct Node<E: StorageEngine> {
     pub(crate) limits: Limits,
     /// Holding the lock serialises commits, which keeps them logged and
     /// applied in Commit Timestamp order.
-    pub(crate) commits: Mutex<CommitState>,
+    pub(crate) commit_lock: Mutex<CommitState>,
     /// The newest Commit Timestamp Applied to the engine; new Snapshots are
     /// taken here without taking the commit lock.
     pub(crate) newest_visible_ts: AtomicU64,
@@ -120,7 +120,7 @@ impl<E: StorageEngine> Node<E> {
         Self {
             engine,
             limits,
-            commits: Mutex::new(CommitState::new(wal)),
+            commit_lock: Mutex::new(CommitState::new(wal)),
             newest_visible_ts: AtomicU64::new(last),
             snapshot_registry: Mutex::new(BTreeMap::new()),
         }
@@ -171,7 +171,7 @@ impl<E: StorageEngine> Node<E> {
 
     /// Begin a Transaction with a Snapshot of everything committed so far.
     pub fn begin(&self) -> Transaction<'_, E> {
-        if self.commits.is_poisoned() {
+        if self.commit_lock.is_poisoned() {
             panic!("commit lock poisoned");
         }
         let snapshot_ts = self.register_snapshot();
@@ -279,7 +279,7 @@ impl<E: StorageEngine> Node<E> {
     #[cfg(any(test, feature = "testing"))]
     pub fn poison_commit_lock_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = self.commits.lock().unwrap();
+            let _guard = self.commit_lock.lock().unwrap();
             panic!("test induced panic to poison commit lock");
         }));
     }

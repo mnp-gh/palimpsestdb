@@ -68,7 +68,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 **A read** (`Transaction::read`, `scan_range`) sees the Snapshot with the Transaction's own writes laid over it. `find` parses the filter and asks `index::plan` for candidate ranges. With no plan, it scans the Collection's Documents. A `Documents` range is read directly. An `Index` range yields Document IDs, which are then fetched. Every candidate is rechecked against the whole filter (`Filter::matches_raw`).
 
-**A commit** (`Transaction::commit`) takes the commit lock (`Node::commits`), then:
+**A commit** (`Transaction::commit`) takes the commit lock (`Node::commit_lock`), then:
 
 1. Fails if the Node is poisoned. A Transaction that wrote nothing commits at once.
 2. Aborts with Collection Changed if a Catalog entry it read, or a Collection it read whole, changed since its Snapshot.
