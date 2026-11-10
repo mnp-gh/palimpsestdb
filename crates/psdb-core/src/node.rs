@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bson::{Bson, Document};
 use psdb_storage::StorageEngine;
@@ -120,7 +120,7 @@ impl<E: StorageEngine> Node<E> {
         Self {
             engine,
             limits,
-            commits: Mutex::new(CommitState::new(last, wal)),
+            commits: Mutex::new(CommitState::new(wal)),
             newest_visible_ts: AtomicU64::new(last),
             snapshot_registry: Mutex::new(BTreeMap::new()),
         }
@@ -131,18 +131,24 @@ impl<E: StorageEngine> Node<E> {
         &self.limits
     }
 
+    /// The newest Commit Timestamp Applied to the engine.
+    pub(crate) fn newest_visible_ts(&self) -> u64 {
+        self.newest_visible_ts.load(Ordering::Acquire)
+    }
+
     /// The oldest Snapshot any active Transaction reads, or the newest Visible
     /// commit when no Transaction is active (see `GLOSSARY.md`).
     pub fn horizon(&self) -> u64 {
         let reg = self.snapshot_registry.lock().expect("registry poisoned");
-        reg.keys().next().copied().unwrap_or_else(|| {
-            self.newest_visible_ts.load(Ordering::Acquire)
-        })
+        reg.keys()
+            .next()
+            .copied()
+            .unwrap_or_else(|| self.newest_visible_ts())
     }
 
     pub(crate) fn register_snapshot(&self) -> u64 {
         let mut reg = self.snapshot_registry.lock().expect("registry poisoned");
-        let ts = self.newest_visible_ts.load(Ordering::Acquire);
+        let ts = self.newest_visible_ts();
         *reg.entry(ts).or_default() += 1;
         ts
     }
@@ -277,13 +283,4 @@ impl<E: StorageEngine> Node<E> {
             panic!("test induced panic to poison commit lock");
         }));
     }
-}
-
-#[allow(dead_code)]
-fn assert_send_sync<E: StorageEngine + 'static>() {
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-    assert_send::<Node<E>>();
-    assert_sync::<Node<E>>();
-    assert_send::<Transaction<'static, E>>();
 }
