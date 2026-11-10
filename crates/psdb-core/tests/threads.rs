@@ -2,12 +2,12 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use bson::{doc, Bson};
+use bson::{Bson, doc};
 use common::collection;
 use psdb_core::{Node, Transaction};
 use psdb_storage_memory::MemoryEngine;
@@ -87,7 +87,10 @@ fn begin_fails_fast_when_commit_lock_is_poisoned() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         node.begin();
     }));
-    assert!(result.is_err(), "begin() must fail fast on poisoned commit lock");
+    assert!(
+        result.is_err(),
+        "begin() must fail fast on poisoned commit lock"
+    );
 }
 
 #[test]
@@ -108,7 +111,8 @@ fn concurrent_threads_stress_test() {
             while running.load(Ordering::Relaxed) {
                 i += 1;
                 let id = Bson::String(format!("t{thread_id}_{i}"));
-                let _ = node.insert(&orders, doc! { "_id": id, "count": i });
+                node.insert(&orders, doc! { "_id": id, "count": i })
+                    .unwrap();
                 thread::yield_now();
             }
         }));
@@ -125,7 +129,7 @@ fn concurrent_threads_stress_test() {
                 let snap = txn.snapshot_ts();
                 // Horizon must never exceed any active transaction's snapshot.
                 assert!(node.horizon() <= snap);
-                let _ = txn.find(&orders, &doc! {});
+                txn.find(&orders, &doc! {}).unwrap();
                 thread::yield_now();
             }
         }));

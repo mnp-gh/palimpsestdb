@@ -1,6 +1,6 @@
 # Thread-safe Node, visibility watermark, Snapshot registry
 
-Status: done
+Status: resolved
 
 Spec: [Threads](../spec.md#threads).
 
