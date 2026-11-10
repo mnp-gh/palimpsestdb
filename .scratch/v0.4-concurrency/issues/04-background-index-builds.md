@@ -10,3 +10,5 @@ Spec: [Index builds](../spec.md#index-builds), [ADR 0013](../../../docs/adr/0013
 - The commit lock is taken per chunk, reading at the newest Commit Timestamp.
 - Drop cancels the build; Recovery drops Building Indexes.
 - CLI `indexes` shows the state.
+- Tests: a Transaction whose Snapshot predates the Building commit aborts with Collection Changed (ADR 0013); a long build while other threads commit; drop during a build; crash during a build.
+- Update `ARCHITECTURE.md` for the changed flows and invariants.
