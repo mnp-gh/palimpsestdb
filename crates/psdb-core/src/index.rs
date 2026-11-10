@@ -394,7 +394,7 @@ impl<E: StorageEngine> Node<E> {
         path: &FieldPath,
         unique: bool,
     ) -> Result<()> {
-        let mut commits = self.commits.lock().expect("lock poisoned");
+        let mut commits = self.commit_lock.lock().expect("lock poisoned");
         let mut txn = Transaction::new(self, self.newest_visible_ts());
         let (mut entry, index) = txn.prepare_index(collection, path, unique)?;
         self.build_index(&mut commits, &entry, &index, txn.snapshot_ts())?;

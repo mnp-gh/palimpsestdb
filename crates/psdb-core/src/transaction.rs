@@ -407,7 +407,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// or not, fails with [`Error::Poisoned`].
     pub fn commit(self) -> Result<u64> {
         let node = self.node;
-        let mut commits = node.commits.lock().expect("lock poisoned");
+        let mut commits = node.commit_lock.lock().expect("lock poisoned");
         self.commit_locked(&mut commits)
     }
 
