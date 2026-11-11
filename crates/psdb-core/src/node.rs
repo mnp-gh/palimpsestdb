@@ -15,8 +15,8 @@ use crate::field_path::FieldPath;
 use crate::index::IndexInfo;
 use crate::mvcc;
 use crate::schema::FieldSchema;
-use crate::transaction::{self, CommitState, Transaction};
-use crate::wal::{OsWalFile, Wal, WalFile};
+use crate::transaction::{self, Transaction, WriteSet, writes};
+use crate::wal::{self, OsWalFile, Wal, WalFile};
 
 /// An embedded PalimpsestDB Node over the Storage Engine `E`.
 ///
@@ -53,6 +53,55 @@ pub struct Node<E: StorageEngine> {
     pub(crate) latest_visible_commit_ts: AtomicU64,
     /// Active Snapshot timestamps mapped to how many open Transactions read them.
     pub(crate) snapshot_registry: Mutex<BTreeMap<u64, usize>>,
+}
+
+/// The state commits serialise on, behind [`Node`]'s commit lock. Only
+/// [`Transaction::commit_locked`] should change it, so every commit is
+/// checked, logged and Applied in one place; `apply` skips the checks.
+pub(crate) struct CommitState {
+    /// `None` when nothing is durable.
+    wal: Option<Wal>,
+    /// Set when a commit's outcome is unknown; nothing more may commit.
+    pub(crate) poisoned: bool,
+}
+
+impl CommitState {
+    pub(crate) fn new(wal: Option<Wal>) -> Self {
+        Self {
+            wal,
+            poisoned: false,
+        }
+    }
+
+    /// Log, Apply and publish a Write Set that has passed its conflict
+    /// checks, at the Commit Timestamp after `latest_visible_commit_ts`.
+    pub(crate) fn apply<E: StorageEngine>(
+        &mut self,
+        engine: &E,
+        latest_visible_commit_ts: &AtomicU64,
+        write_set: &WriteSet,
+    ) -> Result<u64> {
+        // Only the commit lock's holder stores it, so this load sees the newest.
+        let commit_ts = latest_visible_commit_ts.load(Ordering::Relaxed) + 1;
+        let Some(wal) = &mut self.wal else {
+            engine.write_batch(mvcc::commit_batch(commit_ts, writes(write_set)))?;
+            latest_visible_commit_ts.store(commit_ts, Ordering::Release);
+            return Ok(commit_ts);
+        };
+        let record = wal::encode_record(commit_ts, writes(write_set))?;
+        // Once the record may be in the WAL, any failure leaves the outcome
+        // unknown, and retrying fsync is unsafe (ADR 0004).
+        let outcome = wal.append(&record).map_err(Error::Io).and_then(|()| {
+            let batch = mvcc::commit_batch(commit_ts, writes(write_set));
+            Ok(engine.write_batch(batch)?)
+        });
+        if let Err(cause) = outcome {
+            self.poisoned = true;
+            return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
+        }
+        latest_visible_commit_ts.store(commit_ts, Ordering::Release);
+        Ok(commit_ts)
+    }
 }
 
 impl<E: StorageEngine> Node<E> {

@@ -37,9 +37,9 @@ use crate::field_path::FieldPath;
 use crate::filter::{CompareOp, Filter};
 use crate::keys;
 use crate::mvcc;
-use crate::node::Node;
+use crate::node::{CommitState, Node};
 use crate::schema::FieldType;
-use crate::transaction::{CommitState, Transaction, WriteSet};
+use crate::transaction::{Transaction, WriteSet};
 
 /// An Index build commits the entries for at most this many Documents at a
 /// time...
