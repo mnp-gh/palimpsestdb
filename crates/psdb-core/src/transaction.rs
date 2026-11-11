@@ -397,7 +397,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 return Err(Error::WriteConflict);
             }
         }
-        commits.apply(engine, &self.node.latest_visible_commit_ts, &self.write_set)
+        commits.apply_commit(engine, &self.node.latest_visible_commit_ts, &self.write_set)
     }
 
     /// Abort, discarding the Write Set. Same as dropping the Transaction.
