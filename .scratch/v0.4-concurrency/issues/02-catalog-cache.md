@@ -1,6 +1,6 @@
 # In-RAM Catalog cache
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01
 
 Spec: [Catalog cache](../spec.md#catalog-cache).

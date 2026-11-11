@@ -111,6 +111,22 @@ pub(crate) fn collection_entry_key(namespace_id: u32, name: &str) -> Vec<u8> {
     key
 }
 
+/// Whether `logical` is a Namespace or Collection entry, the keys the
+/// Catalog cache holds. Checked on every read, so it allocates nothing.
+pub(crate) fn is_catalog_entry_key(logical: &[u8]) -> bool {
+    let Some((namespace, rest)) = logical.split_first_chunk::<4>() else {
+        return false;
+    };
+    let Some((collection, _)) = rest.split_first_chunk::<4>() else {
+        return false;
+    };
+    u32::from_be_bytes(*namespace) == SYSTEM_NAMESPACE
+        && matches!(
+            u32::from_be_bytes(*collection),
+            NAMESPACES_COLLECTION | COLLECTIONS_COLLECTION
+        )
+}
+
 /// The key that marks a Namespace ID as used, forever (ADR 0006).
 pub(crate) fn namespace_id_key(id: u32) -> Vec<u8> {
     let mut key = collection_prefix(SYSTEM_NAMESPACE, NAMESPACE_IDS_COLLECTION);

@@ -55,7 +55,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 ## Flows
 
-**Opening.** `Node::open` opens the WAL file and locks it, so a second Node on the same directory fails to open. `Wal::open` reads every record, truncates a torn one at the end, and fsyncs the file, so no record it returns can be lost to a later power cut. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch`, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
+**Opening.** `Node::open` opens the WAL file and locks it, so a second Node on the same directory fails to open. `Wal::open` reads every record, truncates a torn one at the end, and fsyncs the file, so no record it returns can be lost to a later power cut. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch` and records its Catalog entries in the Catalog cache, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
 
 **Beginning** (`Node::begin_transaction`) never takes the commit lock. Under the Snapshot registry's own lock it loads `latest_visible_commit_ts` and registers that Snapshot; dropping the Transaction unregisters it. `Node::horizon` reads the oldest registered Snapshot under the same lock, so no Snapshot registers below a Horizon already handed out.
 
@@ -66,7 +66,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 3. `write_document` checks Strict Fields. Then, for every Index, `CollectionEntry::index_entry` works out the old and new entries, and a unique Index refuses a value another Document owns.
 4. `write_all` adds the Document and its Index entry changes to the Write Set together, or adds none of them if they would cross the Write Set cap.
 
-**A read** (`Transaction::read`, `scan_range`) sees the Snapshot with the Transaction's own writes laid over it. `find` parses the filter and asks `index::plan` for candidate ranges. With no plan, it scans the Collection's Documents. A `Documents` range is read directly. An `Index` range yields Document IDs, which are then fetched. Every candidate is rechecked against the whole filter (`Filter::matches_raw`).
+**A read** (`Transaction::read`, `scan_range`) sees the Snapshot with the Transaction's own writes laid over it. A point read of a Namespace or Collection entry asks `Node::catalog_cache` first: it holds each entry's newest Version, so it answers when that Version is at or before the Snapshot, or when the key was never written; only an entry changed since the Snapshot goes to the engine. Debug builds check every cached answer against the engine. Listings and ID keys always read the engine. `find` parses the filter and asks `index::plan` for candidate ranges. With no plan, it scans the Collection's Documents. A `Documents` range is read directly. An `Index` range yields Document IDs, which are then fetched. Every candidate is rechecked against the whole filter (`Filter::matches_raw`).
 
 **A commit** (`Transaction::commit`) takes the commit lock (`Node::commit_lock`), then:
 
@@ -74,7 +74,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 2. Aborts with Collection Changed if a Catalog entry it read, or a Collection it read whole, changed since its Snapshot.
 3. Aborts with Write Conflict if any key it writes was committed since its Snapshot (first-committer-wins).
 4. Calls `CommitState::apply_commit`, which takes the next Commit Timestamp, appends and fsyncs the WAL record, then writes one engine batch: every Version plus `applied_up_to`. A failure after the append poisons the Node with Commit Outcome Unknown (ADR 0004).
-5. `apply_commit` then stores the Commit Timestamp in `Node::latest_visible_commit_ts`, the only copy of it, which makes the commit Visible.
+5. `apply_commit` then records the commit's Catalog entries in `Node::catalog_cache`, and only then stores the Commit Timestamp in `Node::latest_visible_commit_ts`, the only copy of it, which makes the commit Visible.
 
 **Catalog changes** (creating or dropping Namespaces and Collections, schema and Index changes) are ordinary writes to Catalog keys, so they commit or abort with the rest of their Transaction (ADR 0006). Changing a schema or the Indexes rewrites the Collection's entry. A concurrent writer recorded a read of that entry, so it aborts at commit.
 
@@ -91,6 +91,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 - **Versions are never changed in place.** A write adds a Version, and a delete adds a tombstone. Nothing is garbage-collected yet (v0.4).
 - **The engine stays unaware of Versions.** MVCC, Transactions and the Catalog all live above the `StorageEngine` trait (ADR 0001).
 - **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState` lives in `node`, beside the commit lock; `Transaction::commit_locked` is the only caller of `CommitState::apply_commit`, Index build chunks included. `Node::latest_visible_commit_ts` is stored only by `CommitState::apply_commit`, under the commit lock.
+- **The Catalog cache is complete and never behind a Visible commit.** It holds every Namespace and Collection entry ever written, Tombstones included, and `apply_commit` updates it after the engine write and before publishing, under the commit lock. Publishing first would let a Snapshot at the new timestamp read the entry the commit replaced.
 - **Snapshots never go below the Horizon.** `latest_visible_commit_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward.
 - **The WAL comes first.** A commit is in the WAL and fsynced before the engine sees it. If the outcome is unknown, nothing more commits until the Node is reopened.
 - **A Document and its Index entries change in one Write Set.** Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.

@@ -121,6 +121,36 @@ fn catalog_is_frozen_at_the_snapshot() {
 }
 
 #[test]
+fn a_dropped_collection_stays_readable_at_an_older_snapshot() {
+    let node = common::shop();
+    node.insert(&collection("shop.orders"), doc! { "_id": 1 })
+        .unwrap();
+    let mut t1 = node.begin_transaction();
+    node.drop_collection(&collection("shop.orders")).unwrap();
+    assert!(
+        t1.get(&collection("shop.orders"), &Bson::Int32(1))
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        node.get(&collection("shop.orders"), &Bson::Int32(1)),
+        Err(Error::NoSuchCollection { .. })
+    ));
+}
+
+#[test]
+fn own_drop_hides_a_collection_before_commit() {
+    let node = common::shop();
+    let mut t = node.begin_transaction();
+    t.drop_collection(&collection("shop.orders")).unwrap();
+    assert!(matches!(
+        t.insert(&collection("shop.orders"), doc! {}),
+        Err(Error::NoSuchCollection { .. })
+    ));
+    assert_eq!(node.list_collections("shop").unwrap(), ["orders"]);
+}
+
+#[test]
 fn write_into_concurrently_dropped_collection_aborts() {
     let node = common::shop();
     let mut t1 = node.begin_transaction();

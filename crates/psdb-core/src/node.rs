@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bson::{Bson, Document};
 use psdb_storage::StorageEngine;
 
+use crate::catalog::CatalogCache;
 use crate::collection_path::CollectionPath;
 use crate::document::Limits;
 use crate::error::{Error, Result};
@@ -51,6 +52,9 @@ pub struct Node<E: StorageEngine> {
     /// outside [`CommitState`] because `begin_transaction()` and reads load it without
     /// taking the commit lock.
     pub(crate) latest_visible_commit_ts: AtomicU64,
+    /// Only the commit lock's holder updates it, after the engine write and
+    /// before publishing. Its own lock keeps Catalog reads off the commit lock.
+    pub(crate) catalog_cache: CatalogCache,
     /// Active Snapshot timestamps mapped to how many open Transactions read them.
     pub(crate) snapshot_registry: Mutex<BTreeMap<u64, usize>>,
 }
@@ -78,6 +82,7 @@ impl CommitState {
     pub(crate) fn apply_commit<E: StorageEngine>(
         &mut self,
         engine: &E,
+        catalog_cache: &CatalogCache,
         latest_visible_commit_ts: &AtomicU64,
         write_set: &WriteSet,
     ) -> Result<u64> {
@@ -85,6 +90,7 @@ impl CommitState {
         let commit_ts = latest_visible_commit_ts.load(Ordering::Relaxed) + 1;
         let Some(wal) = &mut self.wal else {
             engine.write_batch(mvcc::commit_batch(commit_ts, writes(write_set)))?;
+            catalog_cache.record(commit_ts, write_set);
             latest_visible_commit_ts.store(commit_ts, Ordering::Release);
             return Ok(commit_ts);
         };
@@ -99,6 +105,9 @@ impl CommitState {
             self.poisoned = true;
             return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
         }
+        // Before publishing: a Snapshot at `commit_ts` must not find the
+        // cached entry this commit replaces.
+        catalog_cache.record(commit_ts, write_set);
         latest_visible_commit_ts.store(commit_ts, Ordering::Release);
         Ok(commit_ts)
     }
@@ -119,7 +128,13 @@ impl<E: StorageEngine> Node<E> {
         if mvcc::any_version_under(&engine, &[])? {
             return Err(Error::EngineNotEmpty);
         }
-        Ok(Self::from_parts(engine, limits, 0, None))
+        Ok(Self::from_parts(
+            engine,
+            limits,
+            0,
+            None,
+            CatalogCache::default(),
+        ))
     }
 
     /// Open a durable Node whose WAL lives in `dir`, creating `dir` and
@@ -159,23 +174,38 @@ impl<E: StorageEngine> Node<E> {
             return Err(Error::EngineNotEmpty);
         }
         let (wal, records) = Wal::open(Box::new(wal))?;
+        let catalog_cache = CatalogCache::default();
         let mut last = 0;
         for record in &records {
             engine.write_batch(mvcc::commit_batch(
                 record.commit_ts,
                 transaction::writes(&record.write_set),
             ))?;
+            catalog_cache.record(record.commit_ts, &record.write_set);
             last = record.commit_ts;
         }
-        Ok(Self::from_parts(engine, limits, last, Some(wal)))
+        Ok(Self::from_parts(
+            engine,
+            limits,
+            last,
+            Some(wal),
+            catalog_cache,
+        ))
     }
 
-    fn from_parts(engine: E, limits: Limits, last: u64, wal: Option<Wal>) -> Self {
+    fn from_parts(
+        engine: E,
+        limits: Limits,
+        last: u64,
+        wal: Option<Wal>,
+        catalog_cache: CatalogCache,
+    ) -> Self {
         Self {
             engine,
             limits,
             commit_lock: Mutex::new(CommitState::new(wal)),
             latest_visible_commit_ts: AtomicU64::new(last),
+            catalog_cache,
             snapshot_registry: Mutex::new(BTreeMap::new()),
         }
     }
