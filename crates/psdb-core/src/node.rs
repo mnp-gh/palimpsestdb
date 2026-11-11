@@ -57,7 +57,7 @@ pub struct Node<E: StorageEngine> {
 
 /// The state commits serialise on, behind [`Node`]'s commit lock. Only
 /// [`Transaction::commit_locked`] should change it, so every commit is
-/// checked, logged and Applied in one place; `apply` skips the checks.
+/// checked, logged and Applied in one place; `apply_commit` skips the checks.
 pub(crate) struct CommitState {
     /// `None` when nothing is durable.
     wal: Option<Wal>,
@@ -75,7 +75,7 @@ impl CommitState {
 
     /// Log, Apply and publish a Write Set that has passed its conflict
     /// checks, at the Commit Timestamp after `latest_visible_commit_ts`.
-    pub(crate) fn apply<E: StorageEngine>(
+    pub(crate) fn apply_commit<E: StorageEngine>(
         &mut self,
         engine: &E,
         latest_visible_commit_ts: &AtomicU64,
