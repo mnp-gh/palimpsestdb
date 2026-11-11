@@ -112,12 +112,24 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         self.collection_content_reads.insert(prefix);
     }
 
-    /// Read a logical key: own writes first, then the Snapshot.
+    /// Read a logical key: own writes first, then the Snapshot, from the
+    /// Catalog cache when it has the answer.
     pub(crate) fn read(&self, logical: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.write_set.get(logical) {
-            Some(own) => Ok(own.clone()),
-            None => mvcc::read_at(&self.node.engine, logical, self.snapshot_ts),
+        if let Some(own) = self.write_set.get(logical) {
+            return Ok(own.clone());
         }
+        if keys::is_catalog_entry_key(logical)
+            && let Some(cached) = self.node.catalog_cache.read_at(logical, self.snapshot_ts)
+        {
+            // Debug builds check the cache against the engine; release builds skip the read.
+            debug_assert_eq!(
+                cached,
+                mvcc::read_at(&self.node.engine, logical, self.snapshot_ts)?,
+                "Catalog cache disagrees with the engine"
+            );
+            return Ok(cached);
+        }
+        mvcc::read_at(&self.node.engine, logical, self.snapshot_ts)
     }
 
     pub(crate) fn write(&mut self, logical: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
@@ -402,7 +414,12 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 return Err(Error::WriteConflict);
             }
         }
-        commit_state.apply_commit(engine, &self.node.latest_visible_commit_ts, &self.write_set)
+        commit_state.apply_commit(
+            engine,
+            &self.node.catalog_cache,
+            &self.node.latest_visible_commit_ts,
+            &self.write_set,
+        )
     }
 
     /// Abort, discarding the Write Set. Same as dropping the Transaction.
