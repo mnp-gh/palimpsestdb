@@ -394,13 +394,13 @@ impl<E: StorageEngine> Node<E> {
         path: &FieldPath,
         unique: bool,
     ) -> Result<()> {
-        let mut commits = self.commit_lock.lock().expect("lock poisoned");
+        let mut commit_state = self.commit_lock.lock().expect("lock poisoned");
         let mut txn = Transaction::new(self, self.latest_visible_commit_ts());
         let (mut entry, index) = txn.prepare_index(collection, path, unique)?;
-        self.build_index(&mut commits, &entry, &index, txn.snapshot_ts())?;
+        self.build_index(&mut commit_state, &entry, &index, txn.snapshot_ts())?;
         entry.indexes.push(index);
         txn.write_collection_entry(&entry)?;
-        txn.commit_locked(&mut commits)?;
+        txn.commit_locked(&mut commit_state)?;
         Ok(())
     }
 
@@ -408,7 +408,7 @@ impl<E: StorageEngine> Node<E> {
     /// `snapshot_ts`, one chunk at a time.
     fn build_index(
         &self,
-        commits: &mut CommitState,
+        commit_state: &mut CommitState,
         entry: &CollectionEntry,
         index: &IndexDef,
         snapshot_ts: u64,
@@ -459,7 +459,7 @@ impl<E: StorageEngine> Node<E> {
                 // Its keys are under an Index ID nothing else writes, so the
                 // conflict checks pass; they run so every commit takes one path.
                 Transaction::with_write_set(self, self.latest_visible_commit_ts(), chunk)
-                    .commit_locked(commits)?;
+                    .commit_locked(commit_state)?;
             }
             let Some(start) = next_chunk_start else {
                 return Ok(());
