@@ -356,14 +356,14 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// or not, fails with [`Error::Poisoned`].
     pub fn commit(self) -> Result<u64> {
         let node = self.node;
-        let mut commits = node.commit_lock.lock().expect("lock poisoned");
-        self.commit_locked(&mut commits)
+        let mut commit_state = node.commit_lock.lock().expect("lock poisoned");
+        self.commit_locked(&mut commit_state)
     }
 
     /// [`commit`](Self::commit), for a caller already holding the commit
     /// lock.
-    pub(crate) fn commit_locked(self, commits: &mut CommitState) -> Result<u64> {
-        if commits.poisoned {
+    pub(crate) fn commit_locked(self, commit_state: &mut CommitState) -> Result<u64> {
+        if commit_state.poisoned {
             return Err(Error::Poisoned);
         }
         // A read-only Transaction saw a consistent Snapshot and wrote nothing
@@ -397,7 +397,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 return Err(Error::WriteConflict);
             }
         }
-        commits.apply_commit(engine, &self.node.latest_visible_commit_ts, &self.write_set)
+        commit_state.apply_commit(engine, &self.node.latest_visible_commit_ts, &self.write_set)
     }
 
     /// Abort, discarding the Write Set. Same as dropping the Transaction.
