@@ -57,7 +57,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 **Opening.** `Node::open` opens the WAL file and locks it, so a second Node on the same directory fails to open. `Wal::open` reads every record, truncates a torn one at the end, and fsyncs the file, so no record it returns can be lost to a later power cut. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch`, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
 
-**Beginning** (`Node::begin`) never takes the commit lock. Under the Snapshot registry's own lock it loads `latest_visible_commit_ts` and registers that Snapshot; dropping the Transaction unregisters it. `Node::horizon` reads the oldest registered Snapshot under the same lock, so no Snapshot registers below a Horizon already handed out.
+**Beginning** (`Node::begin_transaction`) never takes the commit lock. Under the Snapshot registry's own lock it loads `latest_visible_commit_ts` and registers that Snapshot; dropping the Transaction unregisters it. `Node::horizon` reads the oldest registered Snapshot under the same lock, so no Snapshot registers below a Horizon already handed out.
 
 **A write** (`Transaction::insert`, `replace`, `delete`) touches only the Transaction's private Write Set:
 

@@ -18,7 +18,7 @@ fn reopen_replays_every_commit() {
         .unwrap();
     node.insert(&collection("shop.orders"), doc! { "_id": 2, "v": 2 })
         .unwrap();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     txn.replace(
         &collection("shop.orders"),
         &Bson::Int32(1),
@@ -40,7 +40,7 @@ fn reopen_replays_every_commit() {
     );
     assert_eq!(node.list_collections("shop").unwrap(), ["orders"]);
 
-    let next = node.begin();
+    let next = node.begin_transaction();
     assert!(next.snapshot_ts() > last, "Snapshots see recovered commits");
     drop(next);
     node.insert(&collection("shop.orders"), doc! { "_id": 3 })

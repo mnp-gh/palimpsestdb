@@ -207,7 +207,7 @@ proptest! {
         for f in &filters {
             same_in_both(&mut |coll| node.find(coll, f), f)?;
         }
-        let mut txn = node.begin();
+        let mut txn = node.begin_transaction();
         for op in &own_writes {
             let _ = apply(&mut txn, op);
         }
@@ -330,7 +330,7 @@ fn snapshots_see_the_index_as_of_their_timestamp() {
     let node = indexed("age", FieldType::Int, false, false);
     node.insert(&collection("shop.orders"), doc! { "_id": 7, "age": 30 })
         .unwrap();
-    let mut old = node.begin();
+    let mut old = node.begin_transaction();
     node.replace(
         &collection("shop.orders"),
         &Bson::Int32(7),
@@ -361,7 +361,7 @@ fn own_writes_are_found_through_the_index() {
     let node = indexed("age", FieldType::Int, false, false);
     node.insert(&collection("shop.orders"), doc! { "_id": 1, "age": 5 })
         .unwrap();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     txn.insert(&collection("shop.orders"), doc! { "_id": 2, "age": 5 })
         .unwrap();
     txn.delete(&collection("shop.orders"), &Bson::Int32(1))
@@ -438,7 +438,7 @@ fn unique_int_index_treats_30_and_30_0_as_the_same_value() {
 #[test]
 fn concurrent_duplicates_conflict() {
     let node = indexed("email", FieldType::String, true, true);
-    let (mut t1, mut t2) = (node.begin(), node.begin());
+    let (mut t1, mut t2) = (node.begin_transaction(), node.begin_transaction());
     t1.insert(
         &collection("shop.orders"),
         doc! { "_id": 1, "email": "a@x" },
@@ -477,7 +477,7 @@ fn failed_write_leaves_nothing_behind() {
         doc! { "_id": 1, "a": 1, "b": 1 },
     )
     .unwrap();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     let dup = txn.insert(
         &collection("shop.orders"),
         doc! { "_id": 2, "a": 2, "b": 1 },
@@ -667,7 +667,7 @@ fn index_inside_a_transaction_needs_an_empty_collection() {
     .unwrap();
     node.insert(&collection("shop.orders"), doc! { "n": 1 })
         .unwrap();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     assert!(matches!(
         txn.create_index_on_empty(&collection("shop.orders"), &field_path("n"), false),
         Err(Error::CollectionNotEmpty { .. })
@@ -703,7 +703,7 @@ fn concurrent_insert_aborts_an_index_created_on_an_empty_collection() {
         field(FieldType::Int, false),
     )
     .unwrap();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     txn.create_index_on_empty(&collection("shop.orders"), &field_path("n"), false)
         .unwrap();
     node.insert(&collection("shop.orders"), doc! { "n": 1 })
@@ -714,7 +714,7 @@ fn concurrent_insert_aborts_an_index_created_on_an_empty_collection() {
 #[test]
 fn concurrent_insert_aborts_making_a_field_strict() {
     let node = common::shop();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     txn.set_field_type(
         &collection("shop.orders"),
         &field_path("n"),
@@ -735,7 +735,7 @@ fn writer_aborts_when_indexes_change_under_it() {
         field(FieldType::Int, false),
     )
     .unwrap();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     txn.insert(&collection("shop.orders"), doc! { "n": 1 })
         .unwrap();
     node.create_index(&collection("shop.orders"), &field_path("n"), false)
@@ -853,7 +853,7 @@ fn write_set_cap_fails_the_write_that_crosses_it() {
     let node = Node::with_limits(MemoryEngine::new(), limits).unwrap();
     node.create_namespace("d").unwrap();
     node.create_collection(&collection("d.c")).unwrap();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     let mut written = 0;
     let err = loop {
         match txn.insert(
@@ -963,7 +963,7 @@ fn refused_index_in_a_transaction_writes_nothing() {
     .unwrap();
     node.insert(&collection("shop.orders"), doc! { "n": 1 })
         .unwrap();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     let snapshot = txn.snapshot_ts();
     assert!(matches!(
         txn.create_index_on_empty(&collection("shop.orders"), &field_path("n"), false),

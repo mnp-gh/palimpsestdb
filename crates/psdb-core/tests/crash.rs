@@ -73,7 +73,7 @@ fn upsert(t: &mut Transaction<'_, MemoryEngine>, id: i32, v: i32) -> psdb_core::
 
 /// Run `txn`, the `sequence`th workload Transaction, and commit it.
 fn run(node: &Node<MemoryEngine>, sequence: i32, txn: &[Op]) -> psdb_core::Result<()> {
-    let mut t = node.begin();
+    let mut t = node.begin_transaction();
     upsert(&mut t, SEQUENCE_ID, sequence)?;
     for &(id, value) in txn {
         match value {

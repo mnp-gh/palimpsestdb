@@ -48,7 +48,7 @@ pub struct Node<E: StorageEngine> {
     /// the WAL with a newer timestamp; it becomes Visible only once Applied.
     ///
     /// Only the commit lock's holder stores it, after the apply. It lives
-    /// outside [`CommitState`] because `begin()` and reads load it without
+    /// outside [`CommitState`] because `begin_transaction()` and reads load it without
     /// taking the commit lock.
     pub(crate) latest_visible_commit_ts: AtomicU64,
     /// Active Snapshot timestamps mapped to how many open Transactions read them.
@@ -224,7 +224,7 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Begin a Transaction with a Snapshot of everything committed so far.
-    pub fn begin(&self) -> Transaction<'_, E> {
+    pub fn begin_transaction(&self) -> Transaction<'_, E> {
         if self.commit_lock.is_poisoned() {
             panic!("commit lock poisoned");
         }
@@ -235,7 +235,7 @@ impl<E: StorageEngine> Node<E> {
     /// Run `work` in a new Transaction and commit it if `work` succeeds.
     /// If `work` fails, the Transaction is aborted and its error returned.
     pub fn run<T>(&self, work: impl FnOnce(&mut Transaction<'_, E>) -> Result<T>) -> Result<T> {
-        let mut txn = self.begin();
+        let mut txn = self.begin_transaction();
         let out = work(&mut txn)?;
         txn.commit()?;
         Ok(out)

@@ -214,7 +214,7 @@ fn execute<'node>(
             if txn.is_some() {
                 return Err("a transaction is already open; commit or abort it first".into());
             }
-            *txn = Some(node.begin());
+            *txn = Some(node.begin_transaction());
         }
         "commit" => {
             let open = txn.take().ok_or("no open transaction")?;
