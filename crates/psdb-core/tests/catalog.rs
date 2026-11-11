@@ -64,7 +64,7 @@ fn errors_name_what_is_missing_or_taken() {
 #[test]
 fn ddl_rolls_back_with_its_transaction() {
     let node = common::shop();
-    let mut t = node.begin();
+    let mut t = node.begin_transaction();
     t.create_collection(&collection("shop.audit")).unwrap();
     t.insert(&collection("shop.audit"), doc! { "_id": 1 })
         .unwrap();
@@ -110,7 +110,7 @@ fn recreated_namespace_starts_empty() {
 #[test]
 fn catalog_is_frozen_at_the_snapshot() {
     let node = common::shop();
-    let mut t1 = node.begin();
+    let mut t1 = node.begin_transaction();
     assert_eq!(t1.list_collections("shop").unwrap(), ["orders"]);
     node.create_collection(&collection("shop.audit")).unwrap();
     assert_eq!(t1.list_collections("shop").unwrap(), ["orders"]);
@@ -123,7 +123,7 @@ fn catalog_is_frozen_at_the_snapshot() {
 #[test]
 fn write_into_concurrently_dropped_collection_aborts() {
     let node = common::shop();
-    let mut t1 = node.begin();
+    let mut t1 = node.begin_transaction();
     t1.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
     node.drop_collection(&collection("shop.orders")).unwrap();
@@ -137,7 +137,7 @@ fn write_into_concurrently_dropped_collection_aborts() {
 #[test]
 fn write_into_concurrently_dropped_namespace_aborts() {
     let node = common::shop();
-    let mut t1 = node.begin();
+    let mut t1 = node.begin_transaction();
     t1.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
     node.drop_namespace("shop").unwrap();
@@ -149,7 +149,7 @@ fn read_only_transactions_commit_even_if_a_collection_they_read_is_dropped() {
     let node = common::shop();
     node.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
-    let mut t1 = node.begin();
+    let mut t1 = node.begin_transaction();
     node.drop_collection(&collection("shop.orders")).unwrap();
     // The Snapshot still shows the Collection and its Document.
     assert_eq!(
@@ -163,8 +163,8 @@ fn read_only_transactions_commit_even_if_a_collection_they_read_is_dropped() {
 #[test]
 fn concurrent_writes_to_one_collection_do_not_conflict_through_the_catalog() {
     let node = common::shop();
-    let mut t1 = node.begin();
-    let mut t2 = node.begin();
+    let mut t1 = node.begin_transaction();
+    let mut t2 = node.begin_transaction();
     t1.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
     t2.insert(&collection("shop.orders"), doc! { "_id": 2 })
@@ -182,8 +182,8 @@ fn concurrent_writes_to_one_collection_do_not_conflict_through_the_catalog() {
 #[test]
 fn concurrent_create_of_one_name_conflicts() {
     let node = common::shop();
-    let mut t1 = node.begin();
-    let mut t2 = node.begin();
+    let mut t1 = node.begin_transaction();
+    let mut t2 = node.begin_transaction();
     t1.create_collection(&collection("shop.audit")).unwrap();
     t2.create_collection(&collection("shop.audit")).unwrap();
     t1.commit().unwrap();
@@ -193,8 +193,8 @@ fn concurrent_create_of_one_name_conflicts() {
 #[test]
 fn concurrent_creates_of_different_names_both_commit() {
     let node = common::shop();
-    let mut t1 = node.begin();
-    let mut t2 = node.begin();
+    let mut t1 = node.begin_transaction();
+    let mut t2 = node.begin_transaction();
     t1.create_namespace("acme").unwrap();
     t2.create_namespace("globex").unwrap();
     t1.create_collection(&collection("shop.audit")).unwrap();

@@ -27,7 +27,7 @@ fn horizon_tracks_active_snapshots_and_advances_on_drop() {
     let node = common::shop();
 
     // Begin a reader; horizon stays pinned to reader's snapshot.
-    let reader1 = node.begin();
+    let reader1 = node.begin_transaction();
     let snap1 = reader1.snapshot_ts();
     assert_eq!(node.horizon(), snap1);
 
@@ -37,7 +37,7 @@ fn horizon_tracks_active_snapshots_and_advances_on_drop() {
     assert_eq!(node.horizon(), snap1);
 
     // Begin a second reader at the new visible commit.
-    let reader2 = node.begin();
+    let reader2 = node.begin_transaction();
     let snap2 = reader2.snapshot_ts();
     assert!(snap2 > snap1);
     assert_eq!(node.horizon(), snap1);
@@ -56,7 +56,7 @@ fn horizon_advances_when_transaction_aborts_or_panics() {
     let node = Arc::new(common::shop());
 
     // Explicit abort unregisters.
-    let txn = node.begin();
+    let txn = node.begin_transaction();
     let snap = txn.snapshot_ts();
     assert_eq!(node.horizon(), snap);
     txn.abort();
@@ -64,7 +64,7 @@ fn horizon_advances_when_transaction_aborts_or_panics() {
     // Panic on a thread unregisters via Drop.
     let node_clone = Arc::clone(&node);
     let handle = thread::spawn(move || {
-        let _txn = node_clone.begin();
+        let _txn = node_clone.begin_transaction();
         panic!("simulated worker thread panic");
     });
     let _ = handle.join();
@@ -72,7 +72,7 @@ fn horizon_advances_when_transaction_aborts_or_panics() {
     // Horizon should not be pinned by the panicked thread.
     node.insert(&collection("shop.orders"), doc! { "item": "pen" })
         .unwrap();
-    let next_txn = node.begin();
+    let next_txn = node.begin_transaction();
     assert_eq!(node.horizon(), next_txn.snapshot_ts());
 }
 
@@ -83,13 +83,13 @@ fn begin_fails_fast_when_commit_lock_is_poisoned() {
     // Poison the commit lock by panicking while holding it.
     node.poison_commit_lock_for_test();
 
-    // begin() must detect the poisoned commit lock and panic.
+    // begin_transaction() must detect the poisoned commit lock and panic.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        node.begin();
+        node.begin_transaction();
     }));
     assert!(
         result.is_err(),
-        "begin() must fail fast on poisoned commit lock"
+        "begin_transaction() must fail fast on poisoned commit lock"
     );
 }
 
@@ -125,7 +125,7 @@ fn concurrent_threads_stress_test() {
         let running = Arc::clone(&running);
         handles.push(thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
-                let mut txn = node.begin();
+                let mut txn = node.begin_transaction();
                 let snap = txn.snapshot_ts();
                 // Horizon must never exceed any active transaction's snapshot.
                 assert!(node.horizon() <= snap);
@@ -145,6 +145,6 @@ fn concurrent_threads_stress_test() {
 
     // After all threads exit, horizon equals latest visible.
     let h = node.horizon();
-    let txn = node.begin();
+    let txn = node.begin_transaction();
     assert_eq!(h, txn.snapshot_ts());
 }

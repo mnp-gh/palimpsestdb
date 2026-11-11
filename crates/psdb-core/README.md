@@ -13,7 +13,7 @@ node.create_namespace("shop")?;
 let orders = "shop.orders".parse()?;
 node.create_collection(&orders)?;
 
-let mut txn = node.begin();
+let mut txn = node.begin_transaction();
 txn.insert(&orders, doc! { "_id": 1, "item": "book" })?;
 txn.commit()?;
 ```

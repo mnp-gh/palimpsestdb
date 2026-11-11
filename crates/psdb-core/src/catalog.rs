@@ -345,7 +345,7 @@ mod tests {
     fn id_of_an_empty_namespace_is_in_use() {
         let node = Node::new(MemoryEngine::new()).unwrap();
         node.create_namespace("shop").unwrap();
-        let mut txn = node.begin();
+        let mut txn = node.begin_transaction();
         let taken = txn.resolve_namespace("shop").unwrap();
         assert_eq!(txn.allocate_id_from([taken, 7], None).unwrap(), 7);
     }
@@ -356,7 +356,7 @@ mod tests {
         node.create_namespace("shop").unwrap();
         let orders = "shop.orders".parse().unwrap();
         node.create_collection(&orders).unwrap();
-        let mut txn = node.begin();
+        let mut txn = node.begin_transaction();
         let (ns_id, taken) = txn.resolve_collection(&orders).unwrap();
         assert_eq!(txn.allocate_id_from([taken, 7], Some(ns_id)).unwrap(), 7);
     }
@@ -374,7 +374,7 @@ mod tests {
         let n = "n".parse().unwrap();
         node.set_field_type(&orders, &n, int).unwrap();
         let index_ids = || {
-            let entry = node.begin().collection_entry(&orders).unwrap();
+            let entry = node.begin_transaction().collection_entry(&orders).unwrap();
             entry.indexes.iter().map(|ix| ix.id).collect::<Vec<_>>()
         };
         node.create_index(&orders, &n, false).unwrap();
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn concurrent_draws_of_one_id_conflict() {
         let node = Node::new(MemoryEngine::new()).unwrap();
-        let (mut t1, mut t2) = (node.begin(), node.begin());
+        let (mut t1, mut t2) = (node.begin_transaction(), node.begin_transaction());
         t1.allocate_id_from([7], None).unwrap();
         t2.allocate_id_from([7], None).unwrap();
         t1.commit().unwrap();
