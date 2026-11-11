@@ -147,6 +147,10 @@ _Avoid_: Constraint violation, duplicate key
 The failure of a write that gives a Strict Field a value of another type. Not an Abort, and not retryable.
 _Avoid_: Schema violation, validation error
 
+**Index Build Cancelled**:
+The failure of an Index build whose Index or Collection was dropped while it ran. Not an Abort, and not retryable: retrying would undo the drop or find no Collection.
+_Avoid_: Build aborted
+
 **Node**:
 One running instance of PalimpsestDB. Until replication exists, PalimpsestDB runs as exactly one Node.
 _Avoid_: Server, instance, replica (until replication is designed), database (a Node holds many Namespaces)
@@ -162,7 +166,7 @@ One committed Transaction in the WAL: its Commit Timestamp and Write Set. Aborte
 _Avoid_: Log entry, journal entry
 
 **Recovery**:
-Replaying the WAL into the Storage Engine when a Node opens. A torn last WAL Record is cut off; damage anywhere else stops the Node from opening rather than lose Durable Transactions.
+Replaying the WAL into the Storage Engine when a Node opens, then dropping every Index still Building, since no build survives a restart. A torn last WAL Record is cut off; damage anywhere else stops the Node from opening rather than lose Durable Transactions.
 _Avoid_: Restore, repair
 
 **Durable**:

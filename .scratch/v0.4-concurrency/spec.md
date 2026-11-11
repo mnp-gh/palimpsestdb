@@ -45,11 +45,16 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 
 ## Index builds
 
-- `Node::create_index` first commits the Index to the Catalog entry as Building (`state` in `indexes`; entries written before v0.4 read as Ready). That commit takes the Index ID and moves `nextIndexId` past it, so every chunk's entries sit below the counter where Reclaim can find them if the build fails.
+- `Node::create_index` first commits the Index to the Catalog entry as Building (a required `state`, `"building"` or `"ready"`, on each of `indexes`; no compatibility with data written before v0.4, so recreate old data directories). That commit takes the Index ID and moves `nextIndexId` past it, so every chunk's entries sit below the counter where Reclaim can find them if the build fails. With the counter moved up front, `prepare_index` no longer skips IDs that already hold entries; delete that loop.
+- `IndexInfo` gains `state: IndexState` (`Building`, `Ready`); `list_indexes` returns both.
 - From that commit on, every write maintains a Building Index's entries and enforces its uniqueness (Duplicate Value); `find` plans only with Ready Indexes. A Transaction whose Snapshot predates the Building commit aborts with Collection Changed through the existing dependency on the Collection's Catalog entry; this is what makes skipping a catch-up pass safe (ADR 0013), so a test must cover it.
 - The build then takes the commit lock per chunk (1024 Documents or 16 MiB), reads that chunk at the newest Commit Timestamp, resuming after the last key it built, and commits its entries. A final commit marks the Index Ready. The calling thread runs the build; other threads commit between chunks.
-- A Building Index counts as its field's Index: a second `create_index` fails with Index Exists. Dropping the Collection makes the next chunk stop with Collection Changed; dropping the Index cancels the build the same way. A duplicate found by a unique build fails it with Duplicate Value and one commit removes the Catalog entry.
-- Recovery drops every Index still Building, in a commit, when the Node opens.
+- Each chunk first re-reads the Collection's Catalog entry at the newest Commit Timestamp and goes on only if it still has the same Collection ID and lists the same Index ID as Building. Matching IDs, not a Catalog dependency, so unrelated changes to the entry (another Index, another field's type) do not stop the build, and a drop followed by a new Index on the same field does.
+- The Ready commit and the cleanup commit are read-modify-writes under the commit lock: read the newest entry, change or remove only this Index, commit. Writing back the entry read at the start would undo a concurrent build's Building commit on another field.
+- A unique build finding an existing entry for its value fails only if the entry names a different Document; a writer may already have indexed this one.
+- A Building Index counts as its field's Index: a second `create_index` fails with Index Exists. Dropping the Collection or the Index makes the next chunk stop with Index Build Cancelled (a new `Error` variant, not an Abort, not retryable).
+- On any failure (Duplicate Value, I/O, Commit Outcome Unknown) one commit tries to remove the Catalog entry, and `create_index` returns the original error. If that cleanup fails or never runs (a panic), the Index stays Building, still maintained by writers, until `drop_index` or Recovery removes it.
+- Recovery drops every Index still Building when the Node opens, in one commit across all Collections, made only if there is one.
 
 ## Seams and simulator
 
