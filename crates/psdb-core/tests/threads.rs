@@ -31,7 +31,7 @@ fn horizon_tracks_active_snapshots_and_advances_on_drop() {
     let snap1 = reader1.snapshot_ts();
     assert_eq!(node.horizon(), snap1);
 
-    // Commit writes; newest_visible_ts advances, but horizon remains at snap1.
+    // Commit writes; latest_visible_commit_ts advances, but horizon remains at snap1.
     node.insert(&collection("shop.orders"), doc! { "item": "book" })
         .unwrap();
     assert_eq!(node.horizon(), snap1);
@@ -46,7 +46,7 @@ fn horizon_tracks_active_snapshots_and_advances_on_drop() {
     drop(reader1);
     assert_eq!(node.horizon(), snap2);
 
-    // Dropping reader2 advances horizon to newest_visible_ts.
+    // Dropping reader2 advances horizon to latest_visible_commit_ts.
     drop(reader2);
     assert!(node.horizon() >= snap2);
 }
