@@ -28,6 +28,10 @@ _Avoid_: Namespace (MongoDB's word for it, but a Namespace here is only the firs
 The authoritative record of which Namespaces and Collections exist and how their names map to their identities.
 _Avoid_: Metadata store, schema registry
 
+**Catalog entry**:
+The Catalog's record of one Namespace or one Collection: its name and identity, and for a Collection its Collection Schema and Indexes.
+_Avoid_: Metadata row
+
 **Index**:
 A secondary lookup over one field of a Collection's Documents, covering values of its field's Field Type, consistent with those Documents at every Snapshot. A unique Index also forbids two Documents from sharing a value in that field. While it is Building, writes keep it up to date (and enforce its uniqueness) but queries do not use it; it becomes Ready when its build finishes.
 _Avoid_: Secondary key, lookup table
@@ -89,6 +93,10 @@ _Avoid_: Version number, LSN, wall-clock time
 **Version**:
 One committed state of a key (a Document, an Index entry or a Catalog entry), identified by its Commit Timestamp.
 _Avoid_: Revision
+
+**Tombstone**:
+A Version that records a key's deletion: a deleted Document, a removed Index entry, or a dropped Namespace or Collection.
+_Avoid_: Delete marker
 
 **Snapshot Isolation**:
 The isolation level where each Transaction reads from its Snapshot and aborts if it writes a document that a concurrent Transaction already committed (first-committer-wins).

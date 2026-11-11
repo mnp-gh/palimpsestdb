@@ -65,7 +65,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 - `fjall` Storage Engine, passing the conformance suite, with block compression (LZ4 or zstd) enabled
 - Streaming scans: `find` iterates instead of loading the whole Collection into memory
-- Recovery replays only WAL Records above the engine's `applied_up_to` (today it replays the whole WAL into an empty engine)
+- Recovery replays only WAL Records above the engine's `applied_up_to` (today it replays the whole WAL into an empty engine). The Catalog cache is filled by replay today, so it must then be filled by scanning the engine's Catalog entries, Tombstones included
 
 ## v0.5: Serializable
 

@@ -27,6 +27,13 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 - Holds the newest Version of each Catalog entry with its Commit Timestamp, updated under the commit lock when a commit writes Catalog entries (Index build chunks write none). Drops are retained as tombstones and purged once the Horizon passes their Commit Timestamp during Garbage Collection.
 - A Transaction whose Snapshot is at or after an entry's timestamp reads it from the cache; an older Snapshot reads the engine. A Transaction's own Write Set still wins over both.
 - Catalog dependency checks at commit are unchanged.
+- Caches Namespace and Collection entries only; ID keys stay engine-only, since `allocate_id` asks whether any Version ever existed, not what a Snapshot sees.
+- Serves point reads only (`resolve_namespace`, `collection_entry`). Listings keep scanning the engine.
+- Holds raw bytes, `RwLock<HashMap<logical key, (Commit Timestamp, Option<bytes>)>>` on `Node`, beside the commit lock rather than inside `CommitState`, so readers never wait on a commit. The lookup sits inside `Transaction::read`; callers are unchanged.
+- The cache is complete, so a miss means absent at every Snapshot (a purged Tombstone is below the Horizon) and needs no engine read.
+- Commit order: engine write, then cache update, then publish `latest_visible_commit_ts`. Publishing first would let a Snapshot at the new timestamp read the old cached entry. Comment this where it is enforced; testing the race waits for the simulator (issue 06).
+- Filled on open by feeding each replayed WAL Record to the same function commits use.
+- Tests: in debug builds every cache answer is cross-checked against the engine with `debug_assert_eq!`. Plus: an old Snapshot still sees a Collection dropped after it began; a never-created Namespace reads as absent; a Transaction's own write beats the cache.
 
 ## Garbage Collection
 
