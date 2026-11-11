@@ -395,7 +395,7 @@ impl<E: StorageEngine> Node<E> {
         unique: bool,
     ) -> Result<()> {
         let mut commits = self.commit_lock.lock().expect("lock poisoned");
-        let mut txn = Transaction::new(self, self.newest_visible_ts());
+        let mut txn = Transaction::new(self, self.latest_visible_commit_ts());
         let (mut entry, index) = txn.prepare_index(collection, path, unique)?;
         self.build_index(&mut commits, &entry, &index, txn.snapshot_ts())?;
         entry.indexes.push(index);
@@ -441,8 +441,12 @@ impl<E: StorageEngine> Node<E> {
                 };
                 if index_entry.unique
                     && (chunk.contains_key(&index_entry.key)
-                        || mvcc::read_at(&self.engine, &index_entry.key, self.newest_visible_ts())?
-                            .is_some())
+                        || mvcc::read_at(
+                            &self.engine,
+                            &index_entry.key,
+                            self.latest_visible_commit_ts(),
+                        )?
+                        .is_some())
                 {
                     return Err(Error::DuplicateValue(format!(
                         "two documents share a value of {}, so it cannot have a unique index",
@@ -454,7 +458,7 @@ impl<E: StorageEngine> Node<E> {
             if !chunk.is_empty() {
                 // Its keys are under an Index ID nothing else writes, so the
                 // conflict checks pass; they run so every commit takes one path.
-                Transaction::with_write_set(self, self.newest_visible_ts(), chunk)
+                Transaction::with_write_set(self, self.latest_visible_commit_ts(), chunk)
                     .commit_locked(commits)?;
             }
             let Some(start) = next_chunk_start else {

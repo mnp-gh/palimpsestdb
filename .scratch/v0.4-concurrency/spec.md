@@ -19,8 +19,8 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 - `Node` is `Send + Sync`, shared across threads by `Arc` or scoped threads; a `Transaction` is `Send` and used by one thread at a time. A compile-time assertion checks both for `Node<MemoryEngine>`.
 - One commit lock still covers the conflict check, WAL append and fsync, and the apply. Its holder is the single in-order applier (ADR 0004).
 - A panic while holding the commit lock poisons the Rust `Mutex`; every later commit panics too, and the Node must be reopened (Recovery repairs a half-applied commit from the WAL). Turning this into an `Error` waits for the server (v0.6). `begin()` checks whether the lock is poisoned and fails fast.
-- Visibility watermark: `newest_visible_ts: AtomicU64`, stored with `Release` after the apply, still under the commit lock. `begin()` never takes the commit lock.
-- Snapshot registry: `begin()` takes a small registry lock, loads `newest_visible_ts` with `Acquire`, registers that Snapshot and releases the lock; dropping the Transaction (committed, aborted or abandoned) unregisters it via `Drop`. The Horizon is the oldest registered Snapshot, or `newest_visible_ts` when none is, read under the same lock, so no Snapshot can register below a Horizon already handed out.
+- Visibility watermark: `latest_visible_commit_ts: AtomicU64`, stored with `Release` after the apply, still under the commit lock. `begin()` never takes the commit lock.
+- Snapshot registry: `begin()` takes a small registry lock, loads `latest_visible_commit_ts` with `Acquire`, registers that Snapshot and releases the lock; dropping the Transaction (committed, aborted or abandoned) unregisters it via `Drop`. The Horizon is the oldest registered Snapshot, or `latest_visible_commit_ts` when none is, read under the same lock, so no Snapshot can register below a Horizon already handed out.
 
 ## Catalog cache
 

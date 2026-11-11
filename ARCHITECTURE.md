@@ -57,7 +57,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 **Opening.** `Node::open` opens the WAL file and locks it, so a second Node on the same directory fails to open. `Wal::open` reads every record, truncates a torn one at the end, and fsyncs the file, so no record it returns can be lost to a later power cut. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch`, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
 
-**Beginning** (`Node::begin`) never takes the commit lock. Under the Snapshot registry's own lock it loads `newest_visible_ts` and registers that Snapshot; dropping the Transaction unregisters it. `Node::horizon` reads the oldest registered Snapshot under the same lock, so no Snapshot registers below a Horizon already handed out.
+**Beginning** (`Node::begin`) never takes the commit lock. Under the Snapshot registry's own lock it loads `latest_visible_commit_ts` and registers that Snapshot; dropping the Transaction unregisters it. `Node::horizon` reads the oldest registered Snapshot under the same lock, so no Snapshot registers below a Horizon already handed out.
 
 **A write** (`Transaction::insert`, `replace`, `delete`) touches only the Transaction's private Write Set:
 
@@ -74,7 +74,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 2. Aborts with Collection Changed if a Catalog entry it read, or a Collection it read whole, changed since its Snapshot.
 3. Aborts with Write Conflict if any key it writes was committed since its Snapshot (first-committer-wins).
 4. Calls `CommitState::apply`, which takes the next Commit Timestamp, appends and fsyncs the WAL record, then writes one engine batch: every Version plus `applied_up_to`. A failure after the append poisons the Node with Commit Outcome Unknown (ADR 0004).
-5. `apply` then stores the Commit Timestamp in `Node::newest_visible_ts`, the only copy of it, which makes the commit Visible.
+5. `apply` then stores the Commit Timestamp in `Node::latest_visible_commit_ts`, the only copy of it, which makes the commit Visible.
 
 **Catalog changes** (creating or dropping Namespaces and Collections, schema and Index changes) are ordinary writes to Catalog keys, so they commit or abort with the rest of their Transaction (ADR 0006). Changing a schema or the Indexes rewrites the Collection's entry. A concurrent writer recorded a read of that entry, so it aborts at commit.
 
@@ -90,8 +90,8 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 - **Versions are never changed in place.** A write adds a Version, and a delete adds a tombstone. Nothing is garbage-collected yet (v0.4).
 - **The engine stays unaware of Versions.** MVCC, Transactions and the Catalog all live above the `StorageEngine` trait (ADR 0001).
-- **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState`'s fields are private to `transaction`, and `Transaction::commit_locked` is the only way to change them, Index build chunks included. `Node::newest_visible_ts` is stored only by `CommitState::apply`, under the commit lock.
-- **Snapshots never go below the Horizon.** `newest_visible_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward.
+- **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState`'s fields are private to `transaction`, and `Transaction::commit_locked` is the only way to change them, Index build chunks included. `Node::latest_visible_commit_ts` is stored only by `CommitState::apply`, under the commit lock.
+- **Snapshots never go below the Horizon.** `latest_visible_commit_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward.
 - **The WAL comes first.** A commit is in the WAL and fsynced before the engine sees it. If the outcome is unknown, nothing more commits until the Node is reopened.
 - **A Document and its Index entries change in one Write Set.** Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.
 - **IDs are never reused.** Namespace and Collection IDs are random, and their ID keys outlive a drop. Index IDs come from a per-Collection counter that only grows (ADR 0006).

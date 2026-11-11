@@ -43,9 +43,14 @@ pub struct Node<E: StorageEngine> {
     /// Holding the lock serialises commits, which keeps them logged and
     /// applied in Commit Timestamp order.
     pub(crate) commit_lock: Mutex<CommitState>,
-    /// The newest Commit Timestamp Applied to the engine; new Snapshots are
-    /// taken here without taking the commit lock.
-    pub(crate) newest_visible_ts: AtomicU64,
+    /// The newest Visible Commit Timestamp: its writes are Applied to the
+    /// engine, so new Snapshots are taken here. A commit may already be in
+    /// the WAL with a newer timestamp; it becomes Visible only once Applied.
+    ///
+    /// Only the commit lock's holder stores it, after the apply. It lives
+    /// outside [`CommitState`] because `begin()` and reads load it without
+    /// taking the commit lock.
+    pub(crate) latest_visible_commit_ts: AtomicU64,
     /// Active Snapshot timestamps mapped to how many open Transactions read them.
     pub(crate) snapshot_registry: Mutex<BTreeMap<u64, usize>>,
 }
@@ -121,7 +126,7 @@ impl<E: StorageEngine> Node<E> {
             engine,
             limits,
             commit_lock: Mutex::new(CommitState::new(wal)),
-            newest_visible_ts: AtomicU64::new(last),
+            latest_visible_commit_ts: AtomicU64::new(last),
             snapshot_registry: Mutex::new(BTreeMap::new()),
         }
     }
@@ -132,8 +137,8 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// The newest Commit Timestamp Applied to the engine.
-    pub(crate) fn newest_visible_ts(&self) -> u64 {
-        self.newest_visible_ts.load(Ordering::Acquire)
+    pub(crate) fn latest_visible_commit_ts(&self) -> u64 {
+        self.latest_visible_commit_ts.load(Ordering::Acquire)
     }
 
     /// The oldest Snapshot any active Transaction reads, or the newest Visible
@@ -143,12 +148,12 @@ impl<E: StorageEngine> Node<E> {
         reg.keys()
             .next()
             .copied()
-            .unwrap_or_else(|| self.newest_visible_ts())
+            .unwrap_or_else(|| self.latest_visible_commit_ts())
     }
 
     pub(crate) fn register_snapshot(&self) -> u64 {
         let mut reg = self.snapshot_registry.lock().expect("registry poisoned");
-        let ts = self.newest_visible_ts();
+        let ts = self.latest_visible_commit_ts();
         *reg.entry(ts).or_default() += 1;
         ts
     }

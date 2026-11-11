@@ -50,18 +50,18 @@ impl CommitState {
     }
 
     /// Log, Apply and publish a Write Set that has passed its conflict
-    /// checks, at the Commit Timestamp after `newest_visible_ts`.
+    /// checks, at the Commit Timestamp after `latest_visible_commit_ts`.
     fn apply<E: StorageEngine>(
         &mut self,
         engine: &E,
-        newest_visible_ts: &AtomicU64,
+        latest_visible_commit_ts: &AtomicU64,
         write_set: &WriteSet,
     ) -> Result<u64> {
         // Only the commit lock's holder stores it, so this load sees the newest.
-        let commit_ts = newest_visible_ts.load(Ordering::Relaxed) + 1;
+        let commit_ts = latest_visible_commit_ts.load(Ordering::Relaxed) + 1;
         let Some(wal) = &mut self.wal else {
             engine.write_batch(mvcc::commit_batch(commit_ts, writes(write_set)))?;
-            newest_visible_ts.store(commit_ts, Ordering::Release);
+            latest_visible_commit_ts.store(commit_ts, Ordering::Release);
             return Ok(commit_ts);
         };
         let record = wal::encode_record(commit_ts, writes(write_set))?;
@@ -75,7 +75,7 @@ impl CommitState {
             self.poisoned = true;
             return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
         }
-        newest_visible_ts.store(commit_ts, Ordering::Release);
+        latest_visible_commit_ts.store(commit_ts, Ordering::Release);
         Ok(commit_ts)
     }
 }
@@ -448,7 +448,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 return Err(Error::WriteConflict);
             }
         }
-        commits.apply(engine, &self.node.newest_visible_ts, &self.write_set)
+        commits.apply(engine, &self.node.latest_visible_commit_ts, &self.write_set)
     }
 
     /// Abort, discarding the Write Set. Same as dropping the Transaction.
