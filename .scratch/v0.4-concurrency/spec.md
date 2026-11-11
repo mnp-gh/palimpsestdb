@@ -18,9 +18,9 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 
 - `Node` is `Send + Sync`, shared across threads by `Arc` or scoped threads; a `Transaction` is `Send` and used by one thread at a time. A compile-time assertion checks both for `Node<MemoryEngine>`.
 - One commit lock still covers the conflict check, WAL append and fsync, and the apply. Its holder is the single in-order applier (ADR 0004).
-- A panic while holding the commit lock poisons the Rust `Mutex`; every later commit panics too, and the Node must be reopened (Recovery repairs a half-applied commit from the WAL). Turning this into an `Error` waits for the server (v0.6). `begin()` checks whether the lock is poisoned and fails fast.
-- Visibility watermark: `latest_visible_commit_ts: AtomicU64`, stored with `Release` after the apply, still under the commit lock. `begin()` never takes the commit lock.
-- Snapshot registry: `begin()` takes a small registry lock, loads `latest_visible_commit_ts` with `Acquire`, registers that Snapshot and releases the lock; dropping the Transaction (committed, aborted or abandoned) unregisters it via `Drop`. The Horizon is the oldest registered Snapshot, or `latest_visible_commit_ts` when none is, read under the same lock, so no Snapshot can register below a Horizon already handed out.
+- A panic while holding the commit lock poisons the Rust `Mutex`; every later commit panics too, and the Node must be reopened (Recovery repairs a half-applied commit from the WAL). Turning this into an `Error` waits for the server (v0.6). `begin_transaction()` checks whether the lock is poisoned and fails fast.
+- Visibility watermark: `latest_visible_commit_ts: AtomicU64`, stored with `Release` after the apply, still under the commit lock. `begin_transaction()` never takes the commit lock.
+- Snapshot registry: `begin_transaction()` takes a small registry lock, loads `latest_visible_commit_ts` with `Acquire`, registers that Snapshot and releases the lock; dropping the Transaction (committed, aborted or abandoned) unregisters it via `Drop`. The Horizon is the oldest registered Snapshot, or `latest_visible_commit_ts` when none is, read under the same lock, so no Snapshot can register below a Horizon already handed out.
 
 ## Catalog cache
 
@@ -31,7 +31,7 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 ## Garbage Collection
 
 - `Node::collect_garbage()` takes the Horizon, scans versioned keys in batches (up to 1,024 physical keys per `WriteBatch`) starting at `NAMESPACES_COLLECTION` (bypassing unversioned `STATE_COLLECTION`), without the commit lock, and for each logical key deletes every Version older than the newest Version at or below the Horizon. If that newest Version is a tombstone, it is deleted too. Returns `GcStats`.
-- One pass at a time: a GC mutex serialises `collect_garbage()` calls, since a later pass could delete Catalog Versions an earlier pass is still reading at its older Horizon. It never blocks commits or `begin()`.
+- One pass at a time: a GC mutex serialises `collect_garbage()` calls, since a later pass could delete Catalog Versions an earlier pass is still reading at its older Horizon. It never blocks commits or `begin_transaction()`.
 - Deletes go straight to the engine and are not logged (ADR 0012).
 - Reclaim reads the Catalog at the Horizon, never at the newest Commit Timestamp, so nothing created after the Horizon is ever taken for dead. A Collection is dead when its ID key is visible at the Horizon but no Collection entry names that ID; an Index is dead when its ID is below its Collection's `nextIndexId` at the Horizon but not in that entry's `indexes` (dropped, failed, or dropped by Recovery). IDs are never reused, so dead stays dead. Each dead ID's key range is scanned and its keys deleted in batches.
 - After reclaim, the commit-time check for strict-field changes and Index creation on empty Collections reads only live data.
