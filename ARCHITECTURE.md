@@ -35,7 +35,7 @@ Modules are cut by concept, not by type. `Node`, `Transaction` and `CollectionEn
 |---|---|
 | How is a key laid out? | `keys` (ADR 0008) |
 | Which Version does a Snapshot see? | `mvcc` |
-| How does a commit get checked and logged? | `transaction` (`commit_locked`, `CommitState`) |
+| How does a commit get checked and logged? | `transaction` (`commit_locked`), `node` (`CommitState`) |
 | What does a Catalog entry hold? | `catalog` (`CollectionEntry`) |
 | What may change in a Collection Schema? | `schema` |
 | How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `create_index_on_empty`, `build_index`) |
@@ -90,7 +90,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 - **Versions are never changed in place.** A write adds a Version, and a delete adds a tombstone. Nothing is garbage-collected yet (v0.4).
 - **The engine stays unaware of Versions.** MVCC, Transactions and the Catalog all live above the `StorageEngine` trait (ADR 0001).
-- **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState`'s fields are private to `transaction`, and `Transaction::commit_locked` is the only way to change them, Index build chunks included. `Node::latest_visible_commit_ts` is stored only by `CommitState::apply`, under the commit lock.
+- **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState` lives in `node`, beside the commit lock; `Transaction::commit_locked` is the only caller of `CommitState::apply`, Index build chunks included. `Node::latest_visible_commit_ts` is stored only by `CommitState::apply`, under the commit lock.
 - **Snapshots never go below the Horizon.** `latest_visible_commit_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward.
 - **The WAL comes first.** A commit is in the WAL and fsynced before the engine sees it. If the outcome is unknown, nothing more commits until the Node is reopened.
 - **A Document and its Index entries change in one Write Set.** Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.
