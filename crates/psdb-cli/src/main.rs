@@ -9,7 +9,7 @@ use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 
 use bson::{Binary, Bson, Document, spec::BinarySubtype};
-use psdb_core::{CollectionPath, FieldPath, FieldSchema, FieldType, Node, Transaction};
+use psdb_core::{CollectionPath, FieldPath, FieldSchema, FieldType, IndexState, Node, Transaction};
 use psdb_storage_memory::MemoryEngine;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -320,7 +320,11 @@ fn execute<'node>(
             let coll = collection_path(rest)?;
             for index in with_txn(node, txn, |t| t.list_indexes(&coll))? {
                 let unique = if index.unique { " unique" } else { "" };
-                println!("{}{unique}", index.path);
+                let building = match index.state {
+                    IndexState::Building => " building",
+                    IndexState::Ready => "",
+                };
+                println!("{}{unique}{building}", index.path);
             }
         }
         "create-index" => {

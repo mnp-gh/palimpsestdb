@@ -11,7 +11,7 @@ use bson::{Binary, Bson, DateTime, Document, doc};
 use proptest::prelude::*;
 use psdb_core::wal::SimDisk;
 use psdb_core::{
-    CollectionPath, Error, FieldSchema, FieldType, IndexInfo, Limits, Node, Transaction,
+    CollectionPath, Error, FieldSchema, FieldType, IndexInfo, IndexState, Limits, Node, Transaction,
 };
 use psdb_storage_memory::MemoryEngine;
 
@@ -629,7 +629,8 @@ fn schema_rules_around_indexes() {
         node.list_indexes(&collection("shop.orders")).unwrap(),
         [IndexInfo {
             path: field_path("n"),
-            unique: true
+            unique: true,
+            state: IndexState::Ready,
         }]
     );
     node.drop_index(&collection("shop.orders"), &field_path("n"))
@@ -1039,4 +1040,170 @@ fn making_a_field_strict_reads_only_documents_not_index_entries() {
         field(FieldType::Int, true),
     )
     .unwrap();
+}
+
+/// `shop.orders` of 2049 Documents, enough for three build chunks, with a
+/// strict `int` field `n` equal to `_id`.
+fn unindexed() -> Node<MemoryEngine> {
+    let node = common::shop();
+    node.run(|t| {
+        for i in 0..2049 {
+            t.insert(&collection("shop.orders"), doc! { "_id": i, "n": i })?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    node.set_field_type(
+        &collection("shop.orders"),
+        &field_path("n"),
+        field(FieldType::Int, true),
+    )
+    .unwrap();
+    node
+}
+
+fn states(node: &Node<MemoryEngine>) -> Vec<IndexState> {
+    node.list_indexes(&collection("shop.orders"))
+        .unwrap()
+        .into_iter()
+        .map(|ix| ix.state)
+        .collect()
+}
+
+#[test]
+fn queries_ignore_an_index_until_its_build_finishes() {
+    let node = unindexed();
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), false)
+        .unwrap();
+    assert_eq!(states(&node), [IndexState::Building]);
+    assert!(!build.step().unwrap(), "first of three chunks");
+    // The first chunk covered `_id` 0..1024, so a query through the Index
+    // would miss 2000.
+    let late = doc! { "n": 2000 };
+    assert_eq!(
+        ids(&node.find(&collection("shop.orders"), &late).unwrap()),
+        [Bson::Int32(2000)]
+    );
+    while !build.step().unwrap() {}
+    assert_eq!(states(&node), [IndexState::Ready]);
+    assert_eq!(
+        ids(&node.find(&collection("shop.orders"), &late).unwrap()),
+        [Bson::Int32(2000)]
+    );
+}
+
+#[test]
+fn dropping_the_index_or_its_collection_cancels_the_build() {
+    let node = unindexed();
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), false)
+        .unwrap();
+    build.step().unwrap();
+    node.drop_index(&collection("shop.orders"), &field_path("n"))
+        .unwrap();
+    // A new Index on the same field is a different build.
+    node.create_index(&collection("shop.orders"), &field_path("n"), false)
+        .unwrap();
+    assert!(matches!(build.step(), Err(Error::IndexBuildCancelled)));
+    assert_eq!(states(&node), [IndexState::Ready]);
+
+    let node = unindexed();
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), false)
+        .unwrap();
+    node.drop_collection(&collection("shop.orders")).unwrap();
+    assert!(matches!(build.step(), Err(Error::IndexBuildCancelled)));
+}
+
+#[test]
+fn a_unique_build_accepts_a_document_a_writer_already_indexed() {
+    let node = unindexed();
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), true)
+        .unwrap();
+    build.step().unwrap();
+    // Ahead of the build: the writer files `n: 5000` under `_id` 2000, and
+    // the build reaches the same Document later.
+    node.replace(
+        &collection("shop.orders"),
+        &Bson::Int32(2000),
+        doc! { "n": 5000 },
+    )
+    .unwrap();
+    while !build.step().unwrap() {}
+    assert_eq!(
+        ids(&node
+            .find(&collection("shop.orders"), &doc! { "n": 5000 })
+            .unwrap()),
+        [Bson::Int32(2000)]
+    );
+}
+
+#[test]
+fn a_duplicate_ahead_of_a_unique_build_fails_it_and_removes_the_index() {
+    let node = unindexed();
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), true)
+        .unwrap();
+    build.step().unwrap();
+    // Behind the build the Index already rejects a duplicate...
+    assert!(matches!(
+        node.insert(&collection("shop.orders"), doc! { "_id": 5000, "n": 10 }),
+        Err(Error::DuplicateValue(_))
+    ));
+    // ...but ahead of it, `n: 2040` is not in the Index yet.
+    node.insert(&collection("shop.orders"), doc! { "_id": 5000, "n": 2040 })
+        .unwrap();
+    let outcome = loop {
+        match build.step() {
+            Ok(false) => {}
+            outcome => break outcome,
+        }
+    };
+    assert!(matches!(outcome, Err(Error::DuplicateValue(_))));
+    assert!(states(&node).is_empty());
+}
+
+#[test]
+fn builds_on_two_fields_of_one_collection_both_finish() {
+    let node = unindexed();
+    node.set_field_type(
+        &collection("shop.orders"),
+        &field_path("m"),
+        field(FieldType::Int, false),
+    )
+    .unwrap();
+    let mut n = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), false)
+        .unwrap();
+    let mut m = node
+        .start_index_build(&collection("shop.orders"), &field_path("m"), false)
+        .unwrap();
+    let (mut n_done, mut m_done) = (false, false);
+    while !(n_done && m_done) {
+        n_done = n_done || n.step().unwrap();
+        m_done = m_done || m.step().unwrap();
+    }
+    assert_eq!(states(&node), [IndexState::Ready, IndexState::Ready]);
+}
+
+#[test]
+fn a_writer_that_began_before_a_build_aborts() {
+    let node = unindexed();
+    let mut txn = node.begin_transaction();
+    txn.replace(
+        &collection("shop.orders"),
+        &Bson::Int32(10),
+        doc! { "n": 5000 },
+    )
+    .unwrap();
+    // The first chunk indexes `n: 10`; the writer knows nothing of the
+    // Index, so committing would leave that entry pointing at a Document
+    // that no longer has the value.
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), false)
+        .unwrap();
+    build.step().unwrap();
+    assert!(matches!(txn.commit(), Err(Error::CollectionChanged)));
 }
