@@ -374,12 +374,12 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     pub fn commit(self) -> Result<u64> {
         let node = self.node;
         let mut commit_state = node.commit_lock.lock().expect("lock poisoned");
-        self.commit_locked(&mut commit_state)
+        self.commit_under_lock(&mut commit_state)
     }
 
     /// [`commit`](Self::commit), for a caller already holding the commit
     /// lock.
-    pub(crate) fn commit_locked(self, commit_state: &mut CommitState) -> Result<u64> {
+    pub(crate) fn commit_under_lock(self, commit_state: &mut CommitState) -> Result<u64> {
         if commit_state.poisoned {
             return Err(Error::Poisoned);
         }
