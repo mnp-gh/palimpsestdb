@@ -3,13 +3,13 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use bson::{Bson, doc};
 use common::collection;
-use psdb_core::{Node, Transaction};
+use psdb_core::{FieldSchema, FieldType, Node, Transaction};
 use psdb_storage_memory::MemoryEngine;
 
 #[test]
@@ -147,4 +147,88 @@ fn concurrent_threads_stress_test() {
     let h = node.horizon();
     let txn = node.begin_transaction();
     assert_eq!(h, txn.snapshot_ts());
+}
+
+#[test]
+fn other_threads_commit_while_an_index_builds() {
+    const DOCS: i32 = 10_000;
+    let node = common::shop();
+    let orders = collection("shop.orders");
+    let n = common::field_path("n");
+    node.run(|t| {
+        for i in 0..DOCS {
+            t.insert(&orders, doc! { "_id": i, "n": i % 100 })?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    node.set_field_type(
+        &orders,
+        &n,
+        FieldSchema {
+            field_type: FieldType::Int,
+            strict: false,
+        },
+    )
+    .unwrap();
+
+    let building = AtomicBool::new(true);
+    let committed_during_build = AtomicUsize::new(0);
+    thread::scope(|s| {
+        for writer in 0..4 {
+            let (node, orders, building, committed) =
+                (&node, &orders, &building, &committed_during_build);
+            s.spawn(move || {
+                let mut i = 0;
+                while building.load(Ordering::Relaxed) {
+                    i += 1;
+                    // Spread over the whole Collection, ahead of the build
+                    // and behind it; new `_id`s land after every chunk.
+                    let id = (i * 7919 + writer * 31) % (DOCS + 500);
+                    let outcome = node.run(|t| {
+                        if i % 5 == 0 {
+                            t.delete(orders, &Bson::Int32(id)).map(drop)
+                        } else if t.replace(orders, &Bson::Int32(id), doc! { "n": i % 100 })? {
+                            Ok(())
+                        } else {
+                            t.insert(orders, doc! { "_id": id, "n": i % 100 }).map(drop)
+                        }
+                    });
+                    match outcome {
+                        Ok(()) => {
+                            committed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) if e.is_retryable() => {}
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            });
+        }
+        node.create_index(&orders, &n, false).unwrap();
+        building.store(false, Ordering::Relaxed);
+    });
+    assert!(
+        committed_during_build.load(Ordering::Relaxed) > 0,
+        "the build never let another commit through"
+    );
+
+    let all = node.find(&orders, &doc! {}).unwrap();
+    let ids = |docs: &[bson::Document]| -> Vec<Bson> {
+        docs.iter().map(|d| d.get("_id").unwrap().clone()).collect()
+    };
+    for (filter, values) in [
+        (doc! { "n": 7 }, 7..=7),
+        (doc! { "n": { "$gte": 90 } }, 90..=99),
+    ] {
+        let want: Vec<_> = all
+            .iter()
+            .filter(|d| values.contains(&d.get_i32("n").unwrap()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            ids(&node.find(&orders, &filter).unwrap()),
+            ids(&want),
+            "{filter}"
+        );
+    }
 }

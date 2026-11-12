@@ -7,12 +7,13 @@
 //! ```text
 //! { name, id,
 //!   fields:  [ { path, type, strict } ],
-//!   indexes: [ { path, id, unique } ],
+//!   indexes: [ { path, id, unique, state } ],
 //!   nextIndexId }
 //! ```
 //!
 //! All three are optional, so a Collection without them reads as having no
-//! schema, no Indexes and next Index ID 0. Changing the schema or the
+//! schema, no Indexes and next Index ID 0. An Index's `state` is
+//! `"building"` or `"ready"` (ADR 0013). Changing the schema or the
 //! Indexes rewrites the entry, so a concurrent writer to the Collection
 //! aborts with Collection Changed.
 //!
@@ -40,7 +41,7 @@ use crate::collection_path::CollectionPath;
 use crate::document::{self, validate_name};
 use crate::error::{Error, Result};
 use crate::field_path::FieldPath;
-use crate::index::IndexDef;
+use crate::index::{IndexDef, IndexState};
 use crate::keys;
 use crate::mvcc;
 use crate::schema::{FieldSchema, FieldType, Schema};
@@ -142,6 +143,11 @@ impl CollectionEntry {
                     path: path(ix, "index path")?,
                     id: read_u32(ix, "id")?,
                     unique: ix.get_bool("unique").map_err(|_| corrupt("index unique"))?,
+                    state: match ix.get_str("state") {
+                        Ok("building") => IndexState::Building,
+                        Ok("ready") => IndexState::Ready,
+                        _ => return Err(corrupt("index state")),
+                    },
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -176,9 +182,15 @@ impl CollectionEntry {
             .indexes
             .iter()
             .map(|ix| {
-                Bson::Document(
-                    doc! { "path": ix.path.as_str(), "id": i64::from(ix.id), "unique": ix.unique },
-                )
+                Bson::Document(doc! {
+                    "path": ix.path.as_str(),
+                    "id": i64::from(ix.id),
+                    "unique": ix.unique,
+                    "state": match ix.state {
+                        IndexState::Building => "building",
+                        IndexState::Ready => "ready",
+                    },
+                })
             })
             .collect();
         encode(&doc! {

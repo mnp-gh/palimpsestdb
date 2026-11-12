@@ -32,7 +32,9 @@ pub use document::{Limits, MAX_NAME_BYTES};
 pub use error::{Error, Result};
 pub use field_path::FieldPath;
 pub use filter::{CompareOp, Filter};
-pub use index::IndexInfo;
+#[cfg(any(test, feature = "testing"))]
+pub use index::IndexBuild;
+pub use index::{IndexInfo, IndexState};
 pub use keys::MAX_ID_BYTES;
 pub use node::Node;
 pub use schema::{FieldSchema, FieldType};

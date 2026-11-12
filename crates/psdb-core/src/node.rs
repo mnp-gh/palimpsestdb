@@ -184,13 +184,9 @@ impl<E: StorageEngine> Node<E> {
             catalog_cache.record(record.commit_ts, &record.write_set);
             last = record.commit_ts;
         }
-        Ok(Self::from_parts(
-            engine,
-            limits,
-            last,
-            Some(wal),
-            catalog_cache,
-        ))
+        let node = Self::from_parts(engine, limits, last, Some(wal), catalog_cache);
+        node.drop_building_indexes()?;
+        Ok(node)
     }
 
     fn from_parts(

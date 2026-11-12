@@ -38,10 +38,10 @@ Modules are cut by concept, not by type. `Node`, `Transaction` and `CollectionEn
 | How does a commit get checked and logged? | `transaction` (`commit_locked`), `node` (`CommitState`) |
 | What does a Catalog entry hold? | `catalog` (`CollectionEntry`) |
 | What may change in a Collection Schema? | `schema` |
-| How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `create_index_on_empty`, `build_index`) |
+| How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `create_index_on_empty`, `IndexBuild::step`) |
 | Which Index or `_id` range does `find` use? | `index` (`plan`) |
 | What is a valid name, `_id` or Document? | `document`, `collection_path`, `field_path` |
-| How does recovery work? | `node` (`open_with`), `wal` |
+| How does recovery work? | `node` (`open_with`), `index` (`drop_building_indexes`), `wal` |
 
 ## Keys
 
@@ -78,11 +78,14 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 **Catalog changes** (creating or dropping Namespaces and Collections, schema and Index changes) are ordinary writes to Catalog keys, so they commit or abort with the rest of their Transaction (ADR 0006). Changing a schema or the Indexes rewrites the Collection's entry. A concurrent writer recorded a read of that entry, so it aborts at commit.
 
-**An Index build** (`Node::create_index`) holds the commit lock throughout:
+**An Index build** (`Node::create_index`) takes the commit lock one chunk at a time (ADR 0013):
 
-1. `prepare_index` gives the Index the next unused ID.
-2. `build_index` reads the Collection at one Snapshot, in chunks of at most 1024 Documents or 16 MiB, and commits each chunk's entries as a Transaction of its own through `commit_locked`, like any other commit, but outside the Write Set cap.
-3. A final commit adds the Index to the Collection's entry, which makes the entries reachable.
+1. An ordinary Transaction adds the Index to the Collection's entry as Building, taking its ID from `nextIndexId`. From then on `write_document` maintains it like any Index, but `index::plan` uses only Ready ones. A writer whose Snapshot predates this commit read the old entry, so it aborts with Collection Changed.
+2. Each `IndexBuild::step` takes the commit lock and re-reads the Collection's entry at the newest Commit Timestamp. It stops with Index Build Cancelled unless the Namespace, Collection and Index IDs still match and the Index is still Building. It then reads the next chunk (at most 1024 Documents or 16 MiB) at that timestamp and commits its entries through `commit_locked`, outside the Write Set cap. A unique Index fails with Duplicate Value only on an entry naming another Document, since a writer may have indexed this one already.
+3. After the last chunk, the same step re-reads the entry, marks only this Index Ready and commits. On any failure but cancellation it instead removes only this Index from the newest entry.
+4. Between steps, `create_index` yields, so waiting writers get the lock.
+
+On open, Recovery drops every Index still Building in one commit (`drop_building_indexes`).
 
 `Transaction::create_index_on_empty` only works on an empty Collection, where there is nothing to build (ADR 0010).
 
@@ -94,8 +97,8 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 - **The Catalog cache is complete and never behind a Visible commit.** It holds every Namespace and Collection entry ever written, Tombstones included, and `apply_commit` updates it after the engine write and before publishing, under the commit lock. Publishing first would let a Snapshot at the new timestamp read the entry the commit replaced.
 - **Snapshots never go below the Horizon.** `latest_visible_commit_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward.
 - **The WAL comes first.** A commit is in the WAL and fsynced before the engine sees it. If the outcome is unknown, nothing more commits until the Node is reopened.
-- **A Document and its Index entries change in one Write Set.** Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.
-- **IDs are never reused.** Namespace and Collection IDs are random, and their ID keys outlive a drop. Index IDs come from a per-Collection counter that only grows (ADR 0006).
+- **A Document and its Index entries change in one Write Set,** Building Indexes included; only an Index build's chunks write entries on their own, under the commit lock. Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.
+- **IDs are never reused.** Namespace and Collection IDs are random, and their ID keys outlive a drop. Index IDs come from a per-Collection counter that only grows and moves when a build begins, so a failed build's entries sit below it (ADR 0006, ADR 0013).
 - **Names and paths are checked once.** A `CollectionPath` or `FieldPath` that exists is valid, so the code below never checks them again.
 
 ## Tests
