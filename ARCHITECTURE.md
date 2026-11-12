@@ -35,7 +35,7 @@ Modules are cut by concept, not by type. `Node`, `Transaction` and `CollectionEn
 |---|---|
 | How is a key laid out? | `keys` (ADR 0008) |
 | Which Version does a Snapshot see? | `mvcc` |
-| How does a commit get checked and logged? | `transaction` (`commit_locked`), `node` (`CommitState`) |
+| How does a commit get checked and logged? | `transaction` (`commit_under_lock`), `node` (`CommitState`) |
 | What does a Catalog entry hold? | `catalog` (`CollectionEntry`) |
 | What may change in a Collection Schema? | `schema` |
 | How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `create_index_on_empty`, `IndexBuild::step`) |
@@ -81,7 +81,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 **An Index build** (`Node::create_index`) takes the commit lock one chunk at a time (ADR 0013):
 
 1. An ordinary Transaction adds the Index to the Collection's entry as Building, taking its ID from `nextIndexId`. From then on `write_document` maintains it like any Index, but `index::plan` uses only Ready ones. A writer whose Snapshot predates this commit read the old entry, so it aborts with Collection Changed.
-2. Each `IndexBuild::step` takes the commit lock and re-reads the Collection's entry at the newest Commit Timestamp. It stops with Index Build Cancelled unless the Namespace, Collection and Index IDs still match and the Index is still Building. It then reads the next chunk (at most 1024 Documents or 16 MiB) at that timestamp and commits its entries through `commit_locked`, outside the Write Set cap. A unique Index fails with Duplicate Value only on an entry naming another Document, since a writer may have indexed this one already.
+2. Each `IndexBuild::step` takes the commit lock and re-reads the Collection's entry at the newest Commit Timestamp. It stops with Index Build Cancelled unless the Namespace, Collection and Index IDs still match and the Index is still Building. It then reads the next chunk (at most 1024 Documents or 16 MiB) at that timestamp and commits its entries through `commit_under_lock`, outside the Write Set cap. A unique Index fails with Duplicate Value only on an entry naming another Document, since a writer may have indexed this one already.
 3. After the last chunk, the same step re-reads the entry, marks only this Index Ready and commits. On any failure but cancellation it instead removes only this Index from the newest entry.
 4. Between steps, `create_index` yields, so waiting writers get the lock.
 
@@ -93,7 +93,7 @@ On open, Recovery drops every Index still Building in one commit (`drop_building
 
 - **Versions are never changed in place.** A write adds a Version, and a delete adds a tombstone. Nothing is garbage-collected yet (v0.4).
 - **The engine stays unaware of Versions.** MVCC, Transactions and the Catalog all live above the `StorageEngine` trait (ADR 0001).
-- **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState` lives in `node`, beside the commit lock; `Transaction::commit_locked` is the only caller of `CommitState::apply_commit`, Index build chunks included. `Node::latest_visible_commit_ts` is stored only by `CommitState::apply_commit`, under the commit lock.
+- **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState` lives in `node`, beside the commit lock; `Transaction::commit_under_lock` is the only caller of `CommitState::apply_commit`, Index build chunks included. `Node::latest_visible_commit_ts` is stored only by `CommitState::apply_commit`, under the commit lock.
 - **The Catalog cache is complete and never behind a Visible commit.** It holds every Namespace and Collection entry ever written, Tombstones included, and `apply_commit` updates it after the engine write and before publishing, under the commit lock. Publishing first would let a Snapshot at the new timestamp read the entry the commit replaced.
 - **Snapshots never go below the Horizon.** `latest_visible_commit_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward.
 - **The WAL comes first.** A commit is in the WAL and fsynced before the engine sees it. If the outcome is unknown, nothing more commits until the Node is reopened.

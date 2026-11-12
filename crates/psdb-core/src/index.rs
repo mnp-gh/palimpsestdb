@@ -501,17 +501,22 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
     /// failure but [`Error::IndexBuildCancelled`].
     pub fn step(&mut self) -> Result<bool> {
         let mut commit_state = self.node.commit_lock.lock().expect("lock poisoned");
-        let outcome = self.step_locked(&mut commit_state);
+        let outcome = match self.index_next_chunk(&mut commit_state) {
+            Ok(true) => Ok(false),
+            Ok(false) => self.mark_ready(&mut commit_state).map(|()| true),
+            Err(e) => Err(e),
+        };
         if let Err(e) = &outcome
             && !matches!(e, Error::IndexBuildCancelled)
         {
             // If this fails too, `drop_index` or Recovery removes the Index.
-            let _ = self.remove_locked(&mut commit_state);
+            let _ = self.remove_under_lock(&mut commit_state);
         }
         outcome
     }
 
-    fn step_locked(&mut self, commit_state: &mut CommitState) -> Result<bool> {
+    /// Index the next chunk of Documents; true if Documents remain.
+    fn index_next_chunk(&mut self, commit_state: &mut CommitState) -> Result<bool> {
         let node = self.node;
         let (_, entry) = self.live_entry()?;
         let index = entry
@@ -561,13 +566,19 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
         if !chunk.is_empty() {
             // Read and committed under the commit lock, so the conflict
             // checks pass; they run so every commit takes one path.
-            Transaction::with_write_set(node, latest, chunk).commit_locked(commit_state)?;
+            Transaction::with_write_set(node, latest, chunk).commit_under_lock(commit_state)?;
         }
         if let Some(start) = next_chunk_start {
             // The newest Version of a key sorts first, at timestamp u64::MAX.
             self.remaining.start = keys::physical_key(&start, u64::MAX);
-            return Ok(false);
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    /// Mark the Index Ready, leaving the Collection's other Indexes as they
+    /// are now.
+    fn mark_ready(&self, commit_state: &mut CommitState) -> Result<()> {
         let (mut txn, mut entry) = self.live_entry()?;
         for ix in &mut entry.indexes {
             if ix.id == self.index_id {
@@ -575,17 +586,16 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
             }
         }
         txn.write_collection_entry(&entry)?;
-        txn.commit_locked(commit_state)?;
-        Ok(true)
+        txn.commit_under_lock(commit_state).map(drop)
     }
 
     /// Remove the Index from the Collection's entry, leaving its other
     /// Indexes as they are now.
-    fn remove_locked(&self, commit_state: &mut CommitState) -> Result<()> {
+    fn remove_under_lock(&self, commit_state: &mut CommitState) -> Result<()> {
         let (mut txn, mut entry) = self.live_entry()?;
         entry.indexes.retain(|ix| ix.id != self.index_id);
         txn.write_collection_entry(&entry)?;
-        txn.commit_locked(commit_state).map(drop)
+        txn.commit_under_lock(commit_state).map(drop)
     }
 
     /// The Collection's newest entry, read in a Transaction at the newest

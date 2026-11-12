@@ -60,7 +60,7 @@ pub struct Node<E: StorageEngine> {
 }
 
 /// The state commits serialise on, behind [`Node`]'s commit lock. Only
-/// [`Transaction::commit_locked`] should change it, so every commit is
+/// [`Transaction::commit_under_lock`] should change it, so every commit is
 /// checked, logged and Applied in one place; `apply_commit` skips the checks.
 pub(crate) struct CommitState {
     /// `None` when nothing is durable.
