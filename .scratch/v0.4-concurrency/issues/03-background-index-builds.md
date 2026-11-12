@@ -1,6 +1,6 @@
 # Background Index builds (Building → Ready)
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01
 
 Spec: [Index builds](../spec.md#index-builds), [ADR 0013](../../../docs/adr/0013-building-indexes-take-the-lock-per-chunk.md).
