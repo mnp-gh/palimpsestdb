@@ -20,6 +20,7 @@ Inside `psdb-core`, from the public API down:
 
 ```
 Node, Transaction                         public API; commits
+  gc                                      removing Versions below the Horizon
   catalog, index, schema, filter,         what keys and values mean
   document, collection_path, field_path
     keys, mvcc                            key encoding; which Version a Snapshot sees
@@ -89,13 +90,15 @@ On open, Recovery drops every Index still Building in one commit (`drop_building
 
 `Transaction::create_index_on_empty` only works on an empty Collection, where there is nothing to build (ADR 0010).
 
+**Garbage Collection** (`Node::collect_garbage`, in `gc`) takes the Horizon once, then scans every versioned key from the Namespaces up, skipping the unversioned state below them. For each logical key it keeps the newest Version at or below the Horizon (or deletes it too if it is a Tombstone) and deletes every older one, 1024 physical keys per batch, resuming each scan just past the last key it visited. It takes no commit lock and writes nothing to the WAL (ADR 0012), so Recovery may bring removed Versions back for the next pass. Versions newer than the Horizon are never touched, so a concurrent commit is unaffected. Last, it purges the Catalog cache's Tombstones at or below the Horizon.
+
 ## Invariants
 
-- **Versions are never changed in place.** A write adds a Version, and a delete adds a tombstone. Nothing is garbage-collected yet (v0.4).
+- **Versions are never changed in place.** A write adds a Version, and a delete adds a tombstone. Garbage Collection only deletes Versions no Snapshot at or after the Horizon can read.
 - **The engine stays unaware of Versions.** MVCC, Transactions and the Catalog all live above the `StorageEngine` trait (ADR 0001).
 - **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState` lives in `node`, beside the commit lock; `Transaction::commit_under_lock` is the only caller of `CommitState::apply_commit`, Index build chunks included. `Node::latest_visible_commit_ts` is stored only by `CommitState::apply_commit`, under the commit lock.
-- **The Catalog cache is complete and never behind a Visible commit.** It holds every Namespace and Collection entry ever written, Tombstones included, and `apply_commit` updates it after the engine write and before publishing, under the commit lock. Publishing first would let a Snapshot at the new timestamp read the entry the commit replaced.
-- **Snapshots never go below the Horizon.** `latest_visible_commit_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward.
+- **The Catalog cache is complete and never behind a Visible commit.** It holds every Namespace and Collection entry ever written, Tombstones included, except Tombstones Garbage Collection purged at or below its Horizon, which every Snapshot from then on reads as absent anyway; and `apply_commit` updates it after the engine write and before publishing, under the commit lock. Publishing first would let a Snapshot at the new timestamp read the entry the commit replaced.
+- **Snapshots never go below the Horizon.** `latest_visible_commit_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward. Index builds register their Snapshots under the commit lock at the latest Visible timestamp; `register_snapshot_at` debug-asserts that no Snapshot registers below the Horizon.
 - **The WAL comes first.** A commit is in the WAL and fsynced before the engine sees it. If the outcome is unknown, nothing more commits until the Node is reopened.
 - **A Document and its Index entries change in one Write Set,** Building Indexes included; only an Index build's chunks write entries on their own, under the commit lock. Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.
 - **IDs are never reused.** Namespace and Collection IDs are random, and their ID keys outlive a drop. Index IDs come from a per-Collection counter that only grows and moves when a build begins, so a failed build's entries sit below it (ADR 0006, ADR 0013).
@@ -113,6 +116,7 @@ On open, Recovery drops every Index still Building in one commit (`drop_building
   - `crash`: simulated power loss on `SimDisk`, and killing a child process
   - `indexes`: a property test checking that `find` through an Index equals a full scan
   - `model`: a property test against a plain map
+  - `gc`: Garbage Collection keeps what open Snapshots read
   - `threads`: the Snapshot registry and Horizon, and a stress test on real threads
 
 ## Keeping this current
