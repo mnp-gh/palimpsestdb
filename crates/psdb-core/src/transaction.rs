@@ -59,15 +59,11 @@ pub struct Transaction<'node, E: StorageEngine> {
 }
 
 impl<'node, E: StorageEngine> Transaction<'node, E> {
-    pub(crate) fn new(node: &'node Node<E>, snapshot_ts: u64) -> Self {
-        node.register_snapshot_at(snapshot_ts);
-        Self::from_registered(node, snapshot_ts)
-    }
-
-    pub(crate) fn from_registered(node: &'node Node<E>, snapshot_ts: u64) -> Self {
+    /// A Transaction whose Snapshot is the latest Visible commit.
+    pub(crate) fn new(node: &'node Node<E>) -> Self {
         Self {
             node,
-            snapshot_ts,
+            snapshot_ts: node.register_snapshot(),
             write_set: WriteSet::new(),
             write_set_bytes: 0,
             catalog_entry_reads: BTreeSet::new(),
@@ -77,20 +73,10 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
 
     /// A Transaction whose Write Set is `write_set`, outside the Write Set
     /// cap: a chunk of an Index build (ADR 0010).
-    pub(crate) fn with_write_set(
-        node: &'node Node<E>,
-        snapshot_ts: u64,
-        write_set: WriteSet,
-    ) -> Self {
-        node.register_snapshot_at(snapshot_ts);
-        Self {
-            node,
-            snapshot_ts,
-            write_set,
-            write_set_bytes: 0,
-            catalog_entry_reads: BTreeSet::new(),
-            collection_content_reads: BTreeSet::new(),
-        }
+    pub(crate) fn with_write_set(node: &'node Node<E>, write_set: WriteSet) -> Self {
+        let mut txn = Self::new(node);
+        txn.write_set = write_set;
+        txn
     }
 
     /// The Commit Timestamp this Transaction's Snapshot was taken at.
