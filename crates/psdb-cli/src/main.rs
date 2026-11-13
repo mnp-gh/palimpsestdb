@@ -51,6 +51,9 @@ Transactions (without begin, every command commits on its own)
   commit                       commit it
   abort                        discard it
 
+Maintenance
+  gc                           remove old versions no open transaction can read
+
   help                         show this help
   quit                         exit (without --data-dir, all data is lost)";
 
@@ -349,6 +352,14 @@ fn execute<'node>(
             };
             let path = field_path(path)?;
             with_txn(node, txn, |t| t.drop_index(&coll, &path))?;
+        }
+
+        "gc" => {
+            let stats = node.collect_garbage().map_err(message)?;
+            println!(
+                "removed {} versions ({} tombstones)",
+                stats.versions_removed, stats.tombstones_removed
+            );
         }
 
         other => return Err(format!("unknown command {other:?}; type `help`")),

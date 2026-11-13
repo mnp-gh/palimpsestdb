@@ -233,8 +233,18 @@ impl<E: StorageEngine> Node<E> {
         ts
     }
 
+    /// Callers hold the commit lock while reading `ts` as the latest Visible
+    /// timestamp, so it cannot fall below a Horizon Garbage Collection used.
     pub(crate) fn register_snapshot_at(&self, ts: u64) {
         let mut reg = self.snapshot_registry.lock().expect("registry poisoned");
+        debug_assert!(
+            ts >= reg
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or_else(|| self.latest_visible_commit_ts()),
+            "Snapshot registered below the Horizon"
+        );
         *reg.entry(ts).or_default() += 1;
     }
 

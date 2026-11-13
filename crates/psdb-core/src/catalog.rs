@@ -85,6 +85,16 @@ impl CatalogCache {
             .expect("catalog cache poisoned")
             .extend(entries);
     }
+
+    /// Forget the Tombstones committed at or before `horizon`: every Snapshot
+    /// from the Horizon on reads their keys as absent either way. A key
+    /// written again since has a newer timestamp, so it stays.
+    pub(crate) fn purge_tombstones(&self, horizon: u64) {
+        self.0
+            .write()
+            .expect("catalog cache poisoned")
+            .retain(|_, (ts, value)| value.is_some() || *ts > horizon);
+    }
 }
 
 /// A Collection's Catalog entry.
@@ -413,6 +423,21 @@ mod tests {
         assert!(keys::is_catalog_entry_key(&keys::collection_entry_key(
             7, "orders"
         )));
+    }
+
+    #[test]
+    fn purging_forgets_only_tombstones_at_or_below_the_horizon() {
+        let cache = CatalogCache::default();
+        let shop = keys::namespace_entry_key("shop");
+        let toys = keys::namespace_entry_key("toys");
+        cache.record(3, &WriteSet::from([(toys.clone(), Some(entry("toys", 8)))]));
+        cache.record(4, &WriteSet::from([(shop.clone(), None)]));
+        cache.record(6, &WriteSet::from([(toys.clone(), None)]));
+
+        cache.purge_tombstones(5);
+        let cached = cache.0.read().unwrap();
+        assert!(!cached.contains_key(&shop), "dropped before the Horizon");
+        assert_eq!(cached.get(&toys), Some(&(6, None)), "dropped after it");
     }
 
     #[test]

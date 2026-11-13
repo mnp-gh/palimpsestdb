@@ -42,6 +42,11 @@ pub(crate) fn commit_batch<'a>(
     batch
 }
 
+/// Whether a stored Version value is a tombstone.
+pub(crate) fn is_tombstone(stored: &[u8]) -> bool {
+    stored == [TOMBSTONE]
+}
+
 fn decode_value(stored: &[u8]) -> Result<Option<Vec<u8>>> {
     match stored.split_first() {
         Some((&TOMBSTONE, [])) => Ok(None),

@@ -1,6 +1,6 @@
 # Garbage Collection of old Versions
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01, 02
 
 Spec: [Garbage Collection](../spec.md#garbage-collection), [ADR 0012](../../../docs/adr/0012-garbage-collection-is-not-logged.md).
