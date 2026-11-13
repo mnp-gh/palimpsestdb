@@ -233,21 +233,6 @@ impl<E: StorageEngine> Node<E> {
         ts
     }
 
-    /// Callers hold the commit lock while reading `ts` as the latest Visible
-    /// timestamp, so it cannot fall below a Horizon Garbage Collection used.
-    pub(crate) fn register_snapshot_at(&self, ts: u64) {
-        let mut reg = self.snapshot_registry.lock().expect("registry poisoned");
-        debug_assert!(
-            ts >= reg
-                .keys()
-                .next()
-                .copied()
-                .unwrap_or_else(|| self.latest_visible_commit_ts()),
-            "Snapshot registered below the Horizon"
-        );
-        *reg.entry(ts).or_default() += 1;
-    }
-
     pub(crate) fn unregister_snapshot(&self, snapshot_ts: u64) {
         let mut reg = self.snapshot_registry.lock().expect("registry poisoned");
         if let std::collections::btree_map::Entry::Occupied(mut entry) = reg.entry(snapshot_ts) {
@@ -264,8 +249,7 @@ impl<E: StorageEngine> Node<E> {
         if self.commit_lock.is_poisoned() {
             panic!("commit lock poisoned");
         }
-        let snapshot_ts = self.register_snapshot();
-        Transaction::from_registered(self, snapshot_ts)
+        Transaction::new(self)
     }
 
     /// Run `work` in a new Transaction and commit it if `work` succeeds.

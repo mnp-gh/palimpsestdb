@@ -566,7 +566,9 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
         if !chunk.is_empty() {
             // Read and committed under the commit lock, so the conflict
             // checks pass; they run so every commit takes one path.
-            Transaction::with_write_set(node, latest, chunk).commit_under_lock(commit_state)?;
+            let txn = Transaction::with_write_set(node, chunk);
+            debug_assert_eq!(txn.snapshot_ts(), latest, "commit lock froze the timestamp");
+            txn.commit_under_lock(commit_state)?;
         }
         if let Some(start) = next_chunk_start {
             // The newest Version of a key sorts first, at timestamp u64::MAX.
@@ -603,7 +605,7 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
     /// under the commit lock, so the entry stays the newest until the
     /// caller commits.
     fn live_entry(&self) -> Result<(Transaction<'_, E>, CollectionEntry)> {
-        let mut txn = Transaction::new(self.node, self.node.latest_visible_commit_ts());
+        let mut txn = Transaction::new(self.node);
         let entry = match txn.collection_entry(&self.collection) {
             Err(Error::NoSuchNamespace(_) | Error::NoSuchCollection(_)) => {
                 return Err(Error::IndexBuildCancelled);
