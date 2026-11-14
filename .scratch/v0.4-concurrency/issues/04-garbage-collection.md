@@ -1,0 +1,13 @@
+# Garbage Collection of old Versions
+
+Status: resolved
+Blocked by: 01, 02
+
+Spec: [Garbage Collection](../spec.md#garbage-collection), [ADR 0012](../../../docs/adr/0012-garbage-collection-is-not-logged.md).
+
+- `Node::collect_garbage()`: batches, no commit lock, not logged; removes a tombstone that is the newest Version at or below the horizon. No GC mutex here: concurrent version-by-version passes are safe; issue 05 adds it for reclaim.
+- At the end of a pass, purge each cached `(ts, None)` with `ts <= horizon` under the Catalog cache's write lock (a rewrite of the key has `ts > horizon`, so it is never purged).
+- Every Snapshot registers through `register_snapshot` (reads the latest visible timestamp under the registry lock), so none falls below the Horizon; `register_snapshot_at` is removed.
+- Returns `GcStats { versions_removed, tombstones_removed }` (tombstones are counted in both). CLI `gc` prints them on one line.
+- Tests: (a) an open old Snapshot still reads its value after an overwrite and GC; (b) a deleted Document's Tombstone and older Versions are gone after GC with no open Transactions; (c) a dropped Collection's Catalog Tombstone is purged from the cache and the name can be recreated; (d) a second pass removes nothing. Randomised interleavings wait for the simulator (06).
+- Update `ARCHITECTURE.md` for the changed flows and invariants.

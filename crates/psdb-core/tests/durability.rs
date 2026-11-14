@@ -6,7 +6,7 @@ use common::{collection, durable_shop, open};
 
 use bson::{Bson, doc};
 use psdb_core::wal::SimDisk;
-use psdb_core::{Error, Limits, Node};
+use psdb_core::{Error, FieldPath, FieldSchema, FieldType, Limits, Node};
 use psdb_storage::{StorageEngine, WriteBatch};
 use psdb_storage_memory::MemoryEngine;
 
@@ -18,7 +18,7 @@ fn reopen_replays_every_commit() {
         .unwrap();
     node.insert(&collection("shop.orders"), doc! { "_id": 2, "v": 2 })
         .unwrap();
-    let mut txn = node.begin();
+    let mut txn = node.begin_transaction();
     txn.replace(
         &collection("shop.orders"),
         &Bson::Int32(1),
@@ -40,7 +40,7 @@ fn reopen_replays_every_commit() {
     );
     assert_eq!(node.list_collections("shop").unwrap(), ["orders"]);
 
-    let next = node.begin();
+    let next = node.begin_transaction();
     assert!(next.snapshot_ts() > last, "Snapshots see recovered commits");
     drop(next);
     node.insert(&collection("shop.orders"), doc! { "_id": 3 })
@@ -140,6 +140,30 @@ fn failed_fsync_poisons_and_leaves_the_outcome_unknown() {
     drop(node);
     disk.power_loss(0);
     assert_eq!(ids(&open(&disk).unwrap()), [Bson::Int32(1)]);
+}
+
+#[test]
+fn index_build_chunks_commit_through_the_poisoning_path() {
+    let disk = SimDisk::new();
+    let node = durable_shop(&disk);
+    let orders = collection("shop.orders");
+    let total: FieldPath = "total".parse().unwrap();
+    node.insert(&orders, doc! { "total": 1 }).unwrap();
+    let field = FieldSchema {
+        field_type: FieldType::Int,
+        strict: false,
+    };
+    node.set_field_type(&orders, &total, field).unwrap();
+
+    disk.fail_next_sync();
+    assert!(matches!(
+        node.create_index(&orders, &total, false),
+        Err(Error::CommitOutcomeUnknown(_))
+    ));
+    assert!(matches!(
+        node.create_index(&orders, &total, false),
+        Err(Error::Poisoned)
+    ));
 }
 
 #[test]

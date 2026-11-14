@@ -5,9 +5,10 @@
 //! under Snapshot Isolation. See `GLOSSARY.md` for the vocabulary and
 //! `docs/adr/` for the decisions behind the design.
 //!
-//! v0.3 is embedded and single-threaded in intent. A Node opened with
+//! v0.4 is thread-safe for embedded use with plain threads. A Node opened with
 //! [`Node::open`] is durable through a WAL replayed into an empty
-//! engine on every open. Old Versions are never collected. `find` reads
+//! engine on every open. Old Versions are removed only when
+//! [`Node::collect_garbage`] is called. `find` reads
 //! candidates from a single-field Index when one fits the filter (see
 //! [`Node::create_index`]) and scans the whole Collection otherwise.
 //!
@@ -19,6 +20,7 @@ mod document;
 mod error;
 mod field_path;
 mod filter;
+mod gc;
 mod index;
 mod keys;
 mod mvcc;
@@ -32,7 +34,10 @@ pub use document::{Limits, MAX_NAME_BYTES};
 pub use error::{Error, Result};
 pub use field_path::FieldPath;
 pub use filter::{CompareOp, Filter};
-pub use index::IndexInfo;
+pub use gc::GcStats;
+#[cfg(any(test, feature = "testing"))]
+pub use index::IndexBuild;
+pub use index::{IndexInfo, IndexState};
 pub use keys::MAX_ID_BYTES;
 pub use node::Node;
 pub use schema::{FieldSchema, FieldType};

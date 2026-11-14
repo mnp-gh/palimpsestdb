@@ -28,8 +28,12 @@ _Avoid_: Namespace (MongoDB's word for it, but a Namespace here is only the firs
 The authoritative record of which Namespaces and Collections exist and how their names map to their identities.
 _Avoid_: Metadata store, schema registry
 
+**Catalog entry**:
+The Catalog's record of one Namespace or one Collection: its name and identity, and for a Collection its Collection Schema and Indexes.
+_Avoid_: Metadata row
+
 **Index**:
-A secondary lookup over one field of a Collection's Documents, covering values of its field's Field Type, consistent with those Documents at every Snapshot. A unique Index also forbids two Documents from sharing a value in that field.
+A secondary lookup over one field of a Collection's Documents, covering values of its field's Field Type, consistent with those Documents at every Snapshot. A unique Index also forbids two Documents from sharing a value in that field. While it is Building, writes keep it up to date (and enforce its uniqueness) but queries do not use it; it becomes Ready when its build finishes.
 _Avoid_: Secondary key, lookup table
 
 **Collection Schema**:
@@ -90,6 +94,10 @@ _Avoid_: Version number, LSN, wall-clock time
 One committed state of a key (a Document, an Index entry or a Catalog entry), identified by its Commit Timestamp.
 _Avoid_: Revision
 
+**Tombstone**:
+A Version that records a key's deletion: a deleted Document, a removed Index entry, or a dropped Namespace or Collection.
+_Avoid_: Delete marker
+
 **Snapshot Isolation**:
 The isolation level where each Transaction reads from its Snapshot and aborts if it writes a document that a concurrent Transaction already committed (first-committer-wins).
 _Avoid_: SI as a synonym for Serializable
@@ -97,6 +105,14 @@ _Avoid_: SI as a synonym for Serializable
 **Serializable**:
 The isolation level where every outcome matches some serial order of the committed Transactions. Achieved via Serializable Snapshot Isolation.
 _Avoid_: Strict, strong (unqualified)
+
+**Garbage Collection**:
+Removing Versions that no active Snapshot can read any more: Versions older than the newest one each key had at the Horizon, that newest Version too when it is a Tombstone, and every Version under a dropped Namespace, Collection or Index once the Horizon is past its drop. It never changes what any Transaction sees.
+_Avoid_: Vacuum, compaction (that is a Storage Engine's own housekeeping), cleanup
+
+**Horizon**:
+The oldest Snapshot any active Transaction reads, or the newest Visible commit when no Transaction is active. Every Snapshot now open or taken later is at or after it, so Garbage Collection may remove whatever no Snapshot at or after the Horizon can read. It only moves forward.
+_Avoid_: Low-water mark, oldest snapshot (when the Horizon is meant), watermark
 
 **Read Marker**:
 A record that a Transaction read a key, a range or a whole Collection, kept so Serializable can detect dangerous interleavings. It never blocks anyone.
@@ -131,6 +147,10 @@ _Avoid_: Constraint violation, duplicate key
 The failure of a write that gives a Strict Field a value of another type. Not an Abort, and not retryable.
 _Avoid_: Schema violation, validation error
 
+**Index Build Cancelled**:
+The failure of an Index build whose Index or Collection was dropped while it ran. Not an Abort, and not retryable: retrying would undo the drop or find no Collection.
+_Avoid_: Build aborted
+
 **Node**:
 One running instance of PalimpsestDB. Until replication exists, PalimpsestDB runs as exactly one Node.
 _Avoid_: Server, instance, replica (until replication is designed), database (a Node holds many Namespaces)
@@ -146,7 +166,7 @@ One committed Transaction in the WAL: its Commit Timestamp and Write Set. Aborte
 _Avoid_: Log entry, journal entry
 
 **Recovery**:
-Replaying the WAL into the Storage Engine when a Node opens. A torn last WAL Record is cut off; damage anywhere else stops the Node from opening rather than lose Durable Transactions.
+Replaying the WAL into the Storage Engine when a Node opens, then dropping every Index still Building, since no build survives a restart. A torn last WAL Record is cut off; damage anywhere else stops the Node from opening rather than lose Durable Transactions.
 _Avoid_: Restore, repair
 
 **Durable**:

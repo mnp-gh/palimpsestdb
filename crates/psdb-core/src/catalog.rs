@@ -7,12 +7,13 @@
 //! ```text
 //! { name, id,
 //!   fields:  [ { path, type, strict } ],
-//!   indexes: [ { path, id, unique } ],
+//!   indexes: [ { path, id, unique, state } ],
 //!   nextIndexId }
 //! ```
 //!
 //! All three are optional, so a Collection without them reads as having no
-//! schema, no Indexes and next Index ID 0. Changing the schema or the
+//! schema, no Indexes and next Index ID 0. An Index's `state` is
+//! `"building"` or `"ready"` (ADR 0013). Changing the schema or the
 //! Indexes rewrites the entry, so a concurrent writer to the Collection
 //! aborts with Collection Changed.
 //!
@@ -30,6 +31,9 @@
 //! so they are never reused either. Creating an Index rewrites its
 //! Collection's entry anyway, so the counter adds no conflicts.
 
+use std::collections::HashMap;
+use std::sync::RwLock;
+
 use bson::{Bson, Document, doc};
 use psdb_storage::{KeyRange, StorageEngine};
 
@@ -37,11 +41,61 @@ use crate::collection_path::CollectionPath;
 use crate::document::{self, validate_name};
 use crate::error::{Error, Result};
 use crate::field_path::FieldPath;
-use crate::index::IndexDef;
+use crate::index::{IndexDef, IndexState};
 use crate::keys;
 use crate::mvcc;
 use crate::schema::{FieldSchema, FieldType, Schema};
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, WriteSet};
+
+/// The newest Version of every Namespace and Collection entry, Tombstones
+/// included, with its Commit Timestamp. It is complete, so a key missing
+/// from it was never written and is absent at every Snapshot.
+#[derive(Default)]
+pub(crate) struct CatalogCache(RwLock<HashMap<Vec<u8>, CachedVersion>>);
+
+/// A Commit Timestamp and the value written then (`None` is a Tombstone).
+type CachedVersion = (u64, Option<Vec<u8>>);
+
+impl CatalogCache {
+    /// The value of the Catalog entry `logical` at `snapshot_ts`, or `None`
+    /// if its newest Version is newer than the Snapshot, so only the engine
+    /// has the answer.
+    pub(crate) fn read_at(&self, logical: &[u8], snapshot_ts: u64) -> Option<Option<Vec<u8>>> {
+        match self.0.read().expect("catalog cache poisoned").get(logical) {
+            None => Some(None),
+            Some((ts, value)) if *ts <= snapshot_ts => Some(value.clone()),
+            Some(_) => None,
+        }
+    }
+
+    /// Record the Catalog entries in a Write Set committed at `commit_ts`.
+    pub(crate) fn record(&self, commit_ts: u64, write_set: &WriteSet) {
+        // Copied before taking the write lock, so readers wait only for the inserts.
+        let entries: Vec<_> = write_set
+            .iter()
+            .filter(|(key, _)| keys::is_catalog_entry_key(key))
+            .map(|(key, value)| (key.clone(), (commit_ts, value.clone())))
+            .collect();
+        // Most commits write no Catalog entry; they skip the write lock.
+        if entries.is_empty() {
+            return;
+        }
+        self.0
+            .write()
+            .expect("catalog cache poisoned")
+            .extend(entries);
+    }
+
+    /// Forget the Tombstones committed at or before `horizon`: every Snapshot
+    /// from the Horizon on reads their keys as absent either way. A key
+    /// written again since has a newer timestamp, so it stays.
+    pub(crate) fn purge_tombstones(&self, horizon: u64) {
+        self.0
+            .write()
+            .expect("catalog cache poisoned")
+            .retain(|_, (ts, value)| value.is_some() || *ts > horizon);
+    }
+}
 
 /// A Collection's Catalog entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +153,11 @@ impl CollectionEntry {
                     path: path(ix, "index path")?,
                     id: read_u32(ix, "id")?,
                     unique: ix.get_bool("unique").map_err(|_| corrupt("index unique"))?,
+                    state: match ix.get_str("state") {
+                        Ok("building") => IndexState::Building,
+                        Ok("ready") => IndexState::Ready,
+                        _ => return Err(corrupt("index state")),
+                    },
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -133,9 +192,15 @@ impl CollectionEntry {
             .indexes
             .iter()
             .map(|ix| {
-                Bson::Document(
-                    doc! { "path": ix.path.as_str(), "id": i64::from(ix.id), "unique": ix.unique },
-                )
+                Bson::Document(doc! {
+                    "path": ix.path.as_str(),
+                    "id": i64::from(ix.id),
+                    "unique": ix.unique,
+                    "state": match ix.state {
+                        IndexState::Building => "building",
+                        IndexState::Ready => "ready",
+                    },
+                })
             })
             .collect();
         encode(&doc! {
@@ -342,10 +407,44 @@ mod tests {
     use crate::Node;
 
     #[test]
+    fn catalog_cache_answers_misses_and_defers_newer_entries_to_the_engine() {
+        let cache = CatalogCache::default();
+        let shop = keys::namespace_entry_key("shop");
+        assert_eq!(cache.read_at(&shop, 0), Some(None), "never written: absent");
+
+        let write_set = WriteSet::from([
+            (shop.clone(), Some(entry("shop", 7))),
+            (keys::namespace_id_key(7), Some(Vec::new())),
+        ]);
+        cache.record(5, &write_set);
+        assert_eq!(cache.read_at(&shop, 4), None, "newer than the Snapshot");
+        assert_eq!(cache.read_at(&shop, 5), Some(Some(entry("shop", 7))));
+        assert!(!keys::is_catalog_entry_key(&keys::namespace_id_key(7)));
+        assert!(keys::is_catalog_entry_key(&keys::collection_entry_key(
+            7, "orders"
+        )));
+    }
+
+    #[test]
+    fn purging_forgets_only_tombstones_at_or_below_the_horizon() {
+        let cache = CatalogCache::default();
+        let shop = keys::namespace_entry_key("shop");
+        let toys = keys::namespace_entry_key("toys");
+        cache.record(3, &WriteSet::from([(toys.clone(), Some(entry("toys", 8)))]));
+        cache.record(4, &WriteSet::from([(shop.clone(), None)]));
+        cache.record(6, &WriteSet::from([(toys.clone(), None)]));
+
+        cache.purge_tombstones(5);
+        let cached = cache.0.read().unwrap();
+        assert!(!cached.contains_key(&shop), "dropped before the Horizon");
+        assert_eq!(cached.get(&toys), Some(&(6, None)), "dropped after it");
+    }
+
+    #[test]
     fn id_of_an_empty_namespace_is_in_use() {
         let node = Node::new(MemoryEngine::new()).unwrap();
         node.create_namespace("shop").unwrap();
-        let mut txn = node.begin();
+        let mut txn = node.begin_transaction();
         let taken = txn.resolve_namespace("shop").unwrap();
         assert_eq!(txn.allocate_id_from([taken, 7], None).unwrap(), 7);
     }
@@ -356,7 +455,7 @@ mod tests {
         node.create_namespace("shop").unwrap();
         let orders = "shop.orders".parse().unwrap();
         node.create_collection(&orders).unwrap();
-        let mut txn = node.begin();
+        let mut txn = node.begin_transaction();
         let (ns_id, taken) = txn.resolve_collection(&orders).unwrap();
         assert_eq!(txn.allocate_id_from([taken, 7], Some(ns_id)).unwrap(), 7);
     }
@@ -374,7 +473,7 @@ mod tests {
         let n = "n".parse().unwrap();
         node.set_field_type(&orders, &n, int).unwrap();
         let index_ids = || {
-            let entry = node.begin().collection_entry(&orders).unwrap();
+            let entry = node.begin_transaction().collection_entry(&orders).unwrap();
             entry.indexes.iter().map(|ix| ix.id).collect::<Vec<_>>()
         };
         node.create_index(&orders, &n, false).unwrap();
@@ -388,7 +487,7 @@ mod tests {
     #[test]
     fn concurrent_draws_of_one_id_conflict() {
         let node = Node::new(MemoryEngine::new()).unwrap();
-        let (mut t1, mut t2) = (node.begin(), node.begin());
+        let (mut t1, mut t2) = (node.begin_transaction(), node.begin_transaction());
         t1.allocate_id_from([7], None).unwrap();
         t2.allocate_id_from([7], None).unwrap();
         t1.commit().unwrap();

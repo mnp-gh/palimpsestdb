@@ -2,7 +2,6 @@
 //! wins Snapshot Isolation at commit.
 
 use std::collections::{BTreeMap, BTreeSet};
-
 use std::ops::ControlFlow;
 
 use bson::{Bson, Document, RawDocument};
@@ -30,7 +29,7 @@ pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
     write_set.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
 }
 
-/// A Transaction: reads see the Snapshot taken at [`Node::begin`] plus
+/// A Transaction: reads see the Snapshot taken at [`Node::begin_transaction`] plus
 /// this Transaction's own writes; writes stay in its Write Set until
 /// [`commit`](Self::commit).
 ///
@@ -44,26 +43,40 @@ pub struct Transaction<'node, E: StorageEngine> {
     /// Bytes of every key and value in the Write Set, checked against
     /// [`Limits::max_write_set_bytes`](crate::Limits::max_write_set_bytes).
     write_set_bytes: usize,
-    /// Catalog entries this Transaction depended on; checked at commit
+    /// Keys of the Catalog entries this Transaction used: Namespaces, and
+    /// Collections with their schema and Indexes. At commit, one point
+    /// lookup per key; a newer Version aborts with Collection Changed
     /// (ADR 0006). Added only through
     /// [`depend_on_catalog_entry`](Self::depend_on_catalog_entry).
-    catalog_reads: BTreeSet<Vec<u8>>,
-    /// Collections whose every Document a schema change or Index creation
-    /// depended on (by key prefix). Added only through
+    catalog_entry_reads: BTreeSet<Vec<u8>>,
+    /// Key prefixes of Collections whose Documents and Index entries a
+    /// schema change or Index creation relied on. The Catalog entry is not
+    /// under the prefix, so it is covered by `catalog_entry_reads`. At
+    /// commit, a range scan per prefix; any newer Version aborts with
+    /// Collection Changed. Added only through
     /// [`depend_on_whole_collection`](Self::depend_on_whole_collection).
-    collection_reads: BTreeSet<Vec<u8>>,
+    collection_content_reads: BTreeSet<Vec<u8>>,
 }
 
 impl<'node, E: StorageEngine> Transaction<'node, E> {
-    pub(crate) fn new(node: &'node Node<E>, snapshot_ts: u64) -> Self {
+    /// A Transaction whose Snapshot is the latest Visible commit.
+    pub(crate) fn new(node: &'node Node<E>) -> Self {
         Self {
             node,
-            snapshot_ts,
+            snapshot_ts: node.register_snapshot(),
             write_set: WriteSet::new(),
             write_set_bytes: 0,
-            catalog_reads: BTreeSet::new(),
-            collection_reads: BTreeSet::new(),
+            catalog_entry_reads: BTreeSet::new(),
+            collection_content_reads: BTreeSet::new(),
         }
+    }
+
+    /// A Transaction whose Write Set is `write_set`, outside the Write Set
+    /// cap: a chunk of an Index build (ADR 0010).
+    pub(crate) fn with_write_set(node: &'node Node<E>, write_set: WriteSet) -> Self {
+        let mut txn = Self::new(node);
+        txn.write_set = write_set;
+        txn
     }
 
     /// The Commit Timestamp this Transaction's Snapshot was taken at.
@@ -75,22 +88,34 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// commit aborts with Collection Changed if another commit changes it
     /// after the Snapshot (ADR 0006).
     pub(crate) fn depend_on_catalog_entry(&mut self, key: Vec<u8>) {
-        self.catalog_reads.insert(key);
+        self.catalog_entry_reads.insert(key);
     }
 
     /// Record that this Transaction relied on every Document under
     /// `prefix`, so the commit aborts with Collection Changed if any
     /// Document there is committed after the Snapshot.
     pub(crate) fn depend_on_whole_collection(&mut self, prefix: Vec<u8>) {
-        self.collection_reads.insert(prefix);
+        self.collection_content_reads.insert(prefix);
     }
 
-    /// Read a logical key: own writes first, then the Snapshot.
+    /// Read a logical key: own writes first, then the Snapshot, from the
+    /// Catalog cache when it has the answer.
     pub(crate) fn read(&self, logical: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.write_set.get(logical) {
-            Some(own) => Ok(own.clone()),
-            None => mvcc::read_at(&self.node.engine, logical, self.snapshot_ts),
+        if let Some(own) = self.write_set.get(logical) {
+            return Ok(own.clone());
         }
+        if keys::is_catalog_entry_key(logical)
+            && let Some(cached) = self.node.catalog_cache.read_at(logical, self.snapshot_ts)
+        {
+            // Debug builds check the cache against the engine; release builds skip the read.
+            debug_assert_eq!(
+                cached,
+                mvcc::read_at(&self.node.engine, logical, self.snapshot_ts)?,
+                "Catalog cache disagrees with the engine"
+            );
+            return Ok(cached);
+        }
+        mvcc::read_at(&self.node.engine, logical, self.snapshot_ts)
     }
 
     pub(crate) fn write(&mut self, logical: Vec<u8>, value: Option<Vec<u8>>) -> Result<()> {
@@ -334,14 +359,14 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// or not, fails with [`Error::Poisoned`].
     pub fn commit(self) -> Result<u64> {
         let node = self.node;
-        let mut commits = node.commits.lock().expect("lock poisoned");
-        self.commit_locked(&mut commits)
+        let mut commit_state = node.commit_lock.lock().expect("lock poisoned");
+        self.commit_under_lock(&mut commit_state)
     }
 
     /// [`commit`](Self::commit), for a caller already holding the commit
     /// lock.
-    pub(crate) fn commit_locked(self, commits: &mut CommitState) -> Result<u64> {
-        if commits.poisoned {
+    pub(crate) fn commit_under_lock(self, commit_state: &mut CommitState) -> Result<u64> {
+        if commit_state.poisoned {
             return Err(Error::Poisoned);
         }
         // A read-only Transaction saw a consistent Snapshot and wrote nothing
@@ -355,7 +380,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             Ok(mvcc::latest_commit_ts(engine, key)?.is_some_and(|ts| ts > self.snapshot_ts))
         };
 
-        for key in &self.catalog_reads {
+        for key in &self.catalog_entry_reads {
             // Own Catalog writes are covered by the write-write check below.
             if !self.write_set.contains_key(key) && changed_since_snapshot(key)? {
                 return Err(Error::CollectionChanged);
@@ -365,7 +390,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         // holding the commit lock: rare (strict-field changes and Index
         // creation on empty Collections) and bounded once garbage
         // collection exists (v0.4).
-        for prefix in &self.collection_reads {
+        for prefix in &self.collection_content_reads {
             if mvcc::changed_since(engine, prefix, self.snapshot_ts)? {
                 return Err(Error::CollectionChanged);
             }
@@ -375,9 +400,20 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 return Err(Error::WriteConflict);
             }
         }
-        self.node.apply_commit(commits, &self.write_set)
+        commit_state.apply_commit(
+            engine,
+            &self.node.catalog_cache,
+            &self.node.latest_visible_commit_ts,
+            &self.write_set,
+        )
     }
 
     /// Abort, discarding the Write Set. Same as dropping the Transaction.
     pub fn abort(self) {}
+}
+
+impl<'node, E: StorageEngine> Drop for Transaction<'node, E> {
+    fn drop(&mut self) {
+        self.node.unregister_snapshot(self.snapshot_ts);
+    }
 }

@@ -9,7 +9,7 @@ use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 
 use bson::{Binary, Bson, Document, spec::BinarySubtype};
-use psdb_core::{CollectionPath, FieldPath, FieldSchema, FieldType, Node, Transaction};
+use psdb_core::{CollectionPath, FieldPath, FieldSchema, FieldType, IndexState, Node, Transaction};
 use psdb_storage_memory::MemoryEngine;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -50,6 +50,9 @@ Transactions (without begin, every command commits on its own)
   begin                        start a transaction
   commit                       commit it
   abort                        discard it
+
+Maintenance
+  gc                           remove old versions no open transaction can read
 
   help                         show this help
   quit                         exit (without --data-dir, all data is lost)";
@@ -214,7 +217,7 @@ fn execute<'node>(
             if txn.is_some() {
                 return Err("a transaction is already open; commit or abort it first".into());
             }
-            *txn = Some(node.begin());
+            *txn = Some(node.begin_transaction());
         }
         "commit" => {
             let open = txn.take().ok_or("no open transaction")?;
@@ -320,7 +323,11 @@ fn execute<'node>(
             let coll = collection_path(rest)?;
             for index in with_txn(node, txn, |t| t.list_indexes(&coll))? {
                 let unique = if index.unique { " unique" } else { "" };
-                println!("{}{unique}", index.path);
+                let building = match index.state {
+                    IndexState::Building => " building",
+                    IndexState::Ready => "",
+                };
+                println!("{}{unique}{building}", index.path);
             }
         }
         "create-index" => {
@@ -345,6 +352,14 @@ fn execute<'node>(
             };
             let path = field_path(path)?;
             with_txn(node, txn, |t| t.drop_index(&coll, &path))?;
+        }
+
+        "gc" => {
+            let stats = node.collect_garbage().map_err(message)?;
+            println!(
+                "removed {} versions ({} tombstones)",
+                stats.versions_removed, stats.tombstones_removed
+            );
         }
 
         other => return Err(format!("unknown command {other:?}; type `help`")),
