@@ -107,7 +107,7 @@ The isolation level where every outcome matches some serial order of the committ
 _Avoid_: Strict, strong (unqualified)
 
 **Garbage Collection**:
-Removing Versions that no active Snapshot can read any more: Versions older than the newest one each key had at the Horizon, that newest Version too when it is a Tombstone, and every Version under a dropped Collection or Index once the Horizon is past its drop. It never changes what any Transaction sees.
+Removing Versions that no active Snapshot can read any more: Versions older than the newest one each key had at the Horizon, that newest Version too when it is a Tombstone, and every Version under a dropped Namespace, Collection or Index once the Horizon is past its drop. It never changes what any Transaction sees.
 _Avoid_: Vacuum, compaction (that is a Storage Engine's own housekeeping), cleanup
 
 **Horizon**:

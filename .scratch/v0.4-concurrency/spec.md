@@ -40,8 +40,15 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 - `Node::collect_garbage()` takes the Horizon, scans versioned keys in batches (up to 1,024 physical keys per `WriteBatch`) starting at `NAMESPACES_COLLECTION` (bypassing unversioned `STATE_COLLECTION`), without the commit lock, and for each logical key deletes every Version older than the newest Version at or below the Horizon. If that newest Version is a tombstone, it is deleted too. Returns `GcStats`.
 - One pass at a time: a GC mutex serialises `collect_garbage()` calls, since a later pass could delete Catalog Versions an earlier pass is still reading at its older Horizon. It never blocks commits or `begin_transaction()`.
 - Deletes go straight to the engine and are not logged (ADR 0012).
-- Reclaim reads the Catalog at the Horizon, never at the newest Commit Timestamp, so nothing created after the Horizon is ever taken for dead. A Collection is dead when its ID key is visible at the Horizon but no Collection entry names that ID; an Index is dead when its ID is below its Collection's `nextIndexId` at the Horizon but not in that entry's `indexes` (dropped, failed, or dropped by Recovery). IDs are never reused, so dead stays dead. Each dead ID's key range is scanned and its keys deleted in batches.
-- After reclaim, the commit-time check for strict-field changes and Index creation on empty Collections reads only live data.
+- Reclaim finds dead IDs in the same scan, from the Catalog, which sorts before all data, so the dead set is known before the scan reaches any data:
+  - A Namespace or Collection is dead when the pass deletes the Tombstone of its entry; the Version before it holds the ID. Every Collection under a dead Namespace is dead too, and its Collection entries (every Version) are deleted from the engine and from the Catalog cache.
+  - An Index is dead when the newest Collection entry at the Horizon lists it with `state: "dropped"`. Dropping an Index (by the client, a failed build, or Recovery's `drop_building_indexes`) keeps it in `indexes` with that state instead of removing it; every reader of `indexes` (planning, Index upkeep on writes, `index_on`, listing) skips it. `shortcut:` the marker is never removed, so each pass looks up every dropped Index's range again; issue 08 tracks clearing it.
+  - Every key under a dead prefix is deleted, whatever its timestamp: IDs are never reused and builds stop once their Index is dropped, so nothing new is written there. Other keys are collected Version by Version as above.
+  - Catalog deletes are held back and written after the data, so a crash never loses the Tombstone that marks data dead.
+  - ID keys and `nextIndexId` are never deleted, so IDs are never reused.
+- Data written before ADR 0013 (build chunks above `nextIndexId`) is not supported, so there are no orphaned build chunks to find.
+- `GcStats` adds `collections_reclaimed` and `indexes_reclaimed`, counting only IDs under which the pass deleted something; reclaimed keys also count in `versions_removed` and `tombstones_removed`. CLI `gc` prints all four.
+- After reclaim, the commit-time check for strict-field changes and Index creation on empty Collections reads less, but still under the commit lock; issue 07 tracks making a field Strict without blocking commits.
 
 ## Index builds
 
