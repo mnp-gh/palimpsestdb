@@ -165,14 +165,32 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     }
 
     /// Every live value under `prefix`: the Snapshot with own writes
-    /// overlaid, in key order.
+    /// overlaid, in key order. Catalog listings come from the Catalog cache
+    /// when it has the answer.
     pub(crate) fn scan(&self, prefix: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        self.scan_range(&KeyRange::prefix(prefix))
+        let range = KeyRange::prefix(prefix);
+        if keys::is_catalog_entry_key(prefix)
+            && let Some(cached) = self.node.catalog_cache.scan_at(prefix, self.snapshot_ts)
+        {
+            debug_assert_eq!(
+                cached,
+                self.scan_snapshot(&range)?,
+                "Catalog cache disagrees with the engine"
+            );
+            return Ok(self.overlay_own_writes(&range, cached));
+        }
+        self.scan_range(&range)
     }
 
     /// Every live value whose logical key is in `range`: the Snapshot with
     /// own writes overlaid, in key order.
     pub(crate) fn scan_range(&self, range: &KeyRange) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+        let live = self.scan_snapshot(range)?;
+        Ok(self.overlay_own_writes(range, live))
+    }
+
+    /// Every live value in `range` at the Snapshot, read from the engine.
+    fn scan_snapshot(&self, range: &KeyRange) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
         let mut live = BTreeMap::new();
         mvcc::scan_range_at(
             &self.node.engine,
@@ -183,6 +201,15 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 ControlFlow::Continue(())
             },
         )?;
+        Ok(live)
+    }
+
+    /// `live` with this Transaction's writes in `range` laid over it.
+    fn overlay_own_writes(
+        &self,
+        range: &KeyRange,
+        mut live: BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> BTreeMap<Vec<u8>, Vec<u8>> {
         let own = self
             .write_set
             .range(range.start.clone()..)
@@ -193,7 +220,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 None => live.remove(key),
             };
         }
-        Ok(live)
+        live
     }
 
     /// Insert a Document. If it has no `_id`, a UUIDv7 is generated.

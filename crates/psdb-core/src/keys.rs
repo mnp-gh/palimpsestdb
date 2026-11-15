@@ -21,6 +21,7 @@ const NAMESPACES_COLLECTION: u32 = 1;
 const COLLECTIONS_COLLECTION: u32 = 2;
 const NAMESPACE_IDS_COLLECTION: u32 = 3;
 const COLLECTION_IDS_COLLECTION: u32 = 4;
+const INDEXES_COLLECTION: u32 = 5;
 
 /// The component that starts every Index entry key in a Collection. It
 /// sorts below every Document ID tag, so a Collection's Index entries and
@@ -111,8 +112,24 @@ pub(crate) fn collection_entry_key(namespace_id: u32, name: &str) -> Vec<u8> {
     key
 }
 
-/// Whether `logical` is a Namespace or Collection entry, the keys the
-/// Catalog cache holds. Checked on every read, so it allocates nothing.
+/// The prefix of every Index Catalog entry of one Collection (ADR 0014).
+pub(crate) fn index_catalog_prefix(namespace_id: u32, collection_id: u32) -> Vec<u8> {
+    let mut key = collection_prefix(SYSTEM_NAMESPACE, INDEXES_COLLECTION);
+    key.extend_from_slice(&namespace_id.to_be_bytes());
+    key.extend_from_slice(&collection_id.to_be_bytes());
+    key
+}
+
+/// The logical key of an Index's Catalog entry. Index IDs are big-endian,
+/// so a Collection's Indexes sort in the order they were created.
+pub(crate) fn index_catalog_key(namespace_id: u32, collection_id: u32, index_id: u32) -> Vec<u8> {
+    let mut key = index_catalog_prefix(namespace_id, collection_id);
+    key.extend_from_slice(&index_id.to_be_bytes());
+    key
+}
+
+/// Whether `logical` is a Namespace, Collection or Index Catalog entry (or
+/// a prefix of them), the keys the Catalog cache holds. Checked on every read, so it allocates nothing.
 pub(crate) fn is_catalog_entry_key(logical: &[u8]) -> bool {
     let Some((namespace, rest)) = logical.split_first_chunk::<4>() else {
         return false;
@@ -123,7 +140,7 @@ pub(crate) fn is_catalog_entry_key(logical: &[u8]) -> bool {
     u32::from_be_bytes(*namespace) == SYSTEM_NAMESPACE
         && matches!(
             u32::from_be_bytes(*collection),
-            NAMESPACES_COLLECTION | COLLECTIONS_COLLECTION
+            NAMESPACES_COLLECTION | COLLECTIONS_COLLECTION | INDEXES_COLLECTION
         )
 }
 

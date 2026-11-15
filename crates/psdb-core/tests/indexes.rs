@@ -742,6 +742,44 @@ fn writer_aborts_when_indexes_change_under_it() {
     node.create_index(&collection("shop.orders"), &field_path("n"), false)
         .unwrap();
     assert!(matches!(txn.commit(), Err(Error::CollectionChanged)));
+
+    // Dropping writes only the Index's own entry, which the writer read.
+    let mut txn = node.begin_transaction();
+    txn.insert(&collection("shop.orders"), doc! { "n": 1 })
+        .unwrap();
+    node.drop_index(&collection("shop.orders"), &field_path("n"))
+        .unwrap();
+    assert!(matches!(txn.commit(), Err(Error::CollectionChanged)));
+}
+
+#[test]
+fn writer_aborts_when_a_building_index_becomes_ready() {
+    let node = unindexed();
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), false)
+        .unwrap();
+    let mut txn = node.begin_transaction();
+    txn.insert(&collection("shop.orders"), doc! { "_id": 9999, "n": 9999 })
+        .unwrap();
+    while !build.step().unwrap() {}
+    assert!(matches!(txn.commit(), Err(Error::CollectionChanged)));
+}
+
+#[test]
+fn an_old_snapshot_still_sees_a_dropped_index() {
+    let node = indexed("age", FieldType::Int, false, false);
+    let mut old = node.begin_transaction();
+    node.drop_index(&collection("shop.orders"), &field_path("age"))
+        .unwrap();
+    assert_eq!(
+        old.list_indexes(&collection("shop.orders")).unwrap().len(),
+        1
+    );
+    assert!(
+        node.list_indexes(&collection("shop.orders"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// `shop.orders` after a unique Index build on `n` failed with Duplicate
