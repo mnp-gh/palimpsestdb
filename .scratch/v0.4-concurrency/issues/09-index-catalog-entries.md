@@ -1,6 +1,6 @@
 # Index Catalog entries
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 02, 03
 
 Spec: [Index Catalog entries](../spec.md#index-catalog-entries), [ADR 0014](../../../docs/adr/0014-indexes-have-their-own-catalog-entries.md).

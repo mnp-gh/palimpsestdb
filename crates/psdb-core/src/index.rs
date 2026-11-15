@@ -293,18 +293,18 @@ impl<E: StorageEngine> Transaction<'_, E> {
         path: &FieldPath,
         unique: bool,
     ) -> Result<()> {
-        let (mut entry, index) = self.prepare_index(collection, path, unique)?;
+        let (entry, index) = self.prepare_index(collection, path, unique)?;
         if self.any_live_in(&entry.documents())? {
             return Err(Error::CollectionNotEmpty(collection.clone()));
         }
         self.depend_on_whole_collection(entry.prefix());
-        entry.indexes.push(index);
-        self.write_collection_entry(&entry)
+        self.write_collection_entry(&entry)?;
+        self.write_index_entry(&entry, &index)
     }
 
     /// Check that an Index may be created and give it the Collection's next
-    /// Index ID. The caller fills the Index and adds it to the returned
-    /// entry, whose counter has moved past the ID.
+    /// Index ID. The caller writes the returned entry, whose counter has
+    /// moved past the ID, and the Index's own entry.
     pub(crate) fn prepare_index(
         &mut self,
         collection: &CollectionPath,
@@ -340,19 +340,18 @@ impl<E: StorageEngine> Transaction<'_, E> {
         Ok((entry, index))
     }
 
-    /// Drop the Index on a field. Its entries become unreachable and stay
-    /// behind until garbage collection exists.
+    /// Drop the Index on a field: a Tombstone on its Catalog entry
+    /// (ADR 0014). Its entries become unreachable and stay behind until
+    /// garbage collection reclaims them.
     pub fn drop_index(&mut self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
-        let mut entry = self.collection_entry(collection)?;
-        let before = entry.indexes.len();
-        entry.indexes.retain(|ix| ix.path != *path);
-        if entry.indexes.len() == before {
+        let entry = self.collection_entry(collection)?;
+        let Some(index) = entry.index_on(path) else {
             return Err(Error::NoSuchIndex {
                 collection: collection.clone(),
                 path: path.clone(),
             });
-        }
-        self.write_collection_entry(&entry)
+        };
+        self.drop_index_entry(&entry, index)
     }
 
     /// The Collection's Indexes, in the order they were created.
@@ -442,12 +441,11 @@ impl<E: StorageEngine> Node<E> {
         unique: bool,
     ) -> Result<IndexBuild<'_, E>> {
         let (entry, index_id) = self.run(|t| {
-            let (mut entry, mut index) = t.prepare_index(collection, path, unique)?;
+            let (entry, mut index) = t.prepare_index(collection, path, unique)?;
             index.state = IndexState::Building;
-            let index_id = index.id;
-            entry.indexes.push(index);
             t.write_collection_entry(&entry)?;
-            Ok((entry, index_id))
+            t.write_index_entry(&entry, &index)?;
+            Ok((entry, index.id))
         })?;
         Ok(IndexBuild {
             node: self,
@@ -465,11 +463,11 @@ impl<E: StorageEngine> Node<E> {
         self.run(|t| {
             for namespace in t.list_namespaces()? {
                 for name in t.list_collections(&namespace)? {
-                    let mut entry = t.collection_entry(&CollectionPath::new(&namespace, &name)?)?;
-                    let before = entry.indexes.len();
-                    entry.indexes.retain(|ix| ix.state == IndexState::Ready);
-                    if entry.indexes.len() != before {
-                        t.write_collection_entry(&entry)?;
+                    let entry = t.collection_entry(&CollectionPath::new(&namespace, &name)?)?;
+                    for index in &entry.indexes {
+                        if index.state == IndexState::Building {
+                            t.drop_index_entry(&entry, index)?;
+                        }
                     }
                 }
             }
@@ -518,12 +516,7 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
     /// Index the next chunk of Documents; true if Documents remain.
     fn index_next_chunk(&mut self, commit_state: &mut CommitState) -> Result<bool> {
         let node = self.node;
-        let (_, entry) = self.live_entry()?;
-        let index = entry
-            .indexes
-            .iter()
-            .find(|ix| ix.id == self.index_id)
-            .expect("live_entry found it");
+        let (_, entry, index) = self.live_entry()?;
         let latest = node.latest_visible_commit_ts();
         let prefix_len = entry.prefix().len();
         let mut docs = Vec::new();
@@ -545,7 +538,8 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
         let mut chunk = WriteSet::new();
         for (key, bytes) in &docs {
             let doc_id = &key[prefix_len..];
-            let Some(index_entry) = entry.index_entry(index, document::raw(bytes)?, doc_id)? else {
+            let Some(index_entry) = entry.index_entry(&index, document::raw(bytes)?, doc_id)?
+            else {
                 continue;
             };
             if index_entry.unique {
@@ -578,33 +572,26 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
         Ok(false)
     }
 
-    /// Mark the Index Ready, leaving the Collection's other Indexes as they
-    /// are now.
+    /// Mark the Index Ready, writing only its own Catalog entry (ADR 0014).
     fn mark_ready(&self, commit_state: &mut CommitState) -> Result<()> {
-        let (mut txn, mut entry) = self.live_entry()?;
-        for ix in &mut entry.indexes {
-            if ix.id == self.index_id {
-                ix.state = IndexState::Ready;
-            }
-        }
-        txn.write_collection_entry(&entry)?;
+        let (mut txn, entry, mut index) = self.live_entry()?;
+        index.state = IndexState::Ready;
+        txn.write_index_entry(&entry, &index)?;
         txn.commit_under_lock(commit_state).map(drop)
     }
 
-    /// Remove the Index from the Collection's entry, leaving its other
-    /// Indexes as they are now.
+    /// Write a Tombstone on the Index's Catalog entry.
     fn remove_under_lock(&self, commit_state: &mut CommitState) -> Result<()> {
-        let (mut txn, mut entry) = self.live_entry()?;
-        entry.indexes.retain(|ix| ix.id != self.index_id);
-        txn.write_collection_entry(&entry)?;
+        let (mut txn, entry, index) = self.live_entry()?;
+        txn.drop_index_entry(&entry, &index)?;
         txn.commit_under_lock(commit_state).map(drop)
     }
 
-    /// The Collection's newest entry, read in a Transaction at the newest
-    /// Commit Timestamp, if it still holds this Index as Building. Called
-    /// under the commit lock, so the entry stays the newest until the
-    /// caller commits.
-    fn live_entry(&self) -> Result<(Transaction<'_, E>, CollectionEntry)> {
+    /// The Collection's newest entry, with its Indexes, read in a
+    /// Transaction at the newest Commit Timestamp, if the Index's own entry
+    /// is still Building. Called under the commit lock, so the entries stay
+    /// the newest until the caller commits.
+    fn live_entry(&self) -> Result<(Transaction<'_, E>, CollectionEntry, IndexDef)> {
         let mut txn = Transaction::new(self.node);
         let entry = match txn.collection_entry(&self.collection) {
             Err(Error::NoSuchNamespace(_) | Error::NoSuchCollection(_)) => {
@@ -612,14 +599,19 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
             }
             entry => entry?,
         };
-        let building = entry
+        let index = entry
             .indexes
             .iter()
-            .any(|ix| ix.id == self.index_id && ix.state == IndexState::Building);
-        if entry.namespace_id != self.namespace_id || entry.id != self.collection_id || !building {
-            return Err(Error::IndexBuildCancelled);
+            .find(|ix| ix.id == self.index_id && ix.state == IndexState::Building)
+            .cloned();
+        match index {
+            Some(index)
+                if entry.namespace_id == self.namespace_id && entry.id == self.collection_id =>
+            {
+                Ok((txn, entry, index))
+            }
+            _ => Err(Error::IndexBuildCancelled),
         }
-        Ok((txn, entry))
     }
 }
 
