@@ -1,6 +1,8 @@
 # Clearing dropped Index markers
 
-Status: needs-triage
+Status: wontfix
+
+Superseded by issue 09 ([ADR 0014](../../../docs/adr/0014-indexes-have-their-own-catalog-entries.md)): a dropped Index's Catalog entry is a Tombstone, which Garbage Collection deletes, so there is no marker to clear.
 
 Since issue 05, dropping an Index (by the client, a failed build, or Recovery's `drop_building_indexes`) keeps it in its Collection entry's `indexes` list with `state: "dropped"`, and Garbage Collection deletes the data of every `dropped` Index it finds. Garbage Collection never writes Versions (ADR 0012), so nothing removes the marker: every pass looks up each dropped Index's (already empty) range again, and the list grows by one item per Index ever dropped on the Collection.
 

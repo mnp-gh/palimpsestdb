@@ -57,6 +57,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Thread-safe Database Layer; single in-order applier; visibility watermark
 - Background Index builds, so a long build no longer stops every other commit: the Index is Building while writers maintain it, and the build takes the commit lock one chunk at a time ([ADR 0010](./adr/0010-index-builds-commit-in-chunks.md), [ADR 0013](./adr/0013-building-indexes-take-the-lock-per-chunk.md))
 - In-RAM Catalog cache (v0.1 reads Catalog entries from the engine on every operation)
+- Each Index gets its own Catalog entry, so a dropped Index leaves a Tombstone like a dropped Collection ([ADR 0014](./adr/0014-indexes-have-their-own-catalog-entries.md))
 - Garbage Collection of old Versions below the oldest active Snapshot, run by an explicit `Node::collect_garbage()`, not logged in the WAL ([ADR 0012](./adr/0012-garbage-collection-is-not-logged.md)); running it automatically comes later
 - Reclaim dropped Namespaces, Collections and Indexes (failed builds included): scan an ID's key range and delete its keys in batches (no range-delete operation in the Storage Engine until an engine benefits from one) once the Horizon is past its drop. Version-by-version collection never removes them, because their newest Versions are still live. This also bounds the commit-time check for strict-field changes and Index creation on empty Collections, which today reads every Version ever written under the Collection while holding the commit lock
 - Clock and I/O seams; deterministic simulator

@@ -1,7 +1,7 @@
 # Clock and random seams, deterministic simulator
 
 Status: ready-for-agent
-Blocked by: 01, 02, 03, 04, 05
+Blocked by: 01, 02, 03, 04, 05, 09
 
 Spec: [Seams and simulator](../spec.md#seams-and-simulator).
 
