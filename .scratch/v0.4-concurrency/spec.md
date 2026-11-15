@@ -2,7 +2,7 @@
 
 Status: ready-for-agent
 
-A thread-safe Database Layer for embedded use with plain threads: Transactions begin and run in parallel, commits stay one at a time, Index builds no longer stop the world, and old Versions are collected. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0004](../../docs/adr/0004-database-layer-owns-wal.md), [ADR 0007](../../docs/adr/0007-runtime-model.md), [ADR 0012](../../docs/adr/0012-garbage-collection-is-not-logged.md) and [ADR 0013](../../docs/adr/0013-building-indexes-take-the-lock-per-chunk.md).
+A thread-safe Database Layer for embedded use with plain threads: Transactions begin and run in parallel, commits stay one at a time, Index builds no longer stop the world, and old Versions are collected. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0004](../../docs/adr/0004-database-layer-owns-wal.md), [ADR 0007](../../docs/adr/0007-runtime-model.md), [ADR 0012](../../docs/adr/0012-garbage-collection-is-not-logged.md), [ADR 0013](../../docs/adr/0013-building-indexes-take-the-lock-per-chunk.md) and [ADR 0014](../../docs/adr/0014-indexes-have-their-own-catalog-entries.md).
 
 ## Out of scope
 
@@ -27,9 +27,9 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 - Holds the newest Version of each Catalog entry with its Commit Timestamp, updated under the commit lock when a commit writes Catalog entries (Index build chunks write none). Drops are retained as tombstones and purged once the Horizon passes their Commit Timestamp during Garbage Collection.
 - A Transaction whose Snapshot is at or after an entry's timestamp reads it from the cache; an older Snapshot reads the engine. A Transaction's own Write Set still wins over both.
 - Catalog dependency checks at commit are unchanged.
-- Caches Namespace and Collection entries only; ID keys stay engine-only, since `allocate_id` asks whether any Version ever existed, not what a Snapshot sees.
-- Serves point reads only (`resolve_namespace`, `collection_entry`). Listings keep scanning the engine.
-- Holds raw bytes, `RwLock<HashMap<logical key, (Commit Timestamp, Option<bytes>)>>` on `Node`, beside the commit lock rather than inside `CommitState`, so readers never wait on a commit. The lookup sits inside `Transaction::read`; callers are unchanged.
+- Caches Namespace, Collection and Index entries; ID keys stay engine-only, since `allocate_id` asks whether any Version ever existed, not what a Snapshot sees.
+- Serves point reads (`resolve_namespace`, `collection_entry`) and one Collection's Index entries (a prefix range). Other listings keep scanning the engine.
+- Holds raw bytes, `RwLock<BTreeMap<logical key, (Commit Timestamp, Option<bytes>)>>` on `Node`, beside the commit lock rather than inside `CommitState`, so readers never wait on a commit. The lookup sits inside `Transaction::read`; callers are unchanged.
 - The cache is complete, so a miss means absent at every Snapshot (a purged Tombstone is below the Horizon) and needs no engine read.
 - Commit order: engine write, then cache update, then publish `latest_visible_commit_ts`. Publishing first would let a Snapshot at the new timestamp read the old cached entry. Comment this where it is enforced; testing the race waits for the simulator (issue 06).
 - Filled on open by feeding each replayed WAL Record to the same function commits use.
@@ -42,13 +42,20 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 - Deletes go straight to the engine and are not logged (ADR 0012).
 - Reclaim finds dead IDs in the same scan, from the Catalog, which sorts before all data, so the dead set is known before the scan reaches any data:
   - A Namespace or Collection is dead when the pass deletes the Tombstone of its entry; the Version before it holds the ID. Every Collection under a dead Namespace is dead too, and its Collection entries (every Version) are deleted from the engine and from the Catalog cache.
-  - An Index is dead when the newest Collection entry at the Horizon lists it with `state: "dropped"`. Dropping an Index (by the client, a failed build, or Recovery's `drop_building_indexes`) keeps it in `indexes` with that state instead of removing it; every reader of `indexes` (planning, Index upkeep on writes, `index_on`, listing) skips it. `shortcut:` the marker is never removed, so each pass looks up every dropped Index's range again; issue 08 tracks clearing it.
+  - An Index is dead when the pass deletes the Tombstone of its Catalog entry (see [Index Catalog entries](#index-catalog-entries)). A dead Collection's Index Catalog entries (every Version) are deleted with it, from the engine and the Catalog cache.
   - Every key under a dead prefix is deleted, whatever its timestamp: IDs are never reused and builds stop once their Index is dropped, so nothing new is written there. Other keys are collected Version by Version as above.
   - Catalog deletes are held back and written after the data, so a crash never loses the Tombstone that marks data dead.
   - ID keys and `nextIndexId` are never deleted, so IDs are never reused.
 - Data written before ADR 0013 (build chunks above `nextIndexId`) is not supported, so there are no orphaned build chunks to find.
 - `GcStats` adds `collections_reclaimed` and `indexes_reclaimed`, counting only IDs under which the pass deleted something; reclaimed keys also count in `versions_removed` and `tombstones_removed`. CLI `gc` prints all four.
 - After reclaim, the commit-time check for strict-field changes and Index creation on empty Collections reads less, but still under the commit lock; issue 07 tracks making a field Strict without blocking commits.
+
+## Index Catalog entries
+
+- Each Index has its own Catalog entry ([ADR 0014](../../docs/adr/0014-indexes-have-their-own-catalog-entries.md)): Catalog Collection 5, key `namespace_id ‖ collection_id ‖ index_id`, value `{ path, unique, state }`. The Collection entry loses `indexes` and keeps `nextIndexId`. Collection entries with `indexes` are not supported; recreate old data directories.
+- Creating an Index writes its entry and rewrites the Collection entry (`nextIndexId`). Dropping one writes a Tombstone on its entry only; marking it Ready rewrites its entry only.
+- A writer records a read of the Collection entry and of every Index entry it maintains, so a create, drop or Ready commit after its Snapshot aborts it with Collection Changed through the existing check.
+- Recovery's `drop_building_indexes` and a failed build's cleanup write Tombstones on the Building Indexes' entries.
 
 ## Index builds
 

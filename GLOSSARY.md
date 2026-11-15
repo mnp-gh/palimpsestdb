@@ -25,11 +25,11 @@ The name of a Collection together with the name of its Namespace, written `<name
 _Avoid_: Namespace (MongoDB's word for it, but a Namespace here is only the first part), full name, qualified name
 
 **Catalog**:
-The authoritative record of which Namespaces and Collections exist and how their names map to their identities.
+The authoritative record of which Namespaces, Collections and Indexes exist and how their names map to their identities.
 _Avoid_: Metadata store, schema registry
 
 **Catalog entry**:
-The Catalog's record of one Namespace or one Collection: its name and identity, and for a Collection its Collection Schema and Indexes.
+The Catalog's record of one Namespace, Collection or Index. A Namespace's or Collection's holds its name and identity, and a Collection's also its Collection Schema; an Index's holds its identity, its Field path, whether it is unique, and whether it is Building or Ready.
 _Avoid_: Metadata row
 
 **Index**:
@@ -95,7 +95,7 @@ One committed state of a key (a Document, an Index entry or a Catalog entry), id
 _Avoid_: Revision
 
 **Tombstone**:
-A Version that records a key's deletion: a deleted Document, a removed Index entry, or a dropped Namespace or Collection.
+A Version that records a key's deletion: a deleted Document, a removed Index entry, or a dropped Namespace, Collection or Index.
 _Avoid_: Delete marker
 
 **Snapshot Isolation**:
