@@ -58,6 +58,10 @@ pub struct Node<E: StorageEngine> {
     pub(crate) catalog_cache: CatalogCache,
     /// Active Snapshot timestamps mapped to how many open Transactions read them.
     pub(crate) snapshot_registry: Mutex<BTreeMap<u64, usize>>,
+    /// Held by a Garbage Collection pass: a later pass could delete Catalog
+    /// Versions an earlier one still reads at its older Horizon. Commits
+    /// never take it.
+    pub(crate) gc_lock: Mutex<()>,
 }
 
 /// The state commits serialise on, behind [`Node`]'s commit lock. Only
@@ -219,6 +223,7 @@ impl<E: StorageEngine> Node<E> {
             latest_visible_commit_ts: AtomicU64::new(last),
             catalog_cache,
             snapshot_registry: Mutex::new(BTreeMap::new()),
+            gc_lock: Mutex::new(()),
         }
     }
 
