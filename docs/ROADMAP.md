@@ -59,7 +59,8 @@ A single-threaded library with no network, no durability and no garbage collecti
 - In-RAM Catalog cache (v0.1 reads Catalog entries from the engine on every operation)
 - Each Index gets its own Catalog entry, so a dropped Index leaves a Tombstone like a dropped Collection ([ADR 0014](./adr/0014-indexes-have-their-own-catalog-entries.md))
 - Garbage Collection of old Versions below the oldest active Snapshot, run by an explicit `Node::collect_garbage()`, not logged in the WAL ([ADR 0012](./adr/0012-garbage-collection-is-not-logged.md)); running it automatically comes later
-- Reclaim dropped Namespaces, Collections and Indexes (failed builds included): scan an ID's key range and delete its keys in batches (no range-delete operation in the Storage Engine until an engine benefits from one) once the Horizon is past its drop. Version-by-version collection never removes them, because their newest Versions are still live. This also bounds the commit-time check for strict-field changes and Index creation on empty Collections, which today reads every Version ever written under the Collection while holding the commit lock
+- Reclaim dropped Namespaces, Collections and Indexes (failed builds included): scan an ID's key range and delete its keys in batches (no range-delete operation in the Storage Engine until an engine benefits from one) once the Horizon is past its drop. Version-by-version collection never removes them, because their newest Versions are still live.
+- The commit-time check for strict-field changes and Index creation on empty Collections compares a per-Collection timestamp of the last Document commit instead of scanning the Collection under the commit lock
 - Clock and I/O seams; deterministic simulator
 
 ## v0.4.1: Persistent engine
@@ -100,6 +101,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v1.0: Hardening
 
 - Documentation pass, benchmarks, fuzzing, stabilised on-disk format
+- Making a field Strict on a busy Collection: writers enforce it while the existing Documents are checked in chunks, like a background Index build, so a steady stream of new Documents cannot make the change abort on every retry
 - Measure the space field names cost after compression; decide on a per-Collection field-name dictionary from the numbers (Documents stay BSON until then)
 
 ## Unscheduled
