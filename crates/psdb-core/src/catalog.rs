@@ -424,7 +424,8 @@ fn entry(name: &str, id: u32) -> Vec<u8> {
     encode(&doc! { "name": name, "id": i64::from(id) })
 }
 
-fn entry_id(bytes: &[u8]) -> Result<u32> {
+/// The ID in a Namespace or Collection entry.
+pub(crate) fn entry_id(bytes: &[u8]) -> Result<u32> {
     read_u32(&document::decode(bytes)?, "id")
 }
 

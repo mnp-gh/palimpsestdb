@@ -60,6 +60,26 @@ pub(crate) fn is_system_key(logical: &[u8]) -> bool {
     logical.starts_with(&SYSTEM_NAMESPACE.to_be_bytes())
 }
 
+/// The Namespace ID in the key of a Collection entry, if `logical` is one.
+pub(crate) fn collection_entry_namespace(logical: &[u8]) -> Option<u32> {
+    let rest = logical
+        .strip_prefix(collection_prefix(SYSTEM_NAMESPACE, COLLECTIONS_COLLECTION).as_slice())?;
+    Some(u32::from_be_bytes(*rest.first_chunk::<4>()?))
+}
+
+/// The Namespace and Collection IDs of a Document or Index entry key.
+pub(crate) fn data_collection(logical: &[u8]) -> Option<(u32, u32)> {
+    if is_system_key(logical) {
+        return None;
+    }
+    let (namespace, rest) = logical.split_first_chunk::<4>()?;
+    let (collection, _) = rest.split_first_chunk::<4>()?;
+    Some((
+        u32::from_be_bytes(*namespace),
+        u32::from_be_bytes(*collection),
+    ))
+}
+
 /// The Collection prefix of `logical` if it is a Document key, not an
 /// Index entry or a Catalog entry.
 pub(crate) fn document_collection_prefix(logical: &[u8]) -> Option<&[u8]> {
