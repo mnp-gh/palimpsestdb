@@ -28,7 +28,9 @@ impl<E: StorageEngine> Node<E> {
     /// and that one too if it is a Tombstone. Deletes straight from the
     /// engine in batches, without the commit lock and without logging, so
     /// Recovery may bring removed Versions back for the next pass to remove.
+    /// One pass runs at a time; a second call waits for the first.
     pub fn collect_garbage(&self) -> Result<GcStats> {
+        let _one_pass = self.gc_lock.lock().expect("gc lock poisoned");
         let horizon = self.horizon();
         let mut stats = GcStats::default();
         // Unversioned state sorts below the Namespaces, so it is skipped.
