@@ -385,7 +385,8 @@ impl<E: StorageEngine> Node<E> {
     /// [`Error::DuplicateValue`], one commit removes the Index and the
     /// original error is returned; if that commit fails too, the Index stays
     /// Building until it is dropped or the Node reopens. Committed chunks
-    /// stay behind under an Index ID that is never reused in the Collection.
+    /// stay behind under an Index ID that is never reused in the Collection,
+    /// until Garbage Collection reclaims them.
     ///
     /// ```
     /// use bson::doc;

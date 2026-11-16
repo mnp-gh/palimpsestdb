@@ -357,8 +357,11 @@ fn execute<'node>(
         "gc" => {
             let stats = node.collect_garbage().map_err(message)?;
             println!(
-                "removed {} versions ({} tombstones)",
-                stats.versions_removed, stats.tombstones_removed
+                "removed {} versions ({} tombstones); reclaimed {} collections, {} indexes",
+                stats.versions_removed,
+                stats.tombstones_removed,
+                stats.collections_reclaimed,
+                stats.indexes_reclaimed
             );
         }
 

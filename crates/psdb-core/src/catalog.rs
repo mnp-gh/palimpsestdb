@@ -263,8 +263,8 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// Drop a Namespace. Its Collections become unreachable: their Catalog
-    /// entries and Documents stay behind under the old IDs until garbage
-    /// collection exists.
+    /// entries and Documents stay behind under the old IDs until Garbage
+    /// Collection reclaims them.
     pub fn drop_namespace(&mut self, name: &str) -> Result<()> {
         self.resolve_namespace(name)?;
         self.write(keys::namespace_entry_key(name), None)
@@ -290,7 +290,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// Drop a Collection. Its Documents become unreachable and stay behind
-    /// until garbage collection exists.
+    /// until Garbage Collection reclaims them.
     pub fn drop_collection(&mut self, collection: &CollectionPath) -> Result<()> {
         let (ns_id, _) = self.resolve_collection(collection)?;
         self.write(
