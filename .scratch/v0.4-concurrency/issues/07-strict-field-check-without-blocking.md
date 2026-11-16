@@ -1,6 +1,6 @@
 # Making a field Strict without blocking other commits
 
-Status: ready-for-agent
+Status: resolved
 
 Making a field Strict (`crates/psdb-core/src/schema.rs:213`) and creating an Index on an empty Collection (`crates/psdb-core/src/index.rs:300`) record a dependency on the whole Collection. Checking the existing Documents runs inside the Transaction, without the commit lock. But at commit, `mvcc::changed_since` reads every Version ever written under the Collection, Documents and Index entries, while holding the commit lock, so every other commit waits for a scan that grows with the Collection.
 
