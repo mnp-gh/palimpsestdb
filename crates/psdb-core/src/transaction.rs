@@ -52,7 +52,7 @@ pub struct Transaction<'node, E: StorageEngine> {
     /// Key prefixes of Collections whose Documents and Index entries a
     /// schema change or Index creation relied on. The Catalog entry is not
     /// under the prefix, so it is covered by `catalog_entry_reads`. At
-    /// commit, a range scan per prefix; any newer Version aborts with
+    /// commit, a Document committed into one after the Snapshot aborts with
     /// Collection Changed. Added only through
     /// [`depend_on_whole_collection`](Self::depend_on_whole_collection).
     collection_content_reads: BTreeSet<Vec<u8>>,
@@ -413,12 +413,18 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
                 return Err(Error::CollectionChanged);
             }
         }
-        // Reads every Version ever written under the Collection, while
-        // holding the commit lock: rare (strict-field changes and Index
-        // creation on empty Collections) and bounded once garbage
-        // collection exists (v0.4).
+        // shortcut: on a Collection that gets Documents all the time, a
+        // Strict change can abort every retry, since one lands while the
+        // existing Documents are checked; upgrade to the gradual design
+        // (.scratch/v1.0-hardening/issues/01-gradual-strict-field.md) if that bites.
         for prefix in &self.collection_content_reads {
-            if mvcc::changed_since(engine, prefix, self.snapshot_ts)? {
+            // No entry: no Document written since the Node opened, which
+            // precedes every Snapshot.
+            if commit_state
+                .last_document_commit
+                .get(prefix)
+                .is_some_and(|&ts| ts > self.snapshot_ts)
+            {
                 return Err(Error::CollectionChanged);
             }
         }

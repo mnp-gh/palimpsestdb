@@ -72,7 +72,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 **A commit** (`Transaction::commit`) takes the commit lock (`Node::commit_lock`), then:
 
 1. Fails if the Node is poisoned. A Transaction that wrote nothing commits at once.
-2. Aborts with Collection Changed if a Catalog entry it read, or a Collection it read whole, changed since its Snapshot.
+2. Aborts with Collection Changed if a Catalog entry it read changed since its Snapshot, or if a Document was committed since then into a Collection it read whole. For the latter, `CommitState::last_document_commit` keeps, in memory, each Collection's last Document commit since the Node opened; Index entries, build chunks included, do not update it.
 3. Aborts with Write Conflict if any key it writes was committed since its Snapshot (first-committer-wins).
 4. Calls `CommitState::apply_commit`, which takes the next Commit Timestamp, appends and fsyncs the WAL record, then writes one engine batch: every Version plus `applied_up_to`. A failure after the append poisons the Node with Commit Outcome Unknown (ADR 0004).
 5. `apply_commit` then records the commit's Catalog entries in `Node::catalog_cache`, and only then stores the Commit Timestamp in `Node::latest_visible_commit_ts`, the only copy of it, which makes the commit Visible.

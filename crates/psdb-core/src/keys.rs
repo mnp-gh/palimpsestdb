@@ -54,6 +54,14 @@ pub(crate) fn collection_prefix(namespace_id: u32, collection_id: u32) -> Vec<u8
     key
 }
 
+/// The Collection prefix of `logical` if it is a Document key, not an
+/// Index entry or a Catalog entry.
+pub(crate) fn document_collection_prefix(logical: &[u8]) -> Option<&[u8]> {
+    let (prefix, rest) = logical.split_at_checked(8)?;
+    let user_namespace = prefix[..4] != SYSTEM_NAMESPACE.to_be_bytes();
+    (user_namespace && rest.first().is_some_and(|&b| b != INDEX_ENTRIES)).then_some(prefix)
+}
+
 /// Every Document of a Collection, without its Index entries.
 pub(crate) fn documents_range(namespace_id: u32, collection_id: u32) -> KeyRange {
     let prefix = collection_prefix(namespace_id, collection_id);

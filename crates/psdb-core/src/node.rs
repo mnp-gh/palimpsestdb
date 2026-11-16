@@ -1,6 +1,6 @@
 //! The entry point: a [`Node`] over one Storage Engine.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +14,7 @@ use crate::document::Limits;
 use crate::error::{Error, Result};
 use crate::field_path::FieldPath;
 use crate::index::IndexInfo;
+use crate::keys;
 use crate::mvcc;
 use crate::schema::FieldSchema;
 use crate::transaction::{self, Transaction, WriteSet, writes};
@@ -67,6 +68,10 @@ pub(crate) struct CommitState {
     wal: Option<Wal>,
     /// Set when a commit's outcome is unknown; nothing more may commit.
     pub(crate) poisoned: bool,
+    /// Collection prefix → Commit Timestamp of the last commit since the
+    /// Node opened that wrote a Document there. Index entries do not count.
+    /// Entries of dropped Collections stay: a few bytes each.
+    pub(crate) last_document_commit: HashMap<Vec<u8>, u64>,
 }
 
 impl CommitState {
@@ -74,6 +79,7 @@ impl CommitState {
         Self {
             wal,
             poisoned: false,
+            last_document_commit: HashMap::new(),
         }
     }
 
@@ -90,6 +96,7 @@ impl CommitState {
         let commit_ts = latest_visible_commit_ts.load(Ordering::Relaxed) + 1;
         let Some(wal) = &mut self.wal else {
             engine.write_batch(mvcc::commit_batch(commit_ts, writes(write_set)))?;
+            self.record_document_commits(commit_ts, write_set);
             catalog_cache.record(commit_ts, write_set);
             latest_visible_commit_ts.store(commit_ts, Ordering::Release);
             return Ok(commit_ts);
@@ -107,9 +114,18 @@ impl CommitState {
         }
         // Before publishing: a Snapshot at `commit_ts` must not find the
         // cached entry this commit replaces.
+        self.record_document_commits(commit_ts, write_set);
         catalog_cache.record(commit_ts, write_set);
         latest_visible_commit_ts.store(commit_ts, Ordering::Release);
         Ok(commit_ts)
+    }
+
+    fn record_document_commits(&mut self, commit_ts: u64, write_set: &WriteSet) {
+        for key in write_set.keys() {
+            if let Some(prefix) = keys::document_collection_prefix(key) {
+                self.last_document_commit.insert(prefix.to_vec(), commit_ts);
+            }
+        }
     }
 }
 
