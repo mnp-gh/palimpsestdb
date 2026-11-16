@@ -36,10 +36,12 @@ impl<E: StorageEngine> Node<E> {
     /// engine in batches, without the commit lock and without logging, so
     /// Recovery may bring removed Versions back for the next pass to remove.
     ///
-    /// Deleting the Tombstone of a Collection's or Index's Catalog entry
-    /// makes its ID dead: every key under it is deleted, whatever its
-    /// timestamp, since IDs are never reused. So is every Version of a dead
-    /// Collection's Index Catalog entries. The Catalog sorts before the data, so dead IDs
+    /// Deleting the Tombstone of a Namespace's, Collection's or Index's
+    /// Catalog entry makes its ID dead: every key under it is deleted,
+    /// whatever its timestamp, since IDs are never reused. So is every
+    /// Version of a dead Namespace's Collection entries and a dead
+    /// Collection's Index Catalog entries. ID keys stay, so IDs are never
+    /// reused. The Catalog sorts before the data, so dead IDs
     /// are known before the scan reaches it.
     ///
     /// One pass runs at a time; a second call waits for the first.
@@ -57,9 +59,11 @@ impl<E: StorageEngine> Node<E> {
         // split one key's Versions.
         let mut current: Vec<u8> = Vec::new();
         let mut seen_newest = false;
-        // Set on deleting a Collection entry's Tombstone: the key's next
-        // Version holds the dropped ID.
+        // Set on deleting a Namespace or Collection entry's Tombstone: the
+        // key's next Version holds the dropped ID.
         let mut dead_id_follows = false;
+        // IDs of the dropped Namespaces found; their Collections are dead too.
+        let mut dead_namespaces = HashSet::new();
         // (Namespace ID, Collection ID) of each dropped Collection found.
         let mut dead_collections = HashSet::new();
         let mut reclaimed_collections = HashSet::new();
@@ -93,7 +97,8 @@ impl<E: StorageEngine> Node<E> {
                     dead_id_follows = false;
                 }
                 let reclaim = if let Some(collection) = keys::data_collection(logical)
-                    && dead_collections.contains(&collection)
+                    && (dead_namespaces.contains(&collection.0)
+                        || dead_collections.contains(&collection))
                 {
                     reclaimed_collections.insert(collection);
                     true
@@ -102,9 +107,15 @@ impl<E: StorageEngine> Node<E> {
                 {
                     reclaimed_indexes.insert(index);
                     true
+                } else if let Some(namespace_id) = keys::collection_entry_namespace(logical)
+                    && dead_namespaces.contains(&namespace_id)
+                {
+                    uncached.insert(logical.to_vec());
+                    true
                 } else if let Some((namespace_id, collection_id, _)) =
                     keys::index_catalog_ids(logical)
-                    && dead_collections.contains(&(namespace_id, collection_id))
+                    && (dead_namespaces.contains(&namespace_id)
+                        || dead_collections.contains(&(namespace_id, collection_id)))
                 {
                     uncached.insert(logical.to_vec());
                     true
@@ -134,17 +145,21 @@ impl<E: StorageEngine> Node<E> {
                 stats.versions_removed += 1;
                 // Every Version older than a deleted one is deleted too, so
                 // the one holding the dropped ID is reached here.
-                if let Some(namespace_id) = keys::collection_entry_namespace(logical) {
+                let collection_namespace = keys::collection_entry_namespace(logical);
+                if collection_namespace.is_some() || keys::is_namespace_entry(logical) {
                     if dead_id_follows {
                         dead_id_follows = false;
                         let id = mvcc::decode_value(value)
                             .and_then(|v| v.map(|bytes| catalog::entry_id(&bytes)).transpose());
-                        match id {
-                            Ok(Some(id)) => {
+                        match (id, collection_namespace) {
+                            (Ok(Some(id)), Some(namespace_id)) => {
                                 dead_collections.insert((namespace_id, id));
                             }
-                            Ok(None) => {}
-                            Err(e) => {
+                            (Ok(Some(id)), None) => {
+                                dead_namespaces.insert(id);
+                            }
+                            (Ok(None), _) => {}
+                            (Err(e), _) => {
                                 failure = Some(e);
                                 return ControlFlow::Break(());
                             }
@@ -375,5 +390,39 @@ mod tests {
             versions_under(&node, &keys::index_prefix(namespace_id, id, 0)),
             0
         );
+    }
+
+    #[test]
+    fn a_dropped_namespace_is_reclaimed_with_its_collections() {
+        let (node, orders) = shop();
+        let users: CollectionPath = "shop.users".parse().unwrap();
+        node.create_collection(&users).unwrap();
+        index(&node, &orders, "n", false);
+        node.insert(&orders, doc! { "_id": 1, "n": 1 }).unwrap();
+        node.insert(&users, doc! { "_id": 1 }).unwrap();
+        let (namespace_id, orders_id) = ids(&node, &orders);
+        let (_, users_id) = ids(&node, &users);
+        node.drop_namespace("shop").unwrap();
+
+        assert_eq!(node.collect_garbage().unwrap().collections_reclaimed, 2);
+        for id in [orders_id, users_id] {
+            assert_eq!(
+                versions_under(&node, &keys::collection_prefix(namespace_id, id)),
+                0
+            );
+        }
+        for entry in [
+            keys::collection_entry_key(namespace_id, "orders"),
+            keys::collection_entry_key(namespace_id, "users"),
+            keys::index_catalog_key(namespace_id, orders_id, 0),
+        ] {
+            assert_eq!(versions_under(&node, &entry), 0);
+            assert_eq!(node.catalog_cache.read_at(&entry, u64::MAX), Some(None));
+        }
+        assert_eq!(
+            versions_under(&node, &keys::namespace_id_key(namespace_id)),
+            1
+        );
+        assert_eq!(node.collect_garbage().unwrap(), GcStats::default());
     }
 }

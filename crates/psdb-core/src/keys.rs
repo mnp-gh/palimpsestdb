@@ -60,6 +60,11 @@ pub(crate) fn is_system_key(logical: &[u8]) -> bool {
     logical.starts_with(&SYSTEM_NAMESPACE.to_be_bytes())
 }
 
+/// Whether `logical` is a Namespace entry.
+pub(crate) fn is_namespace_entry(logical: &[u8]) -> bool {
+    logical.starts_with(&namespaces_prefix())
+}
+
 /// The Namespace ID in the key of a Collection entry, if `logical` is one.
 pub(crate) fn collection_entry_namespace(logical: &[u8]) -> Option<u32> {
     let rest = logical
