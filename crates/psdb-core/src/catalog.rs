@@ -32,7 +32,7 @@
 //! so they are never reused either. Creating an Index rewrites the
 //! Collection entry to move the counter, so concurrent creates conflict.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
 use bson::{Bson, Document, doc};
@@ -109,6 +109,18 @@ impl CatalogCache {
             .write()
             .expect("catalog cache poisoned")
             .extend(entries);
+    }
+
+    /// Forget every Version of `keys`, which Garbage Collection deleted
+    /// from the engine.
+    pub(crate) fn remove(&self, keys: &BTreeSet<Vec<u8>>) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut cached = self.0.write().expect("catalog cache poisoned");
+        for key in keys {
+            cached.remove(key);
+        }
     }
 
     /// Forget the Tombstones committed at or before `horizon`: every Snapshot

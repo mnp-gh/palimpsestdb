@@ -1,6 +1,6 @@
 //! Garbage Collection of old Versions (ADR 0012).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::ControlFlow;
 
 use psdb_storage::{KeyRange, StorageEngine, WriteBatch};
@@ -24,6 +24,9 @@ pub struct GcStats {
     pub tombstones_removed: u64,
     /// Dropped Collections whose Documents or Index entries were deleted.
     pub collections_reclaimed: u64,
+    /// Dropped Indexes, in Collections still there, whose entries were
+    /// deleted.
+    pub indexes_reclaimed: u64,
 }
 
 impl<E: StorageEngine> Node<E> {
@@ -33,9 +36,10 @@ impl<E: StorageEngine> Node<E> {
     /// engine in batches, without the commit lock and without logging, so
     /// Recovery may bring removed Versions back for the next pass to remove.
     ///
-    /// Deleting the Tombstone of a Collection's Catalog entry makes its ID
-    /// dead: every key under it is deleted, whatever its timestamp, since
-    /// IDs are never reused. The Catalog sorts before the data, so dead IDs
+    /// Deleting the Tombstone of a Collection's or Index's Catalog entry
+    /// makes its ID dead: every key under it is deleted, whatever its
+    /// timestamp, since IDs are never reused. So is every Version of a dead
+    /// Collection's Index Catalog entries. The Catalog sorts before the data, so dead IDs
     /// are known before the scan reaches it.
     ///
     /// One pass runs at a time; a second call waits for the first.
@@ -59,6 +63,11 @@ impl<E: StorageEngine> Node<E> {
         // (Namespace ID, Collection ID) of each dropped Collection found.
         let mut dead_collections = HashSet::new();
         let mut reclaimed_collections = HashSet::new();
+        // (Namespace ID, Collection ID, Index ID) of each dropped Index found.
+        let mut dead_indexes = HashSet::new();
+        let mut reclaimed_indexes = HashSet::new();
+        // Catalog entries whose every Version is deleted, to drop from the cache.
+        let mut uncached = BTreeSet::new();
         // Catalog keys to delete once the data is gone, so a crash never
         // loses the Tombstone that marks data dead.
         let mut held_back = Vec::new();
@@ -83,13 +92,33 @@ impl<E: StorageEngine> Node<E> {
                     seen_newest = false;
                     dead_id_follows = false;
                 }
-                if let Some(collection) = keys::data_collection(logical)
+                let reclaim = if let Some(collection) = keys::data_collection(logical)
                     && dead_collections.contains(&collection)
                 {
                     reclaimed_collections.insert(collection);
+                    true
+                } else if let Some(index) = keys::index_entry_ids(logical)
+                    && dead_indexes.contains(&index)
+                {
+                    reclaimed_indexes.insert(index);
+                    true
+                } else if let Some((namespace_id, collection_id, _)) =
+                    keys::index_catalog_ids(logical)
+                    && dead_collections.contains(&(namespace_id, collection_id))
+                {
+                    uncached.insert(logical.to_vec());
+                    true
+                } else {
+                    false
+                };
+                if reclaim {
                     stats.versions_removed += 1;
                     stats.tombstones_removed += u64::from(mvcc::is_tombstone(value));
-                    batch.delete(key.to_vec());
+                    if keys::is_system_key(logical) {
+                        held_back.push(key.to_vec());
+                    } else {
+                        batch.delete(key.to_vec());
+                    }
                     return ControlFlow::Continue(());
                 }
                 if ts > horizon {
@@ -123,6 +152,11 @@ impl<E: StorageEngine> Node<E> {
                     }
                     dead_id_follows = mvcc::is_tombstone(value);
                 }
+                if let Some(index) = keys::index_catalog_ids(logical)
+                    && mvcc::is_tombstone(value)
+                {
+                    dead_indexes.insert(index);
+                }
                 if keys::is_system_key(logical) {
                     held_back.push(key.to_vec());
                 } else {
@@ -149,8 +183,10 @@ impl<E: StorageEngine> Node<E> {
             }
             self.engine.write_batch(batch)?;
         }
+        self.catalog_cache.remove(&uncached);
         self.catalog_cache.purge_tombstones(horizon);
         stats.collections_reclaimed = reclaimed_collections.len() as u64;
+        stats.indexes_reclaimed = reclaimed_indexes.len() as u64;
         Ok(stats)
     }
 }
@@ -171,13 +207,27 @@ mod tests {
         (node, orders)
     }
 
+    fn ids(node: &Node<MemoryEngine>, collection: &CollectionPath) -> (u32, u32) {
+        node.begin_transaction()
+            .resolve_collection(collection)
+            .unwrap()
+    }
+
     /// The key prefix of `collection`'s data.
     fn prefix(node: &Node<MemoryEngine>, collection: &CollectionPath) -> Vec<u8> {
-        let (namespace_id, id) = node
-            .begin_transaction()
-            .resolve_collection(collection)
-            .unwrap();
+        let (namespace_id, id) = ids(node, collection);
         keys::collection_prefix(namespace_id, id)
+    }
+
+    /// Declare `path` an Int field, strict if `unique`, and index it.
+    fn index(node: &Node<MemoryEngine>, collection: &CollectionPath, path: &str, unique: bool) {
+        let path = path.parse().unwrap();
+        let field = FieldSchema {
+            field_type: FieldType::Int,
+            strict: unique,
+        };
+        node.set_field_type(collection, &path, field).unwrap();
+        node.create_index(collection, &path, unique).unwrap();
     }
 
     /// Physical keys under `prefix`, whatever their timestamp.
@@ -195,21 +245,25 @@ mod tests {
     #[test]
     fn a_dropped_collections_documents_and_index_entries_are_reclaimed() {
         let (node, orders) = shop();
-        let n = "n".parse().unwrap();
-        let field = FieldSchema {
-            field_type: FieldType::Int,
-            strict: false,
-        };
-        node.set_field_type(&orders, &n, field).unwrap();
-        node.create_index(&orders, &n, false).unwrap();
+        index(&node, &orders, "n", false);
         node.insert(&orders, doc! { "_id": 1, "n": 1 }).unwrap();
         node.insert(&orders, doc! { "_id": 2, "n": 2 }).unwrap();
-        let data = prefix(&node, &orders);
+        let (namespace_id, id) = ids(&node, &orders);
         node.drop_collection(&orders).unwrap();
 
         let stats = node.collect_garbage().unwrap();
         assert_eq!(stats.collections_reclaimed, 1);
-        assert_eq!(versions_under(&node, &data), 0);
+        assert_eq!(stats.indexes_reclaimed, 0, "counted with its Collection");
+        assert_eq!(
+            versions_under(&node, &keys::collection_prefix(namespace_id, id)),
+            0
+        );
+        let index_entry = keys::index_catalog_key(namespace_id, id, 0);
+        assert_eq!(versions_under(&node, &index_entry), 0);
+        assert_eq!(
+            node.catalog_cache.read_at(&index_entry, u64::MAX),
+            Some(None)
+        );
         assert_eq!(node.collect_garbage().unwrap(), GcStats::default());
     }
 
@@ -262,6 +316,64 @@ mod tests {
         assert_eq!(
             node.get(&orders, &2.into()).unwrap(),
             Some(doc! { "_id": 2 })
+        );
+    }
+
+    #[test]
+    fn a_dropped_index_is_reclaimed_and_other_indexes_are_untouched() {
+        let (node, orders) = shop();
+        index(&node, &orders, "n", false);
+        index(&node, &orders, "m", false);
+        node.insert(&orders, doc! { "_id": 1, "n": 1, "m": 1 })
+            .unwrap();
+        let (namespace_id, id) = ids(&node, &orders);
+        node.drop_index(&orders, &"n".parse().unwrap()).unwrap();
+
+        let stats = node.collect_garbage().unwrap();
+        assert_eq!(stats.indexes_reclaimed, 1);
+        assert_eq!(stats.collections_reclaimed, 0);
+        assert_eq!(
+            versions_under(&node, &keys::index_prefix(namespace_id, id, 0)),
+            0
+        );
+        assert_eq!(
+            versions_under(&node, &keys::index_catalog_key(namespace_id, id, 0)),
+            0
+        );
+        assert_eq!(
+            versions_under(&node, &keys::index_prefix(namespace_id, id, 1)),
+            1
+        );
+        assert_eq!(node.collect_garbage().unwrap(), GcStats::default());
+    }
+
+    #[test]
+    fn a_failed_build_leaves_no_entries() {
+        let (node, orders) = shop();
+        node.run(|t| {
+            // The duplicate sorts last, so the first chunk commits its entries.
+            for i in 0..1100 {
+                t.insert(&orders, doc! { "_id": i, "n": i })?;
+            }
+            t.insert(&orders, doc! { "_id": 5000, "n": 0 })?;
+            Ok(())
+        })
+        .unwrap();
+        let path = "n".parse().unwrap();
+        let field = FieldSchema {
+            field_type: FieldType::Int,
+            strict: true,
+        };
+        node.set_field_type(&orders, &path, field).unwrap();
+        let err = node.create_index(&orders, &path, true).unwrap_err();
+        assert!(matches!(err, crate::Error::DuplicateValue(_)));
+        let (namespace_id, id) = ids(&node, &orders);
+        assert!(versions_under(&node, &keys::index_prefix(namespace_id, id, 0)) > 0);
+
+        assert_eq!(node.collect_garbage().unwrap().indexes_reclaimed, 1);
+        assert_eq!(
+            versions_under(&node, &keys::index_prefix(namespace_id, id, 0)),
+            0
         );
     }
 }

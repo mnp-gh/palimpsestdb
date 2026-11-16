@@ -80,6 +80,34 @@ pub(crate) fn data_collection(logical: &[u8]) -> Option<(u32, u32)> {
     ))
 }
 
+/// The Namespace, Collection and Index IDs in the key of an Index Catalog
+/// entry, if `logical` is one.
+pub(crate) fn index_catalog_ids(logical: &[u8]) -> Option<(u32, u32, u32)> {
+    let rest =
+        logical.strip_prefix(collection_prefix(SYSTEM_NAMESPACE, INDEXES_COLLECTION).as_slice())?;
+    let [namespace, collection, index] = *rest.as_chunks::<4>().0 else {
+        return None;
+    };
+    Some((
+        u32::from_be_bytes(namespace),
+        u32::from_be_bytes(collection),
+        u32::from_be_bytes(index),
+    ))
+}
+
+/// The Namespace, Collection and Index IDs of an Index entry key.
+pub(crate) fn index_entry_ids(logical: &[u8]) -> Option<(u32, u32, u32)> {
+    let (namespace, collection) = data_collection(logical)?;
+    let (&INDEX_ENTRIES, rest) = logical[8..].split_first()? else {
+        return None;
+    };
+    Some((
+        namespace,
+        collection,
+        u32::from_be_bytes(*rest.first_chunk::<4>()?),
+    ))
+}
+
 /// The Collection prefix of `logical` if it is a Document key, not an
 /// Index entry or a Catalog entry.
 pub(crate) fn document_collection_prefix(logical: &[u8]) -> Option<&[u8]> {
