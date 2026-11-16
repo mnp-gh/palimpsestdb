@@ -43,6 +43,9 @@ impl<E: StorageEngine> Node<E> {
         // split one key's Versions.
         let mut current: Vec<u8> = Vec::new();
         let mut seen_newest = false;
+        // Catalog keys to delete once the data is gone, so a crash never
+        // loses the Tombstone that marks data dead.
+        let mut held_back = Vec::new();
         loop {
             let mut batch = WriteBatch::new();
             let mut next_start = None;
@@ -74,7 +77,11 @@ impl<E: StorageEngine> Node<E> {
                     stats.tombstones_removed += 1;
                 }
                 stats.versions_removed += 1;
-                batch.delete(key.to_vec());
+                if keys::is_system_key(logical) {
+                    held_back.push(key.to_vec());
+                } else {
+                    batch.delete(key.to_vec());
+                }
                 ControlFlow::Continue(())
             })?;
             if let Some(e) = failure {
@@ -87,6 +94,14 @@ impl<E: StorageEngine> Node<E> {
                 Some(start) => range.start = start,
                 None => break,
             }
+        }
+        let mut held_back = held_back.into_iter().peekable();
+        while held_back.peek().is_some() {
+            let mut batch = WriteBatch::new();
+            for key in held_back.by_ref().take(BATCH_KEYS) {
+                batch.delete(key);
+            }
+            self.engine.write_batch(batch)?;
         }
         self.catalog_cache.purge_tombstones(horizon);
         Ok(stats)

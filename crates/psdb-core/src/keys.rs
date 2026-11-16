@@ -54,6 +54,12 @@ pub(crate) fn collection_prefix(namespace_id: u32, collection_id: u32) -> Vec<u8
     key
 }
 
+/// Whether `logical` is in the system Namespace: the Catalog or
+/// unversioned state.
+pub(crate) fn is_system_key(logical: &[u8]) -> bool {
+    logical.starts_with(&SYSTEM_NAMESPACE.to_be_bytes())
+}
+
 /// The Collection prefix of `logical` if it is a Document key, not an
 /// Index entry or a Catalog entry.
 pub(crate) fn document_collection_prefix(logical: &[u8]) -> Option<&[u8]> {
