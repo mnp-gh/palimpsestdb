@@ -41,7 +41,8 @@ fn a_deleted_document_leaves_nothing_behind() {
         node.collect_garbage().unwrap(),
         GcStats {
             versions_removed: 2,
-            tombstones_removed: 1
+            tombstones_removed: 1,
+            ..GcStats::default()
         }
     );
     assert_eq!(node.get(&orders, &Bson::Int32(1)).unwrap(), None);
