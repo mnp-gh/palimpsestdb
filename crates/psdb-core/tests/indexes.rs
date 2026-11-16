@@ -728,6 +728,26 @@ fn concurrent_insert_aborts_making_a_field_strict() {
 }
 
 #[test]
+fn other_collections_and_build_chunks_do_not_abort_making_a_field_strict() {
+    let node = unindexed();
+    node.create_collection(&collection("shop.users")).unwrap();
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), false)
+        .unwrap();
+    let mut txn = node.begin_transaction();
+    txn.set_field_type(
+        &collection("shop.orders"),
+        &field_path("m"),
+        field(FieldType::Int, true),
+    )
+    .unwrap();
+    node.insert(&collection("shop.users"), doc! { "m": "thirty" })
+        .unwrap();
+    assert!(!build.step().unwrap());
+    txn.commit().unwrap();
+}
+
+#[test]
 fn writer_aborts_when_indexes_change_under_it() {
     let node = common::shop();
     node.set_field_type(
