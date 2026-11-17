@@ -305,10 +305,12 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             if before == after {
                 continue;
             }
-            // During a build a unique value can still have two owners; the
-            // entry may be the other Document's (ADR 0013).
+            // During a build a unique value can still have two owners; keep the
+            // other Document's entry. No entry at the Snapshot may be one a
+            // chunk wrote since, so remove it and let the conflict check
+            // decide (ADR 0013).
             if let Some(before) = before
-                && (!before.unique || self.read(&before.key)?.as_deref() == Some(doc_id))
+                && (!before.unique || self.read(&before.key)?.is_none_or(|owner| owner == doc_id))
             {
                 writes.push((before.key, None));
             }

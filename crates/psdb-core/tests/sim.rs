@@ -505,3 +505,27 @@ fn a_delete_during_a_build_keeps_another_documents_unique_entry() {
     ];
     simulate(actions, 0).unwrap();
 }
+
+/// A delete whose Snapshot predates the chunk that indexed its Document
+/// must conflict, not commit and leave the entry behind to block the value.
+#[test]
+fn a_delete_racing_the_chunk_that_indexed_it_leaves_no_stale_entry() {
+    use Action::*;
+    let actions = vec![
+        Insert(0, 0, 1),
+        Insert(0, 9, 3),
+        Commit(0),
+        StartBuild,
+        Begin(1),
+        BuildStep,
+        Delete(1, 0),
+        Commit(1),
+        BuildStep,
+        Delete(2, 0),
+        Commit(2),
+        Insert(3, 5, 1),
+        Commit(3),
+    ];
+    // Commits 0, 2 and 3; commit 1 conflicts with the chunk.
+    assert_eq!(simulate(actions, 0).unwrap(), 3);
+}
