@@ -72,9 +72,15 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 
 ## Seams and simulator
 
-- Clock seam for UUIDv7 Document IDs, and a seeded random source for Catalog IDs, both injectable through `Node::open_with`.
-- A deterministic simulator: a seeded, single-threaded scheduler interleaving steps of many Transactions, Index build chunks and Garbage Collection passes over `SimDisk`, checking invariants after every step: each Snapshot's reads never change, Indexes agree with their Documents at every Snapshot, and crash plus Recovery keeps every acknowledged commit.
-- A stress test on real threads (not deterministic) to catch data races in the locking.
+- Document ID and Catalog ID sources, injectable through `Node::open_with` as an `Ids` struct (a fourth parameter; `Node::open` passes `Ids::default()`): `document_id: Box<dyn Fn() -> Uuid + Send + Sync>` defaulting to `Uuid::now_v7`, and `catalog_id: Box<dyn Fn() -> u32 + Send + Sync>` defaulting to `getrandom::u32`. Generated Document IDs keep sorting in creation order (ADR 0009).
+- `GcPass::step()` behind `testing`, like `IndexBuild::step`; `collect_garbage()` loops over it, so the simulator can commit between a pass's batches.
+- A deterministic simulator in `tests/sim.rs`, driven by proptest (an action list plus a `u64` seed, so failures shrink and replay). Single-threaded; one step is one public call: `begin`, `get`, `find`, `insert`, `replace`, `delete` or `commit` on one of up to 4 open Transactions, dropping one (abort), an autocommit `create_index`, `start_index_build` or `drop_index`, one build chunk, one GC step, or a crash. One Strict `int` field with values 0 to 4 carries a unique Index, so concurrent duplicates are common; one Collection is dropped so reclaim runs. In the simulator, Document IDs are UUIDv7s from a step counter and Catalog IDs come from a splitmix generator seeded by proptest. 256 cases of up to 200 steps.
+- Invariants, checked against a model holding the Document map at each Commit Timestamp, after every step:
+  - Each open Transaction re-reads its earlier reads and gets the model's state at its Snapshot.
+  - For each Ready Index, an Index-backed `find` equals a forced full scan at the same Snapshot.
+  - Every acknowledged commit was allowed: no other commit wrote one of its Documents after its Snapshot, and no unique Index holds a duplicate. The Node's aborts are accepted if their kind is expected; each run asserts some commits succeeded.
+  - After a crash (between steps via `power_loss(k)`, or mid-commit via `crash_after(ops, k)`) and reopen, the Node equals the model at the last acknowledged commit, or one beyond it if a commit was in flight. Open Transactions and builds are dropped before reopening.
+- The real-thread stress test is `concurrent_threads_stress_test` in `tests/threads.rs`; no new one.
 
 ## Tests
 
