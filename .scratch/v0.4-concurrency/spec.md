@@ -37,7 +37,7 @@ A thread-safe Database Layer for embedded use with plain threads: Transactions b
 
 ## Garbage Collection
 
-- `Node::collect_garbage()` takes the Horizon, scans versioned keys in batches (up to 1,024 physical keys per `WriteBatch`) starting at `NAMESPACES_COLLECTION` (bypassing unversioned `STATE_COLLECTION`), without the commit lock, and for each logical key deletes every Version older than the newest Version at or below the Horizon. If that newest Version is a tombstone, it is deleted too. Returns `GcStats`.
+- `Node::collect_garbage()` takes the Horizon, scans versioned keys in batches (closed at the first logical key after visiting 1,024 physical keys, deleted or not, so a step's scan is bounded and a key's Versions never split across batches; held-back Catalog deletes go in one batch) starting at `NAMESPACES_COLLECTION` (bypassing unversioned `STATE_COLLECTION`), without the commit lock, and for each logical key deletes every Version older than the newest Version at or below the Horizon. If that newest Version is a tombstone, it is deleted too. Returns `GcStats`.
 - One pass at a time: a GC mutex serialises `collect_garbage()` calls, since a later pass could delete Catalog Versions an earlier pass is still reading at its older Horizon. It never blocks commits or `begin_transaction()`.
 - Deletes go straight to the engine and are not logged (ADR 0012).
 - Reclaim finds dead IDs in the same scan, from the Catalog, which sorts before all data, so the dead set is known before the scan reaches any data:
