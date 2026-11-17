@@ -61,7 +61,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Garbage Collection of old Versions below the oldest active Snapshot, run by an explicit `Node::collect_garbage()`, not logged in the WAL ([ADR 0012](./adr/0012-garbage-collection-is-not-logged.md)); running it automatically comes later
 - Reclaim dropped Namespaces, Collections and Indexes (failed builds included): scan an ID's key range and delete its keys in batches (no range-delete operation in the Storage Engine until an engine benefits from one) once the Horizon is past its drop. Version-by-version collection never removes them, because their newest Versions are still live.
 - The commit-time check for strict-field changes and Index creation on empty Collections compares a per-Collection timestamp of the last Document commit instead of scanning the Collection under the commit lock
-- Clock and I/O seams; deterministic simulator
+- Document ID and Catalog ID seams (`IdGenerator`, passed to `Node::open_with`); deterministic simulator over the simulated WAL disk, interleaving Transactions, Index build chunks, GC steps and crashes
 
 ## v0.4.1: Persistent engine
 
