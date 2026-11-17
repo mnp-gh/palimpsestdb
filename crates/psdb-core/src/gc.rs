@@ -12,7 +12,10 @@ use crate::keys;
 use crate::mvcc;
 use crate::node::Node;
 
-/// The most physical keys one pass deletes in a single batch.
+/// A batch closes at the first logical key after visiting this many
+/// physical keys, so a key's Versions are never split across batches and a
+/// step holds the engine's read lock for a bounded scan, however little it
+/// deletes.
 const BATCH_KEYS: usize = 1024;
 
 /// What one [`Node::collect_garbage`] pass removed.
@@ -99,8 +102,7 @@ pub struct GcPass<'node, E: StorageEngine> {
     /// The keys not yet visited.
     range: KeyRange,
     /// The logical key being visited, and whether its newest Version at
-    /// the Horizon was already seen. Carried across batches, which can
-    /// split one key's Versions.
+    /// the Horizon was already seen.
     current: Vec<u8>,
     seen_newest: bool,
     /// Set on deleting a Namespace or Collection entry's Tombstone: the
@@ -149,13 +151,11 @@ impl<E: StorageEngine> GcPass<'_, E> {
             ..
         } = self;
         let mut batch = WriteBatch::new();
+        let mut visited = 0;
         let mut next_start = None;
         let mut failure = None;
         node.engine.scan(range, &mut |key, value| {
-            if batch.ops().len() == BATCH_KEYS {
-                next_start = Some(key.to_vec());
-                return ControlFlow::Break(());
-            }
+            visited += 1;
             let (logical, ts) = match keys::split_physical(key) {
                 Ok(parts) => parts,
                 Err(e) => {
@@ -164,6 +164,12 @@ impl<E: StorageEngine> GcPass<'_, E> {
                 }
             };
             if logical != current.as_slice() {
+                // Close the batch only between keys: deleting a Tombstone
+                // without the Versions under it would show them to readers.
+                if visited > BATCH_KEYS {
+                    next_start = Some(key.to_vec());
+                    return ControlFlow::Break(());
+                }
                 *current = logical.to_vec();
                 *seen_newest = false;
                 *dead_id_follows = false;
@@ -260,13 +266,14 @@ impl<E: StorageEngine> GcPass<'_, E> {
             range.start = start;
             return Ok(None);
         }
-        let mut held_back = std::mem::take(held_back).into_iter().peekable();
-        while held_back.peek().is_some() {
-            let mut batch = WriteBatch::new();
-            for key in held_back.by_ref().take(BATCH_KEYS) {
-                batch.delete(key);
-            }
-            node.engine.write_batch(batch)?;
+        // One batch, so no Catalog Tombstone is deleted apart from the
+        // Versions under it; the Catalog is small.
+        let mut catalog = WriteBatch::new();
+        for key in std::mem::take(held_back) {
+            catalog.delete(key);
+        }
+        if !catalog.ops().is_empty() {
+            node.engine.write_batch(catalog)?;
         }
         node.catalog_cache.remove(uncached);
         node.catalog_cache.purge_tombstones(*horizon);
@@ -335,6 +342,41 @@ mod tests {
         let mut pass = node.start_garbage_collection();
         while pass.step().unwrap().is_none() {}
         let _ = pass.step();
+    }
+
+    #[test]
+    fn a_batch_never_splits_a_tombstone_from_the_versions_under_it() {
+        let (node, orders) = shop();
+        // A deleted Document with more Versions than a batch, so a batch
+        // boundary falls among them, after its Tombstone.
+        node.insert(&orders, doc! { "_id": 2, "n": 0 }).unwrap();
+        for n in 1..1100 {
+            node.replace(&orders, &2.into(), doc! { "_id": 2, "n": n })
+                .unwrap();
+        }
+        node.delete(&orders, &2.into()).unwrap();
+        // A later key, so the batch closes before the pass ends.
+        node.insert(&orders, doc! { "_id": 3 }).unwrap();
+
+        let mut pass = node.start_garbage_collection();
+        assert_eq!(pass.step().unwrap(), None, "the first batch filled up");
+        assert_eq!(node.get(&orders, &2.into()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_step_with_nothing_to_delete_stops_after_a_batch_of_keys() {
+        let (node, orders) = shop();
+        node.run(|t| {
+            for i in 0..2000 {
+                t.insert(&orders, doc! { "_id": i })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let mut pass = node.start_garbage_collection();
+        assert_eq!(pass.step().unwrap(), None, "the scan stopped partway");
+        while pass.step().unwrap().is_none() {}
     }
 
     #[test]
