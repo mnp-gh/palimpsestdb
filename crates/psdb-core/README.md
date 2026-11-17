@@ -20,7 +20,7 @@ txn.commit()?;
 
 | Module | Responsibility |
 |---|---|
-| `node` | `Node`: begin Transactions, autocommit helpers |
+| `node` | `Node`: begin Transactions, autocommit helpers; `IdGenerator`, the seam for new Document and Catalog IDs |
 | `transaction` | Snapshot reads, Write Set, commit-time conflict checks |
 | `catalog` | Namespaces, Collections, Collection Schemas and Indexes as versioned Catalog entries |
 | `collection_path` | `CollectionPath`: a Namespace and Collection name, `shop.orders` |
@@ -31,6 +31,7 @@ txn.commit()?;
 | `keys` | Order-preserving key encoding |
 | `document` | Limits, Document IDs, name rules |
 | `filter` | Parsing and evaluating `find` filters |
+| `gc` | Garbage Collection and reclaim, one batch per `GcPass` step |
 | `wal` | WAL records, recovery, and the `WalFile` I/O seam with its `SimDisk` fake (feature `testing`) |
 
 **Depends on:** `psdb-storage` (never on a concrete engine outside tests). **Depended on by:** `psdb-cli`.

@@ -84,6 +84,7 @@ impl<E: StorageEngine> Node<E> {
             reclaimed_indexes: HashSet::new(),
             uncached: BTreeSet::new(),
             held_back: Vec::new(),
+            done: false,
         }
     }
 }
@@ -118,12 +119,17 @@ pub struct GcPass<'node, E: StorageEngine> {
     /// Catalog keys to delete once the data is gone, so a crash never
     /// loses the Tombstone that marks data dead.
     held_back: Vec<Vec<u8>>,
+    /// Set once the pass has returned its stats.
+    done: bool,
 }
 
 impl<E: StorageEngine> GcPass<'_, E> {
     /// Delete the next batch of keys; once every key is visited, finish
-    /// the pass and return what it removed. Do not step a finished pass.
+    /// the pass and return what it removed.
+    ///
+    /// Panics if the pass already finished.
     pub fn step(&mut self) -> Result<Option<GcStats>> {
+        assert!(!self.done, "stepped a finished Garbage Collection pass");
         let Self {
             node,
             horizon,
@@ -139,6 +145,7 @@ impl<E: StorageEngine> GcPass<'_, E> {
             reclaimed_indexes,
             uncached,
             held_back,
+            done,
             ..
         } = self;
         let mut batch = WriteBatch::new();
@@ -265,6 +272,7 @@ impl<E: StorageEngine> GcPass<'_, E> {
         node.catalog_cache.purge_tombstones(*horizon);
         stats.collections_reclaimed = reclaimed_collections.len() as u64;
         stats.indexes_reclaimed = reclaimed_indexes.len() as u64;
+        *done = true;
         Ok(Some(*stats))
     }
 }
@@ -318,6 +326,15 @@ mod tests {
             })
             .unwrap();
         n
+    }
+
+    #[test]
+    #[should_panic(expected = "stepped a finished")]
+    fn a_finished_pass_cannot_be_stepped() {
+        let (node, _) = shop();
+        let mut pass = node.start_garbage_collection();
+        while pass.step().unwrap().is_none() {}
+        let _ = pass.step();
     }
 
     #[test]

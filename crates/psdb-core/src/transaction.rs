@@ -305,7 +305,11 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             if before == after {
                 continue;
             }
-            if let Some(before) = before {
+            // During a build a unique value can still have two owners; the
+            // entry may be the other Document's (ADR 0013).
+            if let Some(before) = before
+                && (!before.unique || self.read(&before.key)?.as_deref() == Some(doc_id))
+            {
                 writes.push((before.key, None));
             }
             if let Some(after) = after {
