@@ -2,7 +2,7 @@
 
 A document database in Rust, built as a learning and research project: correctness and clarity first, performance second. New Versions are written over old ones, which stay readable to older Snapshots, like the scraped-and-rewritten pages of a palimpsest.
 
-**Status:** v0.3, an embedded library with Snapshot Isolation and single-field secondary Indexes, durable through a WAL over the in-memory Storage Engine. See [docs/ROADMAP.md](docs/ROADMAP.md).
+**Status:** v0.4, a thread-safe embedded library with Snapshot Isolation, single-field secondary Indexes built in the background and Garbage Collection of old Versions, durable through a WAL over the in-memory Storage Engine. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Try it
 
