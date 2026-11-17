@@ -6,7 +6,7 @@ use common::{collection, durable_shop, open};
 
 use bson::{Bson, doc};
 use psdb_core::wal::SimDisk;
-use psdb_core::{Error, FieldPath, FieldSchema, FieldType, Limits, Node};
+use psdb_core::{Error, FieldPath, FieldSchema, FieldType, IdGenerator, Limits, Node};
 use psdb_storage::{StorageEngine, WriteBatch};
 use psdb_storage_memory::MemoryEngine;
 
@@ -80,7 +80,12 @@ fn engine_with_data_is_refused() {
     };
     let disk = SimDisk::new();
     assert!(matches!(
-        Node::open_with(with_data(), disk.file(), Limits::default()),
+        Node::open_with(
+            with_data(),
+            disk.file(),
+            Limits::default(),
+            IdGenerator::default()
+        ),
         Err(Error::EngineNotEmpty)
     ));
     assert!(matches!(Node::new(with_data()), Err(Error::EngineNotEmpty)));

@@ -455,6 +455,7 @@ impl<E: StorageEngine> Node<E> {
             collection_id: entry.id,
             index_id,
             remaining: entry.documents(),
+            chunk_documents: BUILD_CHUNK_DOCUMENTS,
         })
     }
 
@@ -488,9 +489,19 @@ pub struct IndexBuild<'node, E: StorageEngine> {
     index_id: u32,
     /// The Documents not yet indexed.
     remaining: KeyRange,
+    /// The most Documents one chunk indexes.
+    chunk_documents: usize,
 }
 
 impl<E: StorageEngine> IndexBuild<'_, E> {
+    /// Index at most `n` Documents per chunk, so tests can interleave
+    /// commits between chunks of a small Collection.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_chunk_documents(mut self, n: usize) -> Self {
+        self.chunk_documents = n;
+        self
+    }
+
     /// Index the next chunk of Documents, read at the newest Commit
     /// Timestamp, and commit their entries; after the last chunk, make the
     /// Index Ready and return true. Holds the commit lock throughout, so no
@@ -526,7 +537,7 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
         // before the Collection ended.
         let mut next_chunk_start = None;
         mvcc::scan_range_at(&node.engine, &self.remaining, latest, &mut |key, value| {
-            let full = docs.len() == BUILD_CHUNK_DOCUMENTS
+            let full = docs.len() == self.chunk_documents
                 || (!docs.is_empty() && docs_bytes + value.len() > BUILD_CHUNK_BYTES);
             if full {
                 next_chunk_start = Some(key.to_vec());

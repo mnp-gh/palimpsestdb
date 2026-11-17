@@ -227,7 +227,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// Returns the Document ID.
     pub fn insert(&mut self, collection: &CollectionPath, doc: Document) -> Result<Bson> {
         let entry = self.collection_entry(collection)?;
-        let (id, bytes) = document::prepare(doc, None, &self.node.limits)?;
+        let (id, bytes) = document::prepare(doc, None, &self.node.limits, &self.node.id_generator)?;
         let key = keys::document_key(entry.namespace_id, entry.id, &id)?;
         if self.read(&key)?.is_some() {
             return Err(Error::DuplicateId(id));
@@ -259,7 +259,8 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         let Some(old) = self.read(&key)? else {
             return Ok(false);
         };
-        let (_, bytes) = document::prepare(doc, Some(id), &self.node.limits)?;
+        let (_, bytes) =
+            document::prepare(doc, Some(id), &self.node.limits, &self.node.id_generator)?;
         self.write_document(&entry, key, Some(&old), Some(bytes))?;
         Ok(true)
     }
