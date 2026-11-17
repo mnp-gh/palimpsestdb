@@ -1,0 +1,533 @@
+//! Deterministic simulator: one thread interleaves steps of many
+//! Transactions, an Index build and Garbage Collection passes over a
+//! `SimDisk`, crashing at random, and checks after every step that
+//! Snapshots never change, Indexes agree with their Documents, and Recovery
+//! keeps every acknowledged commit.
+
+mod common;
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bson::{Document, doc};
+use common::{collection, field_path};
+use proptest::prelude::*;
+use psdb_core::wal::SimDisk;
+use psdb_core::{
+    Error, FieldSchema, FieldType, GcPass, IdGenerator, IndexBuild, IndexState, Limits, Node,
+    Transaction,
+};
+use psdb_storage_memory::MemoryEngine;
+use uuid::Builder;
+
+const SLOTS: usize = 4;
+
+#[derive(Debug, Clone)]
+enum Action {
+    /// Writes to an empty slot begin a Transaction there too.
+    Begin(usize),
+    Get(usize, i32),
+    Insert(usize, i32, i32),
+    Replace(usize, i32, i32),
+    Delete(usize, i32),
+    Commit(usize),
+    Abort(usize),
+    StartBuild,
+    BuildStep,
+    DropIndex,
+    StartGc,
+    GcStep,
+    /// Cut the power between steps, keeping this many unsynced bytes.
+    Crash(usize),
+    /// Cut the power during the WAL operation after this many more succeed.
+    CrashLater(usize, usize),
+}
+
+fn action() -> impl Strategy<Value = Action> {
+    let slot = 0..SLOTS;
+    // Few IDs and values, so conflicts and duplicate values are common.
+    let id = 0..6i32;
+    let n = 0..5i32;
+    let keep = prop_oneof![Just(0), Just(usize::MAX), 0..200usize];
+    prop_oneof![
+        6 => slot.clone().prop_map(Action::Begin),
+        6 => (slot.clone(), id.clone()).prop_map(|(s, i)| Action::Get(s, i)),
+        12 => (slot.clone(), id.clone(), n.clone()).prop_map(|(s, i, n)| Action::Insert(s, i, n)),
+        9 => (slot.clone(), id.clone(), n).prop_map(|(s, i, n)| Action::Replace(s, i, n)),
+        6 => (slot.clone(), id).prop_map(|(s, i)| Action::Delete(s, i)),
+        12 => slot.clone().prop_map(Action::Commit),
+        2 => slot.prop_map(Action::Abort),
+        2 => Just(Action::StartBuild),
+        6 => Just(Action::BuildStep),
+        1 => Just(Action::DropIndex),
+        2 => Just(Action::StartGc),
+        6 => Just(Action::GcStep),
+        1 => keep.clone().prop_map(Action::Crash),
+        1 => (0..6usize, keep).prop_map(|(ops, k)| Action::CrashLater(ops, k)),
+    ]
+}
+
+/// Committed `orders` contents (`_id` → `n`) at each Commit Timestamp that
+/// changed them.
+struct Model {
+    history: BTreeMap<u64, BTreeMap<i32, i32>>,
+    /// Commit Timestamp of each `_id`'s last write.
+    last_write: BTreeMap<i32, u64>,
+    committed: usize,
+}
+
+impl Model {
+    fn at(&self, snapshot: u64) -> &BTreeMap<i32, i32> {
+        self.history.range(..=snapshot).next_back().unwrap().1
+    }
+
+    fn latest(&self) -> &BTreeMap<i32, i32> {
+        self.history.values().next_back().unwrap()
+    }
+
+    /// Forget history after Recovery: no Snapshot from before it survives.
+    fn reset(&mut self, ts: u64, docs: BTreeMap<i32, i32>) {
+        self.history = BTreeMap::from([(ts, docs)]);
+        self.last_write.clear();
+    }
+}
+
+struct Slot<'node> {
+    txn: Transaction<'node, MemoryEngine>,
+    /// `_id` → new `n`, or `None` for a delete.
+    writes: BTreeMap<i32, Option<i32>>,
+}
+
+impl Slot<'_> {
+    /// What this Transaction should read: its Snapshot plus its own writes.
+    fn view(&self, model: &Model) -> BTreeMap<i32, i32> {
+        let mut docs = model.at(self.txn.snapshot_ts()).clone();
+        apply(&mut docs, &self.writes);
+        docs
+    }
+}
+
+fn apply(docs: &mut BTreeMap<i32, i32>, writes: &BTreeMap<i32, Option<i32>>) {
+    for (&id, &n) in writes {
+        match n {
+            Some(n) => docs.insert(id, n),
+            None => docs.remove(&id),
+        };
+    }
+}
+
+fn as_docs<'a>(docs: impl IntoIterator<Item = (&'a i32, &'a i32)>) -> Vec<Document> {
+    docs.into_iter()
+        .map(|(&id, &n)| doc! { "_id": id, "n": n })
+        .collect()
+}
+
+/// Counters behind deterministic IDs, shared across reopens so IDs never
+/// repeat.
+struct IdCounters {
+    clock: Arc<AtomicU64>,
+    random: Arc<AtomicU64>,
+}
+
+impl IdCounters {
+    fn id_generator(&self) -> IdGenerator {
+        let clock = self.clock.clone();
+        let random = self.random.clone();
+        IdGenerator {
+            // One millisecond per ID, so they sort in creation order.
+            document_id: Box::new(move || {
+                let ms = clock.fetch_add(1, Ordering::Relaxed);
+                Builder::from_unix_timestamp_millis(ms, &[0; 10]).into_uuid()
+            }),
+            // splitmix64
+            catalog_id: Box::new(move || {
+                let mut z = random.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                (z ^ (z >> 31)) as u32
+            }),
+        }
+    }
+}
+
+fn open(disk: &SimDisk, counters: &IdCounters) -> Node<MemoryEngine> {
+    Node::open_with(
+        MemoryEngine::new(),
+        disk.file(),
+        Limits::default(),
+        counters.id_generator(),
+    )
+    .unwrap()
+}
+
+/// Why [`run`] stopped.
+enum Stop {
+    /// The actions ran out.
+    Done,
+    /// The process crashed and the Node must be reopened.
+    Crashed {
+        /// What `orders` would hold had the commit in flight succeeded, if
+        /// one was.
+        in_flight: Option<BTreeMap<i32, i32>>,
+        /// Whether a Ready Index must survive: the crash came between
+        /// steps, so no Index commit was in flight.
+        ready_survives: bool,
+    },
+}
+
+/// A crash with nothing in flight if `err` needs a reopen; otherwise a
+/// test failure.
+fn crash_or_fail(what: &str, err: Error) -> Result<Stop, TestCaseError> {
+    if err.requires_reopen() {
+        return Ok(Stop::Crashed {
+            in_flight: None,
+            ready_survives: false,
+        });
+    }
+    Err(TestCaseError::fail(format!("{what}: {err:?}")))
+}
+
+/// Whether `orders` has a Ready Index; a crash if the Node is poisoned.
+fn ready_index(node: &Node<MemoryEngine>) -> Result<Result<bool, Stop>, TestCaseError> {
+    match node.list_indexes(&collection("shop.orders")) {
+        Ok(indexes) => Ok(Ok(indexes.iter().any(|i| i.state == IndexState::Ready))),
+        Err(e) => crash_or_fail("list indexes", e).map(Err),
+    }
+}
+
+/// Run `actions` until they run out or the process crashes.
+fn run(
+    node: &Node<MemoryEngine>,
+    disk: &SimDisk,
+    actions: &mut impl Iterator<Item = Action>,
+    model: &mut Model,
+) -> Result<Stop, TestCaseError> {
+    let orders = collection("shop.orders");
+    let n_path = field_path("n");
+    let mut ready = match ready_index(node)? {
+        Ok(ready) => ready,
+        Err(stop) => return Ok(stop),
+    };
+    let mut slots: Vec<Option<Slot<'_>>> = (0..SLOTS).map(|_| None).collect();
+    let mut build: Option<IndexBuild<'_, MemoryEngine>> = None;
+    let mut gc: Option<GcPass<'_, MemoryEngine>> = None;
+    let begin = || Slot {
+        txn: node.begin_transaction(),
+        writes: BTreeMap::new(),
+    };
+    for action in actions {
+        match action {
+            Action::Begin(s) => {
+                slots[s].get_or_insert_with(begin);
+            }
+            Action::Get(s, id) => {
+                let slot = slots[s].get_or_insert_with(begin);
+                let expected = slot
+                    .view(model)
+                    .get(&id)
+                    .map(|&n| doc! { "_id": id, "n": n });
+                match slot.txn.get(&orders, &id.into()) {
+                    Ok(found) => prop_assert_eq!(found, expected, "get {}", id),
+                    Err(e) => return crash_or_fail("get", e),
+                }
+            }
+            Action::Insert(s, id, value) => {
+                let slot = slots[s].get_or_insert_with(begin);
+                let present = slot.view(model).contains_key(&id);
+                match slot.txn.insert(&orders, doc! { "_id": id, "n": value }) {
+                    Ok(_) => {
+                        prop_assert!(!present, "insert of existing {id}");
+                        slot.writes.insert(id, Some(value));
+                    }
+                    Err(Error::DuplicateId(_)) => prop_assert!(present),
+                    Err(Error::DuplicateValue(_) | Error::CollectionChanged) => {}
+                    Err(e) => return crash_or_fail("insert", e),
+                }
+            }
+            Action::Replace(s, id, value) => {
+                let slot = slots[s].get_or_insert_with(begin);
+                let present = slot.view(model).contains_key(&id);
+                match slot.txn.replace(&orders, &id.into(), doc! { "n": value }) {
+                    Ok(replaced) => {
+                        prop_assert_eq!(replaced, present);
+                        if replaced {
+                            slot.writes.insert(id, Some(value));
+                        }
+                    }
+                    Err(Error::DuplicateValue(_) | Error::CollectionChanged) => {}
+                    Err(e) => return crash_or_fail("replace", e),
+                }
+            }
+            Action::Delete(s, id) => {
+                let slot = slots[s].get_or_insert_with(begin);
+                let present = slot.view(model).contains_key(&id);
+                match slot.txn.delete(&orders, &id.into()) {
+                    Ok(deleted) => {
+                        prop_assert_eq!(deleted, present);
+                        if deleted {
+                            slot.writes.insert(id, None);
+                        }
+                    }
+                    Err(Error::CollectionChanged) => {}
+                    Err(e) => return crash_or_fail("delete", e),
+                }
+            }
+            Action::Commit(s) => {
+                let Some(slot) = slots[s].take() else {
+                    continue;
+                };
+                let snapshot = slot.txn.snapshot_ts();
+                let mut after = model.latest().clone();
+                apply(&mut after, &slot.writes);
+                match slot.txn.commit() {
+                    Ok(ts) => {
+                        if slot.writes.is_empty() {
+                            continue;
+                        }
+                        prop_assert!(ts > *model.history.keys().next_back().unwrap());
+                        for (&id, value) in &slot.writes {
+                            let last = model.last_write.get(&id).copied().unwrap_or(0);
+                            prop_assert!(last <= snapshot, "lost update of {id}");
+                            // A Building Index lets a duplicate of a Document it
+                            // has not reached yet commit; its build then fails
+                            // (ADR 0013).
+                            if let (true, Some(value)) = (ready, value) {
+                                let sharing = after.values().filter(|&v| v == value).count();
+                                prop_assert_eq!(sharing, 1, "duplicate n {} committed", value);
+                            }
+                            model.last_write.insert(id, ts);
+                        }
+                        model.history.insert(ts, after);
+                        model.committed += 1;
+                    }
+                    Err(Error::CommitOutcomeUnknown(_)) => {
+                        return Ok(Stop::Crashed {
+                            in_flight: (!slot.writes.is_empty()).then_some(after),
+                            ready_survives: false,
+                        });
+                    }
+                    Err(
+                        Error::WriteConflict | Error::CollectionChanged | Error::DuplicateValue(_),
+                    ) => {}
+                    Err(e) => return crash_or_fail("commit", e),
+                }
+            }
+            Action::Abort(s) => slots[s] = None,
+            Action::StartBuild => {
+                if build.is_some() {
+                    continue;
+                }
+                match node.start_index_build(&orders, &n_path, true) {
+                    // One Document per chunk, so commits land between chunks.
+                    Ok(b) => build = Some(b.with_chunk_documents(1)),
+                    Err(Error::IndexExists { .. }) => {}
+                    Err(e) => return crash_or_fail("start build", e),
+                }
+            }
+            Action::BuildStep => {
+                let Some(b) = &mut build else { continue };
+                match b.step() {
+                    Ok(false) => {}
+                    Ok(true) | Err(Error::DuplicateValue(_) | Error::IndexBuildCancelled) => {
+                        build = None;
+                    }
+                    Err(e) => return crash_or_fail("build step", e),
+                }
+            }
+            Action::DropIndex => match node.drop_index(&orders, &n_path) {
+                Ok(()) | Err(Error::NoSuchIndex { .. }) => {}
+                Err(e) => return crash_or_fail("drop index", e),
+            },
+            Action::StartGc => {
+                if gc.is_none() {
+                    // Small batches, so commits and crashes land between them;
+                    // smaller ones rarely get past the Catalog before a crash.
+                    gc = Some(node.start_garbage_collection().with_batch_keys(8));
+                }
+            }
+            Action::GcStep => {
+                if let Some(pass) = &mut gc
+                    && pass.step().unwrap().is_some()
+                {
+                    gc = None;
+                }
+            }
+            Action::Crash(keep) => {
+                disk.power_loss(keep);
+                return Ok(Stop::Crashed {
+                    in_flight: None,
+                    ready_survives: ready,
+                });
+            }
+            Action::CrashLater(ops, keep) => disk.crash_after(ops, keep),
+        }
+        // A failed build's cleanup can poison the Node behind another error.
+        ready = match ready_index(node)? {
+            Ok(ready) => ready,
+            Err(stop) => return Ok(stop),
+        };
+        check(node, &orders, &mut slots, model, ready)?;
+    }
+    Ok(Stop::Done)
+}
+
+/// Every open Snapshot, and a new one, reads what the model says, through
+/// a full scan and through the Index when it is Ready.
+fn check(
+    node: &Node<MemoryEngine>,
+    orders: &psdb_core::CollectionPath,
+    slots: &mut [Option<Slot<'_>>],
+    model: &Model,
+    ready: bool,
+) -> Result<(), TestCaseError> {
+    if ready {
+        let mut values: Vec<_> = model.latest().values().collect();
+        let len = values.len();
+        values.sort();
+        values.dedup();
+        prop_assert_eq!(values.len(), len, "a Ready unique Index over duplicates");
+    }
+    let check_slot = |txn: &mut Transaction<'_, MemoryEngine>, view: BTreeMap<i32, i32>| {
+        let all = txn.find(orders, &doc! {}).unwrap();
+        prop_assert_eq!(all, as_docs(&view), "at Snapshot {}", txn.snapshot_ts());
+        let high = txn.find(orders, &doc! { "n": { "$gte": 2 } }).unwrap();
+        prop_assert_eq!(high, as_docs(view.iter().filter(|(_, n)| **n >= 2)));
+        let three = txn.find(orders, &doc! { "n": 3 }).unwrap();
+        prop_assert_eq!(three, as_docs(view.iter().filter(|(_, n)| **n == 3)));
+        Ok(())
+    };
+    check_slot(&mut node.begin_transaction(), model.latest().clone())?;
+    for slot in slots.iter_mut().flatten() {
+        let view = slot.view(model);
+        check_slot(&mut slot.txn, view)?;
+    }
+    Ok(())
+}
+
+/// Run one simulation of `actions`, with Catalog IDs drawn from `seed`, and
+/// return how many writing commits succeeded.
+fn simulate(actions: Vec<Action>, seed: u64) -> Result<usize, TestCaseError> {
+    let disk = SimDisk::new();
+    let counters = IdCounters {
+        clock: Arc::new(AtomicU64::new(0)),
+        random: Arc::new(AtomicU64::new(seed)),
+    };
+    let mut node = open(&disk, &counters);
+    let orders = collection("shop.orders");
+    let junk = collection("shop.junk");
+    node.create_namespace("shop").unwrap();
+    node.create_collection(&orders).unwrap();
+    let strict_int = FieldSchema {
+        field_type: FieldType::Int,
+        strict: true,
+    };
+    node.set_field_type(&orders, &field_path("n"), strict_int)
+        .unwrap();
+    // A dropped Collection, for Garbage Collection to reclaim.
+    node.create_collection(&junk).unwrap();
+    node.insert(&junk, doc! { "_id": 1 }).unwrap();
+    node.drop_collection(&junk).unwrap();
+
+    let start = node.begin_transaction().snapshot_ts();
+    let mut model = Model {
+        history: BTreeMap::from([(start, BTreeMap::new())]),
+        last_write: BTreeMap::new(),
+        committed: 0,
+    };
+    let mut actions = actions.into_iter();
+    while let Stop::Crashed {
+        in_flight,
+        ready_survives,
+    } = run(&node, &disk, &mut actions, &mut model)?
+    {
+        drop(node);
+        node = open(&disk, &counters);
+        let indexes = node.list_indexes(&orders).unwrap();
+        prop_assert!(
+            indexes.iter().all(|i| i.state == IndexState::Ready),
+            "Recovery left a build: {:?}",
+            indexes
+        );
+        prop_assert!(
+            !ready_survives || !indexes.is_empty(),
+            "a Ready Index was lost"
+        );
+        let found = node.find(&orders, &doc! {}).unwrap();
+        let acknowledged = as_docs(model.latest());
+        let recovered = match in_flight {
+            Some(docs) if found == as_docs(&docs) && found != acknowledged => docs,
+            _ => {
+                prop_assert_eq!(&found, &acknowledged, "an acknowledged commit was lost");
+                model.latest().clone()
+            }
+        };
+        let ts = node.begin_transaction().snapshot_ts();
+        model.reset(ts, recovered);
+    }
+    Ok(model.committed)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn simulated_interleavings_keep_every_invariant(
+        actions in prop::collection::vec(action(), 1..200),
+        seed: u64,
+    ) {
+        simulate(actions, seed)?;
+    }
+}
+
+/// A Node that aborted everything would pass every check above.
+#[test]
+fn independent_commits_succeed() {
+    use Action::*;
+    let actions = vec![Insert(0, 0, 0), Commit(0), Insert(1, 1, 1), Commit(1)];
+    assert_eq!(simulate(actions, 0).unwrap(), 2);
+}
+
+/// Deleting a not-yet-indexed duplicate during a unique build must not
+/// remove the entry of the Document the build already indexed.
+#[test]
+fn a_delete_during_a_build_keeps_another_documents_unique_entry() {
+    use Action::*;
+    let actions = vec![
+        Insert(0, 0, 1),
+        Insert(0, 2, 1),
+        Commit(0),
+        StartBuild,
+        BuildStep,
+        Delete(1, 2),
+        Commit(1),
+        BuildStep,
+        Insert(2, 1, 1),
+        Commit(2),
+    ];
+    simulate(actions, 0).unwrap();
+}
+
+/// A delete whose Snapshot predates the chunk that indexed its Document
+/// must conflict, not commit and leave the entry behind to block the value.
+#[test]
+fn a_delete_racing_the_chunk_that_indexed_it_leaves_no_stale_entry() {
+    use Action::*;
+    let actions = vec![
+        Insert(0, 0, 1),
+        Insert(0, 9, 3),
+        Commit(0),
+        StartBuild,
+        Begin(1),
+        BuildStep,
+        Delete(1, 0),
+        Commit(1),
+        BuildStep,
+        Delete(2, 0),
+        Commit(2),
+        Insert(3, 5, 1),
+        Commit(3),
+    ];
+    // Commits 0, 2 and 3; commit 1 conflicts with the chunk.
+    assert_eq!(simulate(actions, 0).unwrap(), 3);
+}

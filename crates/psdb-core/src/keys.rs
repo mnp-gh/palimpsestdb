@@ -21,6 +21,7 @@ const NAMESPACES_COLLECTION: u32 = 1;
 const COLLECTIONS_COLLECTION: u32 = 2;
 const NAMESPACE_IDS_COLLECTION: u32 = 3;
 const COLLECTION_IDS_COLLECTION: u32 = 4;
+const INDEXES_COLLECTION: u32 = 5;
 
 /// The component that starts every Index entry key in a Collection. It
 /// sorts below every Document ID tag, so a Collection's Index entries and
@@ -51,6 +52,73 @@ pub(crate) fn collection_prefix(namespace_id: u32, collection_id: u32) -> Vec<u8
     key.extend_from_slice(&namespace_id.to_be_bytes());
     key.extend_from_slice(&collection_id.to_be_bytes());
     key
+}
+
+/// Whether `logical` is in the system Namespace: the Catalog or
+/// unversioned state.
+pub(crate) fn is_system_key(logical: &[u8]) -> bool {
+    logical.starts_with(&SYSTEM_NAMESPACE.to_be_bytes())
+}
+
+/// Whether `logical` is a Namespace entry.
+pub(crate) fn is_namespace_entry(logical: &[u8]) -> bool {
+    logical.starts_with(&namespaces_prefix())
+}
+
+/// The Namespace ID in the key of a Collection entry, if `logical` is one.
+pub(crate) fn collection_entry_namespace(logical: &[u8]) -> Option<u32> {
+    let rest = logical
+        .strip_prefix(collection_prefix(SYSTEM_NAMESPACE, COLLECTIONS_COLLECTION).as_slice())?;
+    Some(u32::from_be_bytes(*rest.first_chunk::<4>()?))
+}
+
+/// The Namespace and Collection IDs of a Document or Index entry key.
+pub(crate) fn data_collection(logical: &[u8]) -> Option<(u32, u32)> {
+    if is_system_key(logical) {
+        return None;
+    }
+    let (namespace, rest) = logical.split_first_chunk::<4>()?;
+    let (collection, _) = rest.split_first_chunk::<4>()?;
+    Some((
+        u32::from_be_bytes(*namespace),
+        u32::from_be_bytes(*collection),
+    ))
+}
+
+/// The Namespace, Collection and Index IDs in the key of an Index Catalog
+/// entry, if `logical` is one.
+pub(crate) fn index_catalog_ids(logical: &[u8]) -> Option<(u32, u32, u32)> {
+    let rest =
+        logical.strip_prefix(collection_prefix(SYSTEM_NAMESPACE, INDEXES_COLLECTION).as_slice())?;
+    let [namespace, collection, index] = *rest.as_chunks::<4>().0 else {
+        return None;
+    };
+    Some((
+        u32::from_be_bytes(namespace),
+        u32::from_be_bytes(collection),
+        u32::from_be_bytes(index),
+    ))
+}
+
+/// The Namespace, Collection and Index IDs of an Index entry key.
+pub(crate) fn index_entry_ids(logical: &[u8]) -> Option<(u32, u32, u32)> {
+    let (namespace, collection) = data_collection(logical)?;
+    let (&INDEX_ENTRIES, rest) = logical[8..].split_first()? else {
+        return None;
+    };
+    Some((
+        namespace,
+        collection,
+        u32::from_be_bytes(*rest.first_chunk::<4>()?),
+    ))
+}
+
+/// The Collection prefix of `logical` if it is a Document key, not an
+/// Index entry or a Catalog entry.
+pub(crate) fn document_collection_prefix(logical: &[u8]) -> Option<&[u8]> {
+    let (prefix, rest) = logical.split_at_checked(8)?;
+    let user_namespace = prefix[..4] != SYSTEM_NAMESPACE.to_be_bytes();
+    (user_namespace && rest.first().is_some_and(|&b| b != INDEX_ENTRIES)).then_some(prefix)
 }
 
 /// Every Document of a Collection, without its Index entries.
@@ -109,6 +177,38 @@ pub(crate) fn collection_entry_key(namespace_id: u32, name: &str) -> Vec<u8> {
     let mut key = collections_prefix(namespace_id);
     push_escaped(&mut key, name.as_bytes());
     key
+}
+
+/// The prefix of every Index Catalog entry of one Collection (ADR 0014).
+pub(crate) fn index_catalog_prefix(namespace_id: u32, collection_id: u32) -> Vec<u8> {
+    let mut key = collection_prefix(SYSTEM_NAMESPACE, INDEXES_COLLECTION);
+    key.extend_from_slice(&namespace_id.to_be_bytes());
+    key.extend_from_slice(&collection_id.to_be_bytes());
+    key
+}
+
+/// The logical key of an Index's Catalog entry. Index IDs are big-endian,
+/// so a Collection's Indexes sort in the order they were created.
+pub(crate) fn index_catalog_key(namespace_id: u32, collection_id: u32, index_id: u32) -> Vec<u8> {
+    let mut key = index_catalog_prefix(namespace_id, collection_id);
+    key.extend_from_slice(&index_id.to_be_bytes());
+    key
+}
+
+/// Whether `logical` is a Namespace, Collection or Index Catalog entry (or
+/// a prefix of them), the keys the Catalog cache holds. Checked on every read, so it allocates nothing.
+pub(crate) fn is_catalog_entry_key(logical: &[u8]) -> bool {
+    let Some((namespace, rest)) = logical.split_first_chunk::<4>() else {
+        return false;
+    };
+    let Some((collection, _)) = rest.split_first_chunk::<4>() else {
+        return false;
+    };
+    u32::from_be_bytes(*namespace) == SYSTEM_NAMESPACE
+        && matches!(
+            u32::from_be_bytes(*collection),
+            NAMESPACES_COLLECTION | COLLECTIONS_COLLECTION | INDEXES_COLLECTION
+        )
 }
 
 /// The key that marks a Namespace ID as used, forever (ADR 0006).

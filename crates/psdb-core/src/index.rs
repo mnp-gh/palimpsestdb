@@ -58,6 +58,17 @@ pub struct IndexInfo {
     pub path: FieldPath,
     /// Whether no two Documents may share a value in the field.
     pub unique: bool,
+    /// Whether queries use it yet.
+    pub state: IndexState,
+}
+
+/// Whether an Index is still being built (ADR 0013).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexState {
+    /// Writes maintain it and enforce its uniqueness, but queries do not use it.
+    Building,
+    /// Queries use it.
+    Ready,
 }
 
 /// An Index as the Catalog stores it.
@@ -67,6 +78,7 @@ pub(crate) struct IndexDef {
     /// Unique within its Collection and never reused there (ADR 0006).
     pub(crate) id: u32,
     pub(crate) unique: bool,
+    pub(crate) state: IndexState,
 }
 
 /// A Document's entry in an Index.
@@ -153,7 +165,9 @@ pub(crate) fn plan(filter: &Filter, collection: &CollectionEntry) -> Option<Vec<
                 let base = collection.prefix();
                 CandidateRange::Documents(bounds(base, id_type(value)?, op, value)?)
             } else {
-                let index = collection.index_on(path)?;
+                let index = collection
+                    .index_on(path)
+                    .filter(|ix| ix.state == IndexState::Ready)?;
                 let ty = collection.schema.get(&index.path)?.field_type;
                 CandidateRange::Index(bounds(collection.index_prefix(index), ty, op, value)?)
             };
@@ -279,18 +293,18 @@ impl<E: StorageEngine> Transaction<'_, E> {
         path: &FieldPath,
         unique: bool,
     ) -> Result<()> {
-        let (mut entry, index) = self.prepare_index(collection, path, unique)?;
+        let (entry, index) = self.prepare_index(collection, path, unique)?;
         if self.any_live_in(&entry.documents())? {
             return Err(Error::CollectionNotEmpty(collection.clone()));
         }
         self.depend_on_whole_collection(entry.prefix());
-        entry.indexes.push(index);
-        self.write_collection_entry(&entry)
+        self.write_collection_entry(&entry)?;
+        self.write_index_entry(&entry, &index)
     }
 
     /// Check that an Index may be created and give it the Collection's next
-    /// Index ID. The caller fills the Index and adds it to the returned
-    /// entry, whose counter has moved past the ID.
+    /// Index ID. The caller writes the returned entry, whose counter has
+    /// moved past the ID, and the Index's own entry.
     pub(crate) fn prepare_index(
         &mut self,
         collection: &CollectionPath,
@@ -314,33 +328,30 @@ impl<E: StorageEngine> Transaction<'_, E> {
                 "a unique index needs a strict field; declare {path} strict first"
             )));
         }
-        // Skip IDs holding entries from a build that never committed: the
-        // counter moves only when the Index is added (ADR 0010).
-        let mut index = IndexDef {
+        // A failed build's entries sit below the counter, which moved when
+        // it began (ADR 0013), so the next ID holds no entries.
+        let index = IndexDef {
             path: path.clone(),
             id: entry.next_index_id,
             unique,
+            state: IndexState::Ready,
         };
-        while mvcc::any_version_under(&self.node.engine, &entry.index_prefix(&index))? {
-            index.id += 1;
-        }
         entry.next_index_id = index.id + 1;
         Ok((entry, index))
     }
 
-    /// Drop the Index on a field. Its entries become unreachable and stay
-    /// behind until garbage collection exists.
+    /// Drop the Index on a field: a Tombstone on its Catalog entry
+    /// (ADR 0014). Its entries become unreachable and stay behind until
+    /// garbage collection reclaims them.
     pub fn drop_index(&mut self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
-        let mut entry = self.collection_entry(collection)?;
-        let before = entry.indexes.len();
-        entry.indexes.retain(|ix| ix.path != *path);
-        if entry.indexes.len() == before {
+        let entry = self.collection_entry(collection)?;
+        let Some(index) = entry.index_on(path) else {
             return Err(Error::NoSuchIndex {
                 collection: collection.clone(),
                 path: path.clone(),
             });
-        }
-        self.write_collection_entry(&entry)
+        };
+        self.drop_index_entry(&entry, index)
     }
 
     /// The Collection's Indexes, in the order they were created.
@@ -352,6 +363,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
             .map(|ix| IndexInfo {
                 path: ix.path,
                 unique: ix.unique,
+                state: ix.state,
             })
             .collect())
     }
@@ -359,17 +371,22 @@ impl<E: StorageEngine> Transaction<'_, E> {
 
 impl<E: StorageEngine> Node<E> {
     /// Create an Index on a field and build it from the Documents already in
-    /// the Collection (ADR 0010). The field's type must be declared in the
+    /// the Collection (ADR 0013). The field's type must be declared in the
     /// Collection Schema; a unique Index needs a Strict Field.
     ///
-    /// The build runs in the foreground, holding the commit lock, so no
-    /// other commit happens until it finishes. It commits the entries in
-    /// chunks, each an ordinary fsynced commit, so it never holds more than
-    /// one chunk in memory; the entries stay unreachable until a final
-    /// commit adds the Index to the Catalog. If the build fails, for
-    /// example with [`Error::DuplicateValue`], or the Node crashes, the
-    /// committed chunks are left behind under an Index ID that is never
-    /// reused in the Collection, until garbage collection exists.
+    /// A first commit adds the Index as Building: from then on writes
+    /// maintain it, but queries do not use it. The calling thread then
+    /// builds it one chunk at a time, each an ordinary fsynced commit under
+    /// the commit lock, so other commits wait for one chunk, not the whole
+    /// build. A final commit makes it Ready.
+    ///
+    /// Fails with [`Error::IndexBuildCancelled`] if the Index or its
+    /// Collection is dropped meanwhile. On any other failure, for example
+    /// [`Error::DuplicateValue`], one commit removes the Index and the
+    /// original error is returned; if that commit fails too, the Index stays
+    /// Building until it is dropped or the Node reopens. Committed chunks
+    /// stay behind under an Index ID that is never reused in the Collection,
+    /// until Garbage Collection reclaims them.
     ///
     /// ```
     /// use bson::doc;
@@ -394,73 +411,218 @@ impl<E: StorageEngine> Node<E> {
         path: &FieldPath,
         unique: bool,
     ) -> Result<()> {
-        let mut commits = self.commits.lock().expect("lock poisoned");
-        if commits.poisoned {
-            return Err(Error::Poisoned);
+        let mut build = self.start_build(collection, path, unique)?;
+        while !build.step()? {
+            // std's Mutex is unfair: without this the build often takes the
+            // commit lock straight back and starves waiting writers.
+            // shortcut: a hint, not a guarantee; use a fair lock if writers
+            // still starve behind long builds.
+            std::thread::yield_now();
         }
-        let mut txn = Transaction::new(self, commits.last);
-        let (mut entry, index) = txn.prepare_index(collection, path, unique)?;
-        self.build_index(&mut commits, &entry, &index, txn.snapshot_ts())?;
-        entry.indexes.push(index);
-        txn.write_collection_entry(&entry)?;
-        txn.commit_locked(&mut commits)?;
         Ok(())
     }
 
-    /// Commit an entry in `index` for every Document of the Collection at
-    /// `snapshot_ts`, one chunk at a time.
-    fn build_index(
+    /// Commit the Index as Building and return its build, for the caller to
+    /// [`step`](IndexBuild::step), as [`create_index`](Self::create_index)
+    /// does.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn start_index_build(
         &self,
-        commits: &mut CommitState,
-        entry: &CollectionEntry,
-        index: &IndexDef,
-        snapshot_ts: u64,
-    ) -> Result<()> {
-        let prefix_len = entry.prefix().len();
-        let mut range = entry.documents();
-        loop {
-            let mut docs = Vec::new();
-            let mut docs_bytes = 0;
-            // The first Document of the next chunk, if this one filled up
-            // before the Collection ended.
-            let mut next_chunk_start = None;
-            mvcc::scan_range_at(&self.engine, &range, snapshot_ts, &mut |key, value| {
-                let full = docs.len() == BUILD_CHUNK_DOCUMENTS
-                    || (!docs.is_empty() && docs_bytes + value.len() > BUILD_CHUNK_BYTES);
-                if full {
-                    next_chunk_start = Some(key.to_vec());
-                    return ControlFlow::Break(());
+        collection: &CollectionPath,
+        path: &FieldPath,
+        unique: bool,
+    ) -> Result<IndexBuild<'_, E>> {
+        self.start_build(collection, path, unique)
+    }
+
+    fn start_build(
+        &self,
+        collection: &CollectionPath,
+        path: &FieldPath,
+        unique: bool,
+    ) -> Result<IndexBuild<'_, E>> {
+        let (entry, index_id) = self.run(|t| {
+            let (entry, mut index) = t.prepare_index(collection, path, unique)?;
+            index.state = IndexState::Building;
+            t.write_collection_entry(&entry)?;
+            t.write_index_entry(&entry, &index)?;
+            Ok((entry, index.id))
+        })?;
+        Ok(IndexBuild {
+            node: self,
+            collection: collection.clone(),
+            namespace_id: entry.namespace_id,
+            collection_id: entry.id,
+            index_id,
+            remaining: entry.documents(),
+            chunk_documents: BUILD_CHUNK_DOCUMENTS,
+        })
+    }
+
+    /// The last step of Recovery: no Index build survives a restart, so
+    /// drop every Index still Building, in one commit (ADR 0013).
+    pub(crate) fn drop_building_indexes(&self) -> Result<()> {
+        self.run(|t| {
+            for namespace in t.list_namespaces()? {
+                for name in t.list_collections(&namespace)? {
+                    let entry = t.collection_entry(&CollectionPath::new(&namespace, &name)?)?;
+                    for index in &entry.indexes {
+                        if index.state == IndexState::Building {
+                            t.drop_index_entry(&entry, index)?;
+                        }
+                    }
                 }
-                docs_bytes += value.len();
-                docs.push((key.to_vec(), value));
-                ControlFlow::Continue(())
-            })?;
-            let mut chunk = WriteSet::new();
-            for (key, bytes) in &docs {
-                let doc_id = &key[prefix_len..];
-                let Some(index_entry) = entry.index_entry(index, document::raw(bytes)?, doc_id)?
-                else {
-                    continue;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// An Index being built, one chunk per [`step`](Self::step) (ADR 0013).
+pub struct IndexBuild<'node, E: StorageEngine> {
+    node: &'node Node<E>,
+    collection: CollectionPath,
+    /// The IDs the build started with: a dropped and recreated Namespace,
+    /// Collection or Index gets new ones, so the build stops.
+    namespace_id: u32,
+    collection_id: u32,
+    index_id: u32,
+    /// The Documents not yet indexed.
+    remaining: KeyRange,
+    /// The most Documents one chunk indexes.
+    chunk_documents: usize,
+}
+
+impl<E: StorageEngine> IndexBuild<'_, E> {
+    /// Index at most `n` Documents per chunk, so tests can interleave
+    /// commits between chunks of a small Collection.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_chunk_documents(mut self, n: usize) -> Self {
+        self.chunk_documents = n;
+        self
+    }
+
+    /// Index the next chunk of Documents, read at the newest Commit
+    /// Timestamp, and commit their entries; after the last chunk, make the
+    /// Index Ready and return true. Holds the commit lock throughout, so no
+    /// Document changes between reading it and committing its entries.
+    ///
+    /// Fails as [`Node::create_index`] does, removing the Index on any
+    /// failure but [`Error::IndexBuildCancelled`].
+    pub fn step(&mut self) -> Result<bool> {
+        let mut commit_state = self.node.commit_lock.lock().expect("lock poisoned");
+        let outcome = match self.index_next_chunk(&mut commit_state) {
+            Ok(true) => Ok(false),
+            Ok(false) => self.mark_ready(&mut commit_state).map(|()| true),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &outcome
+            && !matches!(e, Error::IndexBuildCancelled)
+        {
+            // If this fails too, `drop_index` or Recovery removes the Index.
+            let _ = self.remove_under_lock(&mut commit_state);
+        }
+        outcome
+    }
+
+    /// Index the next chunk of Documents; true if Documents remain.
+    fn index_next_chunk(&mut self, commit_state: &mut CommitState) -> Result<bool> {
+        let node = self.node;
+        let (_, entry, index) = self.live_entry()?;
+        let latest = node.latest_visible_commit_ts();
+        let prefix_len = entry.prefix().len();
+        let mut docs = Vec::new();
+        let mut docs_bytes = 0;
+        // The first Document of the next chunk, if this one filled up
+        // before the Collection ended.
+        let mut next_chunk_start = None;
+        mvcc::scan_range_at(&node.engine, &self.remaining, latest, &mut |key, value| {
+            let full = docs.len() == self.chunk_documents
+                || (!docs.is_empty() && docs_bytes + value.len() > BUILD_CHUNK_BYTES);
+            if full {
+                next_chunk_start = Some(key.to_vec());
+                return ControlFlow::Break(());
+            }
+            docs_bytes += value.len();
+            docs.push((key.to_vec(), value));
+            ControlFlow::Continue(())
+        })?;
+        let mut chunk = WriteSet::new();
+        for (key, bytes) in &docs {
+            let doc_id = &key[prefix_len..];
+            let Some(index_entry) = entry.index_entry(&index, document::raw(bytes)?, doc_id)?
+            else {
+                continue;
+            };
+            if index_entry.unique {
+                // A writer may already have indexed this very Document.
+                let owner = match chunk.get(&index_entry.key) {
+                    Some(owner) => owner.clone(),
+                    None => mvcc::read_at(&node.engine, &index_entry.key, latest)?,
                 };
-                if index_entry.unique
-                    && (chunk.contains_key(&index_entry.key)
-                        || mvcc::read_at(&self.engine, &index_entry.key, commits.last)?.is_some())
-                {
+                if owner.is_some_and(|owner| owner != doc_id) {
                     return Err(Error::DuplicateValue(format!(
                         "two documents share a value of {}, so it cannot have a unique index",
                         index.path
                     )));
                 }
-                chunk.insert(index_entry.key, Some(doc_id.to_vec()));
             }
-            if !chunk.is_empty() {
-                self.apply_commit(commits, &chunk)?;
-            }
-            let Some(start) = next_chunk_start else {
-                return Ok(());
-            };
+            chunk.insert(index_entry.key, Some(doc_id.to_vec()));
+        }
+        if !chunk.is_empty() {
+            // Read and committed under the commit lock, so the conflict
+            // checks pass; they run so every commit takes one path.
+            let txn = Transaction::with_write_set(node, chunk);
+            debug_assert_eq!(txn.snapshot_ts(), latest, "commit lock froze the timestamp");
+            txn.commit_under_lock(commit_state)?;
+        }
+        if let Some(start) = next_chunk_start {
             // The newest Version of a key sorts first, at timestamp u64::MAX.
-            range.start = keys::physical_key(&start, u64::MAX);
+            self.remaining.start = keys::physical_key(&start, u64::MAX);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Mark the Index Ready, writing only its own Catalog entry (ADR 0014).
+    fn mark_ready(&self, commit_state: &mut CommitState) -> Result<()> {
+        let (mut txn, entry, mut index) = self.live_entry()?;
+        index.state = IndexState::Ready;
+        txn.write_index_entry(&entry, &index)?;
+        txn.commit_under_lock(commit_state).map(drop)
+    }
+
+    /// Write a Tombstone on the Index's Catalog entry.
+    fn remove_under_lock(&self, commit_state: &mut CommitState) -> Result<()> {
+        let (mut txn, entry, index) = self.live_entry()?;
+        txn.drop_index_entry(&entry, &index)?;
+        txn.commit_under_lock(commit_state).map(drop)
+    }
+
+    /// The Collection's newest entry, with its Indexes, read in a
+    /// Transaction at the newest Commit Timestamp, if the Index's own entry
+    /// is still Building. Called under the commit lock, so the entries stay
+    /// the newest until the caller commits.
+    fn live_entry(&self) -> Result<(Transaction<'_, E>, CollectionEntry, IndexDef)> {
+        let mut txn = Transaction::new(self.node);
+        let entry = match txn.collection_entry(&self.collection) {
+            Err(Error::NoSuchNamespace(_) | Error::NoSuchCollection(_)) => {
+                return Err(Error::IndexBuildCancelled);
+            }
+            entry => entry?,
+        };
+        let index = entry
+            .indexes
+            .iter()
+            .find(|ix| ix.id == self.index_id && ix.state == IndexState::Building)
+            .cloned();
+        match index {
+            Some(index)
+                if entry.namespace_id == self.namespace_id && entry.id == self.collection_id =>
+            {
+                Ok((txn, entry, index))
+            }
+            _ => Err(Error::IndexBuildCancelled),
         }
     }
 }
@@ -490,6 +652,7 @@ mod tests {
             path: path.parse().unwrap(),
             id,
             unique: false,
+            state: IndexState::Ready,
         }
     }
 

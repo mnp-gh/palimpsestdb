@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use psdb_core::wal::SimDisk;
-use psdb_core::{CollectionPath, FieldPath, Limits, Node, Result};
+use psdb_core::{CollectionPath, FieldPath, IdGenerator, Limits, Node, Result};
 use psdb_storage_memory::MemoryEngine;
 
 /// A Node with `shop.orders` already created.
@@ -17,7 +17,12 @@ pub fn shop() -> Node<MemoryEngine> {
 
 /// A durable Node over `disk`, replaying the WAL already on it.
 pub fn open(disk: &SimDisk) -> Result<Node<MemoryEngine>> {
-    Node::open_with(MemoryEngine::new(), disk.file(), Limits::default())
+    Node::open_with(
+        MemoryEngine::new(),
+        disk.file(),
+        Limits::default(),
+        IdGenerator::default(),
+    )
 }
 
 /// A durable Node over a fresh `disk`, with `shop.orders` already created.

@@ -14,7 +14,7 @@ fn snapshot_is_stable_while_others_commit() {
     node.insert(&collection("shop.orders"), doc! { "_id": 1, "v": "old" })
         .unwrap();
 
-    let mut reader = node.begin();
+    let mut reader = node.begin_transaction();
     assert_eq!(
         reader
             .get(&collection("shop.orders"), &Bson::Int32(1))
@@ -59,7 +59,7 @@ fn snapshot_is_stable_while_others_commit() {
 #[test]
 fn reads_see_own_writes_only() {
     let node = common::shop();
-    let mut t1 = node.begin();
+    let mut t1 = node.begin_transaction();
     t1.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
     assert!(
@@ -72,7 +72,7 @@ fn reads_see_own_writes_only() {
         1
     );
 
-    let mut t2 = node.begin();
+    let mut t2 = node.begin_transaction();
     assert!(
         t2.get(&collection("shop.orders"), &Bson::Int32(1))
             .unwrap()
@@ -93,7 +93,7 @@ fn reads_see_own_writes_only() {
 #[test]
 fn aborted_writes_vanish() {
     let node = common::shop();
-    let mut t = node.begin();
+    let mut t = node.begin_transaction();
     t.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
     drop(t);
@@ -111,8 +111,8 @@ fn first_committer_wins() {
         .unwrap();
     let id = Bson::Int32(1);
 
-    let mut t1 = node.begin();
-    let mut t2 = node.begin();
+    let mut t1 = node.begin_transaction();
+    let mut t2 = node.begin_transaction();
     t1.replace(&collection("shop.orders"), &id, doc! { "n": 1 })
         .unwrap();
     t2.replace(&collection("shop.orders"), &id, doc! { "n": 2 })
@@ -132,8 +132,8 @@ fn delete_conflicts_with_concurrent_replace() {
     node.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
     let id = Bson::Int32(1);
-    let mut t1 = node.begin();
-    let mut t2 = node.begin();
+    let mut t1 = node.begin_transaction();
+    let mut t2 = node.begin_transaction();
     t1.delete(&collection("shop.orders"), &id).unwrap();
     t2.replace(&collection("shop.orders"), &id, doc! { "n": 2 })
         .unwrap();
@@ -144,8 +144,8 @@ fn delete_conflicts_with_concurrent_replace() {
 #[test]
 fn concurrent_inserts_of_one_id_conflict() {
     let node = common::shop();
-    let mut t1 = node.begin();
-    let mut t2 = node.begin();
+    let mut t1 = node.begin_transaction();
+    let mut t2 = node.begin_transaction();
     t1.insert(&collection("shop.orders"), doc! { "_id": "x" })
         .unwrap();
     t2.insert(&collection("shop.orders"), doc! { "_id": "x" })
@@ -199,8 +199,8 @@ fn snapshot_isolation_permits_write_skew() {
     .unwrap();
     let on_call = doc! { "on_call": true };
 
-    let mut t1 = node.begin();
-    let mut t2 = node.begin();
+    let mut t1 = node.begin_transaction();
+    let mut t2 = node.begin_transaction();
     assert_eq!(
         t1.find(&collection("shop.doctors"), &on_call)
             .unwrap()
