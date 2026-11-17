@@ -63,7 +63,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 **A write** (`Transaction::insert`, `replace`, `delete`) touches only the Transaction's private Write Set:
 
 1. `collection_entry` reads the Collection's Catalog entry, which holds its schema, and each of its Index Catalog entries, and records every one of those reads as a dependency.
-2. `document::prepare` checks the limits and the `_id`, generating a UUIDv7 if there is none.
+2. `document::prepare` checks the limits and the `_id`, taking a UUIDv7 from `Node::id_generator` if there is none.
 3. `write_document` checks Strict Fields. Then, for every Index, `CollectionEntry::index_entry` works out the old and new entries, and a unique Index refuses a value another Document owns.
 4. `write_all` adds the Document and its Index entry changes to the Write Set together, or adds none of them if they would cross the Write Set cap.
 
@@ -90,7 +90,7 @@ On open, Recovery writes a Tombstone on every Index still Building, in one commi
 
 `Transaction::create_index_on_empty` only works on an empty Collection, where there is nothing to build (ADR 0010).
 
-**Garbage Collection** (`Node::collect_garbage`, in `gc`) takes the Horizon once, then scans every versioned key from the Namespaces up, skipping the unversioned state below them. For each logical key it keeps the newest Version at or below the Horizon (or deletes it too if it is a Tombstone) and deletes every older one, 1024 physical keys per batch, resuming each scan just past the last key it visited. It takes no commit lock and writes nothing to the WAL (ADR 0012), so Recovery may bring removed Versions back for the next pass. Versions newer than the Horizon are never touched, so a concurrent commit is unaffected. A `gc_lock` lets one pass run at a time, since a later pass could delete Catalog Versions an earlier one still reads; commits never take it.
+**Garbage Collection** (`Node::collect_garbage`, in `gc`) takes the Horizon once, then scans every versioned key from the Namespaces up, skipping the unversioned state below them. For each logical key it keeps the newest Version at or below the Horizon (or deletes it too if it is a Tombstone) and deletes every older one, 1024 physical keys per batch, resuming each scan just past the last key it visited. Each batch is one `GcPass::step`; tests step a pass themselves to commit between batches. It takes no commit lock and writes nothing to the WAL (ADR 0012), so Recovery may bring removed Versions back for the next pass. Versions newer than the Horizon are never touched, so a concurrent commit is unaffected. A `gc_lock` lets one pass run at a time, since a later pass could delete Catalog Versions an earlier one still reads; commits never take it.
 
 The same scan reclaims dropped Namespaces, Collections and Indexes. The Catalog sorts before all data, so dead IDs are known before the scan reaches it. Deleting the Tombstone of a Namespace or Collection entry makes the ID in the Version before it dead; deleting an Index Catalog entry's Tombstone makes that Index dead. Every key under a dead ID is then deleted whatever its timestamp, as is every Version of a dead Namespace's Collection entries and a dead Collection's Index Catalog entries. Catalog deletes are held back and written after the data, so a crash never loses the Tombstone that marks data dead. Last, it drops those reclaimed entries from the Catalog cache and purges the cache's Tombstones at or below the Horizon.
 
@@ -103,7 +103,7 @@ The same scan reclaims dropped Namespaces, Collections and Indexes. The Catalog 
 - **Snapshots never go below the Horizon.** `latest_visible_commit_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward. Every Snapshot, Index builds included, registers through `register_snapshot`, which reads the latest Visible timestamp under the registry lock.
 - **The WAL comes first.** A commit is in the WAL and fsynced before the engine sees it. If the outcome is unknown, nothing more commits until the Node is reopened.
 - **A Document and its Index entries change in one Write Set,** Building Indexes included; only an Index build's chunks write entries on their own, under the commit lock. Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.
-- **IDs are never reused.** Namespace and Collection IDs are random, and their ID keys outlive a drop and Garbage Collection. Index IDs come from a per-Collection counter that only grows and moves when a build begins, so a failed build's entries sit below it (ADR 0006, ADR 0013).
+- **IDs are never reused.** Namespace and Collection IDs are random (drawn from `IdGenerator::catalog_id`, which tests seed), and their ID keys outlive a drop and Garbage Collection. Index IDs come from a per-Collection counter that only grows and moves when a build begins, so a failed build's entries sit below it (ADR 0006, ADR 0013).
 - **Names and paths are checked once.** A `CollectionPath` or `FieldPath` that exists is valid, so the code below never checks them again.
 
 ## Tests
@@ -120,6 +120,7 @@ The same scan reclaims dropped Namespaces, Collections and Indexes. The Catalog 
   - `model`: a property test against a plain map
   - `gc`: Garbage Collection keeps what open Snapshots read
   - `threads`: the Snapshot registry and Horizon, and a stress test on real threads
+  - `sim`: a deterministic simulator. One thread interleaves single calls on several Transactions, one-Document Index build chunks, Garbage Collection batches and power losses on `SimDisk`, with seeded `IdGenerator`; after every step every open Snapshot must read what a model says, through a scan and through a Ready Index, and Recovery must keep every acknowledged commit
 
 ## Keeping this current
 

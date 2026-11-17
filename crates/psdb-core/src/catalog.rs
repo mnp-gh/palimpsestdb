@@ -389,7 +389,11 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// Collection in the Namespace `namespace_id`. Indexes are numbered per
     /// Collection instead.
     fn allocate_id(&mut self, namespace_id: Option<u32>) -> Result<u32> {
-        self.allocate_id_from(std::iter::repeat_with(random_id), namespace_id)
+        let node = self.node;
+        self.allocate_id_from(
+            std::iter::repeat_with(|| (node.id_generator.catalog_id)()),
+            namespace_id,
+        )
     }
 
     /// The first of `candidates` whose ID key was never written, at any
@@ -425,11 +429,6 @@ fn pick_unused(
         }
     }
     Err(Error::IdsExhausted)
-}
-
-/// A random 32-bit ID.
-fn random_id() -> u32 {
-    getrandom::u32().expect("the OS random number generator failed")
 }
 
 fn entry(name: &str, id: u32) -> Vec<u8> {

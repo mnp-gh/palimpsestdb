@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bson::{Bson, Document};
 use psdb_storage::StorageEngine;
+use uuid::Uuid;
 
 use crate::catalog::CatalogCache;
 use crate::collection_path::CollectionPath;
@@ -42,6 +43,7 @@ use crate::wal::{self, OsWalFile, Wal, WalFile};
 pub struct Node<E: StorageEngine> {
     pub(crate) engine: E,
     pub(crate) limits: Limits,
+    pub(crate) id_generator: IdGenerator,
     /// Holding the lock serialises commits, which keeps them logged and
     /// applied in Commit Timestamp order.
     pub(crate) commit_lock: Mutex<CommitState>,
@@ -62,6 +64,27 @@ pub struct Node<E: StorageEngine> {
     /// Versions an earlier one still reads at its older Horizon. Commits
     /// never take it.
     pub(crate) gc_lock: Mutex<()>,
+}
+
+/// Where a Node gets new IDs. Tests inject deterministic sources; the
+/// defaults are the OS clock and random number generator.
+pub struct IdGenerator {
+    /// A new generated Document ID: a UUIDv7 (ADR 0009). IDs from one
+    /// source must sort in creation order.
+    pub document_id: Box<dyn Fn() -> Uuid + Send + Sync>,
+    /// A random candidate for a new Namespace or Collection ID (ADR 0006).
+    pub catalog_id: Box<dyn Fn() -> u32 + Send + Sync>,
+}
+
+impl Default for IdGenerator {
+    fn default() -> Self {
+        Self {
+            document_id: Box::new(Uuid::now_v7),
+            catalog_id: Box::new(|| {
+                getrandom::u32().expect("the OS random number generator failed")
+            }),
+        }
+    }
 }
 
 /// The state commits serialise on, behind [`Node`]'s commit lock. Only
@@ -151,6 +174,7 @@ impl<E: StorageEngine> Node<E> {
         Ok(Self::from_parts(
             engine,
             limits,
+            IdGenerator::default(),
             0,
             None,
             CatalogCache::default(),
@@ -178,18 +202,28 @@ impl<E: StorageEngine> Node<E> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn open(engine: E, dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with(engine, OsWalFile::open(dir)?, Limits::default())
+        Self::open_with(
+            engine,
+            OsWalFile::open(dir)?,
+            Limits::default(),
+            IdGenerator::default(),
+        )
     }
 
     /// Open a durable Node over any [`WalFile`], such as a `SimDisk` file
-    /// in tests (feature `testing`), and replay it into
-    /// `engine`, which must be empty.
+    /// in tests (feature `testing`), taking new IDs from `id_generator`, and replay
+    /// the WAL into `engine`, which must be empty.
     ///
     /// Fails with [`Error::EngineNotEmpty`], [`Error::UnrecognisedWal`] or
     /// [`Error::Corruption`] without changing the WAL. On success, a torn
     /// write at the WAL's end has been truncated, and a WAL cut off while
     /// being created has been rewritten.
-    pub fn open_with(engine: E, wal: impl WalFile + 'static, limits: Limits) -> Result<Self> {
+    pub fn open_with(
+        engine: E,
+        wal: impl WalFile + 'static,
+        limits: Limits,
+        id_generator: IdGenerator,
+    ) -> Result<Self> {
         if mvcc::any_version_under(&engine, &[])? {
             return Err(Error::EngineNotEmpty);
         }
@@ -204,7 +238,7 @@ impl<E: StorageEngine> Node<E> {
             catalog_cache.record(record.commit_ts, &record.write_set);
             last = record.commit_ts;
         }
-        let node = Self::from_parts(engine, limits, last, Some(wal), catalog_cache);
+        let node = Self::from_parts(engine, limits, id_generator, last, Some(wal), catalog_cache);
         node.drop_building_indexes()?;
         Ok(node)
     }
@@ -212,6 +246,7 @@ impl<E: StorageEngine> Node<E> {
     fn from_parts(
         engine: E,
         limits: Limits,
+        id_generator: IdGenerator,
         last: u64,
         wal: Option<Wal>,
         catalog_cache: CatalogCache,
@@ -219,6 +254,7 @@ impl<E: StorageEngine> Node<E> {
         Self {
             engine,
             limits,
+            id_generator,
             commit_lock: Mutex::new(CommitState::new(wal)),
             latest_visible_commit_ts: AtomicU64::new(last),
             catalog_cache,
