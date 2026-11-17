@@ -7,7 +7,7 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | v0.1 | Embedded, in-memory | Done |
 | v0.2 | Durability | Done |
 | v0.3 | Indexes | Done |
-| v0.4 | Concurrency | Planned |
+| v0.4 | Concurrency | Done |
 | v0.4.1 | Persistent engine | Planned |
 | v0.5 | Serializable | Planned |
 | v0.6 | Server | Planned |
