@@ -41,6 +41,10 @@ pub enum Error {
     /// Type Mismatch: the write gives a Strict Field a value of another
     /// type. Not an Abort, and not retryable.
     TypeMismatch(String),
+    /// Index Build Cancelled: the Index or its Collection was dropped while
+    /// the Index was being built (ADR 0013). Not an Abort, and not
+    /// retryable: retrying would undo the drop.
+    IndexBuildCancelled,
     /// A Collection Schema change or Index definition breaks a rule, such
     /// as indexing a field whose type is not declared.
     InvalidSchema(String),
@@ -139,6 +143,9 @@ impl fmt::Display for Error {
             Error::DuplicateId(id) => write!(f, "a document with _id {id} already exists"),
             Error::DuplicateValue(msg) => write!(f, "duplicate value: {msg}"),
             Error::TypeMismatch(msg) => write!(f, "type mismatch: {msg}"),
+            Error::IndexBuildCancelled => f.write_str(
+                "index build cancelled: the index or its collection was dropped while it was being built",
+            ),
             Error::InvalidSchema(msg) => write!(f, "invalid schema: {msg}"),
             Error::IndexExists { collection, path } => {
                 write!(f, "collection {collection} already has an index on {path}")

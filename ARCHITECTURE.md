@@ -1,6 +1,6 @@
 # Architecture
 
-A map of the code: what lives where, how a request flows through it, and the rules that hold across modules. It describes v0.3: an embedded library, single-threaded in intent, durable through a WAL over an in-memory Storage Engine.
+A map of the code: what lives where, how a request flows through it, and the rules that hold across modules. It describes v0.4 in progress: an embedded library, thread-safe for plain threads, durable through a WAL over an in-memory Storage Engine.
 
 Read [GLOSSARY.md](GLOSSARY.md) first; capitalised terms here are defined there. The *why* behind each decision is in [docs/adr/](docs/adr/), and the details are in each module's doc comments (`cargo doc --open --document-private-items`). This file only connects them, so it names modules and types, never lines.
 
@@ -20,6 +20,7 @@ Inside `psdb-core`, from the public API down:
 
 ```
 Node, Transaction                         public API; commits
+  gc                                      removing Versions below the Horizon
   catalog, index, schema, filter,         what keys and values mean
   document, collection_path, field_path
     keys, mvcc                            key encoding; which Version a Snapshot sees
@@ -35,13 +36,13 @@ Modules are cut by concept, not by type. `Node`, `Transaction` and `CollectionEn
 |---|---|
 | How is a key laid out? | `keys` (ADR 0008) |
 | Which Version does a Snapshot see? | `mvcc` |
-| How does a commit get checked and logged? | `transaction` (`commit`), `node` (`apply_commit`) |
+| How does a commit get checked and logged? | `transaction` (`commit_under_lock`), `node` (`CommitState`) |
 | What does a Catalog entry hold? | `catalog` (`CollectionEntry`) |
 | What may change in a Collection Schema? | `schema` |
-| How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `create_index_on_empty`, `build_index`) |
+| How is an Index created, built, or kept in step with a write? | `index` (`index_entry`, `create_index`, `create_index_on_empty`, `IndexBuild::step`) |
 | Which Index or `_id` range does `find` use? | `index` (`plan`) |
 | What is a valid name, `_id` or Document? | `document`, `collection_path`, `field_path` |
-| How does recovery work? | `node` (`open_with`), `wal` |
+| How does recovery work? | `node` (`open_with`), `index` (`drop_building_indexes`), `wal` |
 
 ## Keys
 
@@ -49,48 +50,60 @@ Every stored thing is a **logical key** with Versions. A **physical key** is the
 
 - A Document: `namespace_id ‖ collection_id ‖ document_id`.
 - An Index entry: `namespace_id ‖ collection_id ‖ 0x00 ‖ index_id ‖ value ‖ document_id`, below every Document of its Collection. A unique Index leaves out the `document_id` (ADR 0011).
-- The Catalog: Collections 1 to 4 of Namespace 0 (ADR 0006). Its Collection 0 holds unversioned state: the `applied_up_to` marker.
+- The Catalog: Collections 1 to 5 of Namespace 0 (ADR 0006). Collection 5 holds one entry per Index, `namespace_id ‖ collection_id ‖ index_id` (ADR 0014). Its Collection 0 holds unversioned state: the `applied_up_to` marker.
 
 So everything a Collection owns sits under one prefix, `namespace_id ‖ collection_id`.
 
 ## Flows
 
-**Opening.** `Node::open` opens the WAL file and locks it, so a second Node on the same directory fails to open. `Wal::open` reads every record, truncates a torn one at the end, and fsyncs the file, so no record it returns can be lost to a later power cut. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch`, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
+**Opening.** `Node::open` opens the WAL file and locks it, so a second Node on the same directory fails to open. `Wal::open` reads every record, truncates a torn one at the end, and fsyncs the file, so no record it returns can be lost to a later power cut. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch` and records its Catalog entries in the Catalog cache, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
+
+**Beginning** (`Node::begin_transaction`) never takes the commit lock. Under the Snapshot registry's own lock it loads `latest_visible_commit_ts` and registers that Snapshot; dropping the Transaction unregisters it. `Node::horizon` reads the oldest registered Snapshot under the same lock, so no Snapshot registers below a Horizon already handed out.
 
 **A write** (`Transaction::insert`, `replace`, `delete`) touches only the Transaction's private Write Set:
 
-1. `collection_entry` reads the Collection's Catalog entry, which holds its schema and Indexes, and records the read as a dependency.
-2. `document::prepare` checks the limits and the `_id`, generating a UUIDv7 if there is none.
+1. `collection_entry` reads the Collection's Catalog entry, which holds its schema, and each of its Index Catalog entries, and records every one of those reads as a dependency.
+2. `document::prepare` checks the limits and the `_id`, taking a UUIDv7 from `Node::id_generator` if there is none.
 3. `write_document` checks Strict Fields. Then, for every Index, `CollectionEntry::index_entry` works out the old and new entries, and a unique Index refuses a value another Document owns.
 4. `write_all` adds the Document and its Index entry changes to the Write Set together, or adds none of them if they would cross the Write Set cap.
 
-**A read** (`Transaction::read`, `scan_range`) sees the Snapshot with the Transaction's own writes laid over it. `find` parses the filter and asks `index::plan` for candidate ranges. With no plan, it scans the Collection's Documents. A `Documents` range is read directly. An `Index` range yields Document IDs, which are then fetched. Every candidate is rechecked against the whole filter (`Filter::matches_raw`).
+**A read** (`Transaction::read`, `scan_range`) sees the Snapshot with the Transaction's own writes laid over it. A point read of a Catalog entry, or a listing of Catalog entries (`Transaction::scan`), asks `Node::catalog_cache` first: it holds each entry's newest Version, ordered by key, so it answers when every Version it would return is at or before the Snapshot, or when the key was never written; otherwise the read goes to the engine. Debug builds check every cached answer against the engine. ID keys always read the engine. `find` parses the filter and asks `index::plan` for candidate ranges. With no plan, it scans the Collection's Documents. A `Documents` range is read directly. An `Index` range yields Document IDs, which are then fetched. Every candidate is rechecked against the whole filter (`Filter::matches_raw`).
 
-**A commit** (`Transaction::commit`) takes the commit lock (`Node::commits`), then:
+**A commit** (`Transaction::commit`) takes the commit lock (`Node::commit_lock`), then:
 
 1. Fails if the Node is poisoned. A Transaction that wrote nothing commits at once.
-2. Aborts with Collection Changed if a Catalog entry it read, or a Collection it read whole, changed since its Snapshot.
+2. Aborts with Collection Changed if a Catalog entry it read changed since its Snapshot, or if a Document was committed since then into a Collection it read whole. For the latter, `CommitState::last_document_commit` keeps, in memory, each Collection's last Document commit since the Node opened; Index entries, build chunks included, do not update it.
 3. Aborts with Write Conflict if any key it writes was committed since its Snapshot (first-committer-wins).
-4. Calls `Node::apply_commit`, which takes the next Commit Timestamp, appends and fsyncs the WAL record, then writes one engine batch: every Version plus `applied_up_to`. A failure after the append poisons the Node with Commit Outcome Unknown (ADR 0004).
+4. Calls `CommitState::apply_commit`, which takes the next Commit Timestamp, appends and fsyncs the WAL record, then writes one engine batch: every Version plus `applied_up_to`. A failure after the append poisons the Node with Commit Outcome Unknown (ADR 0004).
+5. `apply_commit` then records the commit's Catalog entries in `Node::catalog_cache`, and only then stores the Commit Timestamp in `Node::latest_visible_commit_ts`, the only copy of it, which makes the commit Visible.
 
-**Catalog changes** (creating or dropping Namespaces and Collections, schema and Index changes) are ordinary writes to Catalog keys, so they commit or abort with the rest of their Transaction (ADR 0006). Changing a schema or the Indexes rewrites the Collection's entry. A concurrent writer recorded a read of that entry, so it aborts at commit.
+**Catalog changes** (creating or dropping Namespaces and Collections, schema and Index changes) are ordinary writes to Catalog keys, so they commit or abort with the rest of their Transaction (ADR 0006). Changing a schema rewrites the Collection's entry; creating an Index rewrites it too (`nextIndexId`) and writes the Index's own entry, while dropping an Index or marking it Ready writes only the Index's entry (ADR 0014). A concurrent writer recorded a read of all of them, so it aborts at commit.
 
-**An Index build** (`Node::create_index`) holds the commit lock throughout:
+**An Index build** (`Node::create_index`) takes the commit lock one chunk at a time (ADR 0013):
 
-1. `prepare_index` gives the Index the next unused ID.
-2. `build_index` reads the Collection at one Snapshot, in chunks of at most 1024 Documents or 16 MiB, and commits each chunk's entries through `apply_commit` directly, outside any Write Set and its cap.
-3. A final commit adds the Index to the Collection's entry, which makes the entries reachable.
+1. An ordinary Transaction writes the Index's Catalog entry as Building, taking its ID from `nextIndexId` in the Collection's entry. From then on `write_document` maintains it like any Index, but `index::plan` uses only Ready ones. A writer whose Snapshot predates this commit read the old entry, so it aborts with Collection Changed.
+2. Each `IndexBuild::step` takes the commit lock and re-reads the Collection's entries at the newest Commit Timestamp. It stops with Index Build Cancelled unless the Namespace, Collection and Index IDs still match and the Index is still Building. It then reads the next chunk (at most 1024 Documents or 16 MiB) at that timestamp and commits its entries through `commit_under_lock`, outside the Write Set cap. A unique Index fails with Duplicate Value only on an entry naming another Document, since a writer may have indexed this one already.
+3. After the last chunk, the same step rewrites only this Index's entry as Ready and commits. On any failure but cancellation it instead writes a Tombstone on that entry.
+4. Between steps, `create_index` yields, so waiting writers get the lock.
+
+On open, Recovery writes a Tombstone on every Index still Building, in one commit (`drop_building_indexes`).
 
 `Transaction::create_index_on_empty` only works on an empty Collection, where there is nothing to build (ADR 0010).
 
+**Garbage Collection** (`Node::collect_garbage`, in `gc`) takes the Horizon once, then scans every versioned key from the Namespaces up, skipping the unversioned state below them. For each logical key it keeps the newest Version at or below the Horizon (or deletes it too if it is a Tombstone) and deletes every older one. A batch closes at the first logical key after visiting 1024 physical keys, deleted or not, so a key's Versions are deleted in one batch (a Tombstone deleted alone would uncover the Versions under it) and a step's scan stays short; the next step resumes at that key. Each batch is one `GcPass::step`; tests step a pass themselves to commit between batches. It takes no commit lock and writes nothing to the WAL (ADR 0012), so Recovery may bring removed Versions back for the next pass. Versions newer than the Horizon are never touched, so a concurrent commit is unaffected. A `gc_lock` lets one pass run at a time, since a later pass could delete Catalog Versions an earlier one still reads; commits never take it.
+
+The same scan reclaims dropped Namespaces, Collections and Indexes. The Catalog sorts before all data, so dead IDs are known before the scan reaches it. Deleting the Tombstone of a Namespace or Collection entry makes the ID in the Version before it dead; deleting an Index Catalog entry's Tombstone makes that Index dead. Every key under a dead ID is then deleted whatever its timestamp, as is every Version of a dead Namespace's Collection entries and a dead Collection's Index Catalog entries. Catalog deletes are held back and written after the data, in one batch, so a crash never loses the Tombstone that marks data dead. Last, it drops those reclaimed entries from the Catalog cache and purges the cache's Tombstones at or below the Horizon.
+
 ## Invariants
 
-- **Versions are never changed in place.** A write adds a Version, and a delete adds a tombstone. Nothing is garbage-collected yet (v0.4).
+- **Versions are never changed in place.** A write adds a Version, and a delete adds a tombstone. Garbage Collection only deletes Versions no Snapshot at or after the Horizon can read.
 - **The engine stays unaware of Versions.** MVCC, Transactions and the Catalog all live above the `StorageEngine` trait (ADR 0001).
-- **Commits are serialised.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order.
+- **Commits are serialised and take one path.** One lock covers conflict checking, the WAL append and the engine write, so Commit Timestamps rise by one and the WAL is in Commit Timestamp order. `CommitState` lives in `node`, beside the commit lock; `Transaction::commit_under_lock` is the only caller of `CommitState::apply_commit`, Index build chunks included. `Node::latest_visible_commit_ts` is stored only by `CommitState::apply_commit`, under the commit lock.
+- **The Catalog cache is complete and never behind a Visible commit.** It holds every Namespace, Collection and Index Catalog entry ever written, Tombstones included, except Tombstones Garbage Collection purged at or below its Horizon and entries of reclaimed Namespaces and Collections, which every Snapshot from then on reads as absent anyway; and `apply_commit` updates it after the engine write and before publishing, under the commit lock. Publishing first would let a Snapshot at the new timestamp read the entry the commit replaced.
+- **Snapshots never go below the Horizon.** `latest_visible_commit_ts` only rises, and registration and `Node::horizon` share one lock, so the Horizon only moves forward. Every Snapshot, Index builds included, registers through `register_snapshot`, which reads the latest Visible timestamp under the registry lock.
 - **The WAL comes first.** A commit is in the WAL and fsynced before the engine sees it. If the outcome is unknown, nothing more commits until the Node is reopened.
-- **A Document and its Index entries change in one Write Set.** Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.
-- **IDs are never reused.** Namespace and Collection IDs are random, and their ID keys outlive a drop. Index IDs come from a per-Collection counter that only grows (ADR 0006).
+- **A Document and its Index entries change in one Write Set,** Building Indexes included; only an Index build's chunks write entries on their own, under the commit lock. Index entries point to Document IDs, not to Versions, so a lookup always fetches the Document at its Snapshot and rechecks the filter.
+- **IDs are never reused.** Namespace and Collection IDs are random (drawn from `IdGenerator::catalog_id`, which tests seed), and their ID keys outlive a drop and Garbage Collection. Index IDs come from a per-Collection counter that only grows and moves when a build begins, so a failed build's entries sit below it (ADR 0006, ADR 0013).
 - **Names and paths are checked once.** A `CollectionPath` or `FieldPath` that exists is valid, so the code below never checks them again.
 
 ## Tests
@@ -105,6 +118,9 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
   - `crash`: simulated power loss on `SimDisk`, and killing a child process
   - `indexes`: a property test checking that `find` through an Index equals a full scan
   - `model`: a property test against a plain map
+  - `gc`: Garbage Collection keeps what open Snapshots read
+  - `threads`: the Snapshot registry and Horizon, and a stress test on real threads
+  - `sim`: a deterministic simulator. One thread interleaves single calls on several Transactions, one-Document Index build chunks, Garbage Collection batches and power losses on `SimDisk`, with seeded `IdGenerator`; after every step every open Snapshot must read what a model says, through a scan and through a Ready Index, and Recovery must keep every acknowledged commit
 
 ## Keeping this current
 

@@ -42,7 +42,13 @@ pub(crate) fn commit_batch<'a>(
     batch
 }
 
-fn decode_value(stored: &[u8]) -> Result<Option<Vec<u8>>> {
+/// Whether a stored Version value is a tombstone.
+pub(crate) fn is_tombstone(stored: &[u8]) -> bool {
+    stored == [TOMBSTONE]
+}
+
+/// A stored Version value: `None` for a Tombstone.
+pub(crate) fn decode_value(stored: &[u8]) -> Result<Option<Vec<u8>>> {
     match stored.split_first() {
         Some((&TOMBSTONE, [])) => Ok(None),
         Some((&LIVE, bytes)) => Ok(Some(bytes.to_vec())),
@@ -100,32 +106,6 @@ pub(crate) fn any_version_under<E: StorageEngine>(engine: &E, prefix: &[u8]) -> 
 
 /// A scan callback: a logical key and its visible value; `Break` stops.
 pub(crate) type Visit<'a> = dyn FnMut(&[u8], Vec<u8>) -> ControlFlow<()> + 'a;
-
-/// Whether any key under `prefix` has a Version committed after
-/// `snapshot_ts`.
-pub(crate) fn changed_since<E: StorageEngine>(
-    engine: &E,
-    prefix: &[u8],
-    snapshot_ts: u64,
-) -> Result<bool> {
-    let mut changed = false;
-    let mut failure = None;
-    engine.scan(
-        &KeyRange::prefix(prefix),
-        &mut |key, _| match split_physical(key) {
-            Ok((_, ts)) if ts > snapshot_ts => {
-                changed = true;
-                ControlFlow::Break(())
-            }
-            Ok(_) => ControlFlow::Continue(()),
-            Err(e) => {
-                failure = Some(e);
-                ControlFlow::Break(())
-            }
-        },
-    )?;
-    failure.map_or(Ok(changed), Err)
-}
 
 /// Call `visit` with every logical key in `range` that has a live Version
 /// at `snapshot_ts`, in key order, with that Version's value, until it

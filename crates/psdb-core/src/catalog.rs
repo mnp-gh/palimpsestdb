@@ -2,19 +2,21 @@
 //! entries in Namespace 0 so DDL is transactional (ADR 0006).
 //!
 //! Each entry's value is a BSON document `{ name, id }`; a Collection entry
-//! adds its Collection Schema and Indexes (ADR 0011):
+//! adds its Collection Schema and Index ID counter (ADR 0011):
 //!
 //! ```text
 //! { name, id,
 //!   fields:  [ { path, type, strict } ],
-//!   indexes: [ { path, id, unique } ],
 //!   nextIndexId }
 //! ```
 //!
-//! All three are optional, so a Collection without them reads as having no
-//! schema, no Indexes and next Index ID 0. Changing the schema or the
-//! Indexes rewrites the entry, so a concurrent writer to the Collection
-//! aborts with Collection Changed.
+//! Both are optional, so a Collection without them reads as having no
+//! schema and next Index ID 0. Each Index has its own Catalog entry,
+//! `{ path, unique, state }`, keyed by its Collection and Index IDs
+//! (ADR 0014); its `state` is `"building"` or `"ready"` (ADR 0013).
+//! Changing the schema rewrites the Collection entry, and changing an Index
+//! writes its own entry; a concurrent writer to the Collection read both, so
+//! it aborts with Collection Changed.
 //!
 //! Namespace and Collection IDs are random, and creating one also writes its
 //! ID key, which dropping leaves in place, so an ID is never reused, even by
@@ -23,12 +25,15 @@
 //! the same ID, does, because both Transactions write the same key.
 //!
 //! This module owns the entries and the Namespace and Collection changes.
-//! Schema and Index changes rewrite a Collection's entry too, but live with
+//! Schema and Index changes write Catalog entries too, but live with
 //! their rules in [`crate::schema`] and [`crate::index`].
 //!
 //! Index IDs are counted per Collection by `nextIndexId`, which only grows,
-//! so they are never reused either. Creating an Index rewrites its
-//! Collection's entry anyway, so the counter adds no conflicts.
+//! so they are never reused either. Creating an Index rewrites the
+//! Collection entry to move the counter, so concurrent creates conflict.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::RwLock;
 
 use bson::{Bson, Document, doc};
 use psdb_storage::{KeyRange, StorageEngine};
@@ -37,11 +42,97 @@ use crate::collection_path::CollectionPath;
 use crate::document::{self, validate_name};
 use crate::error::{Error, Result};
 use crate::field_path::FieldPath;
-use crate::index::IndexDef;
+use crate::index::{IndexDef, IndexState};
 use crate::keys;
 use crate::mvcc;
 use crate::schema::{FieldSchema, FieldType, Schema};
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, WriteSet};
+
+/// The newest Version of every Namespace, Collection and Index Catalog
+/// entry, Tombstones included, with its Commit Timestamp. It is complete, so
+/// a key missing from it was never written and is absent at every Snapshot.
+#[derive(Default)]
+pub(crate) struct CatalogCache(RwLock<BTreeMap<Vec<u8>, CachedVersion>>);
+
+/// A Commit Timestamp and the value written then (`None` is a Tombstone).
+type CachedVersion = (u64, Option<Vec<u8>>);
+
+impl CatalogCache {
+    /// The value of the Catalog entry `logical` at `snapshot_ts`, or `None`
+    /// if its newest Version is newer than the Snapshot, so only the engine
+    /// has the answer.
+    pub(crate) fn read_at(&self, logical: &[u8], snapshot_ts: u64) -> Option<Option<Vec<u8>>> {
+        match self.0.read().expect("catalog cache poisoned").get(logical) {
+            None => Some(None),
+            Some((ts, value)) if *ts <= snapshot_ts => Some(value.clone()),
+            Some(_) => None,
+        }
+    }
+
+    /// The live Catalog entries under `prefix` at `snapshot_ts`, or `None`
+    /// if any of them has a Version newer than the Snapshot, so only the
+    /// engine has the answer.
+    pub(crate) fn scan_at(
+        &self,
+        prefix: &[u8],
+        snapshot_ts: u64,
+    ) -> Option<BTreeMap<Vec<u8>, Vec<u8>>> {
+        let cached = self.0.read().expect("catalog cache poisoned");
+        let mut live = BTreeMap::new();
+        for (key, (ts, value)) in cached
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            if *ts > snapshot_ts {
+                return None;
+            }
+            if let Some(value) = value {
+                live.insert(key.clone(), value.clone());
+            }
+        }
+        Some(live)
+    }
+
+    /// Record the Catalog entries in a Write Set committed at `commit_ts`.
+    pub(crate) fn record(&self, commit_ts: u64, write_set: &WriteSet) {
+        // Copied before taking the write lock, so readers wait only for the inserts.
+        let entries: Vec<_> = write_set
+            .iter()
+            .filter(|(key, _)| keys::is_catalog_entry_key(key))
+            .map(|(key, value)| (key.clone(), (commit_ts, value.clone())))
+            .collect();
+        // Most commits write no Catalog entry; they skip the write lock.
+        if entries.is_empty() {
+            return;
+        }
+        self.0
+            .write()
+            .expect("catalog cache poisoned")
+            .extend(entries);
+    }
+
+    /// Forget every Version of `keys`, which Garbage Collection deleted
+    /// from the engine.
+    pub(crate) fn remove(&self, keys: &BTreeSet<Vec<u8>>) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut cached = self.0.write().expect("catalog cache poisoned");
+        for key in keys {
+            cached.remove(key);
+        }
+    }
+
+    /// Forget the Tombstones committed at or before `horizon`: every Snapshot
+    /// from the Horizon on reads their keys as absent either way. A key
+    /// written again since has a newer timestamp, so it stays.
+    pub(crate) fn purge_tombstones(&self, horizon: u64) {
+        self.0
+            .write()
+            .expect("catalog cache poisoned")
+            .retain(|_, (ts, value)| value.is_some() || *ts > horizon);
+    }
+}
 
 /// A Collection's Catalog entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +143,7 @@ pub(crate) struct CollectionEntry {
     pub(crate) name: String,
     pub(crate) id: u32,
     pub(crate) schema: Schema,
+    /// Read from the Indexes' own Catalog entries, not stored in this one.
     pub(crate) indexes: Vec<IndexDef>,
     /// The lowest Index ID never given out in this Collection.
     pub(crate) next_index_id: u32,
@@ -71,17 +163,9 @@ impl CollectionEntry {
                 Some(_) => Err(corrupt(field)),
             }
         };
-        // Stored paths were checked when declared; one that fails now is
-        // corrupt.
-        let path = |item: &Document, what: &str| -> Result<FieldPath> {
-            item.get_str("path")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .ok_or_else(|| corrupt(what))
-        };
         let mut schema = Schema::new();
         for field in list("fields")? {
-            let path = path(&field, "field path")?;
+            let path = read_path(&field).ok_or_else(|| corrupt("field path"))?;
             let field_type = field
                 .get_str("type")
                 .ok()
@@ -92,26 +176,12 @@ impl CollectionEntry {
                 .map_err(|_| corrupt("field strict"))?;
             schema.insert(path, FieldSchema { field_type, strict });
         }
-        let indexes = list("indexes")?
-            .iter()
-            .map(|ix| {
-                Ok(IndexDef {
-                    path: path(ix, "index path")?,
-                    id: read_u32(ix, "id")?,
-                    unique: ix.get_bool("unique").map_err(|_| corrupt("index unique"))?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        // Writes look up each indexed field's type in the schema.
-        if indexes.iter().any(|ix| !schema.contains_key(&ix.path)) {
-            return Err(corrupt("index on an undeclared field"));
-        }
         Ok(Self {
             namespace_id,
             name: doc.get_str("name").map_err(|_| corrupt("name"))?.to_owned(),
             id: read_u32(&doc, "id")?,
             schema,
-            indexes,
+            indexes: Vec::new(),
             next_index_id: match doc.get("nextIndexId") {
                 None => 0,
                 Some(_) => read_u32(&doc, "nextIndexId")?,
@@ -129,21 +199,43 @@ impl CollectionEntry {
                 )
             })
             .collect();
-        let indexes: Vec<Bson> = self
-            .indexes
-            .iter()
-            .map(|ix| {
-                Bson::Document(
-                    doc! { "path": ix.path.as_str(), "id": i64::from(ix.id), "unique": ix.unique },
-                )
-            })
-            .collect();
         encode(&doc! {
             "name": &self.name,
             "id": i64::from(self.id),
             "fields": fields,
-            "indexes": indexes,
             "nextIndexId": i64::from(self.next_index_id),
+        })
+    }
+
+    /// Decode the Index Catalog entry at `key`, whose last four bytes are the
+    /// Index ID.
+    fn decode_index(key: &[u8], bytes: &[u8]) -> Result<IndexDef> {
+        let doc = document::decode(bytes)?;
+        let corrupt = |what: &str| Error::Corruption(format!("index catalog entry {what}"));
+        let id = key
+            .last_chunk::<4>()
+            .map(|id| u32::from_be_bytes(*id))
+            .ok_or_else(|| corrupt("key"))?;
+        Ok(IndexDef {
+            path: read_path(&doc).ok_or_else(|| corrupt("path"))?,
+            id,
+            unique: doc.get_bool("unique").map_err(|_| corrupt("unique"))?,
+            state: match doc.get_str("state") {
+                Ok("building") => IndexState::Building,
+                Ok("ready") => IndexState::Ready,
+                _ => return Err(corrupt("state")),
+            },
+        })
+    }
+
+    fn encode_index(index: &IndexDef) -> Vec<u8> {
+        encode(&doc! {
+            "path": index.path.as_str(),
+            "unique": index.unique,
+            "state": match index.state {
+                IndexState::Building => "building",
+                IndexState::Ready => "ready",
+            },
         })
     }
 
@@ -171,8 +263,8 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// Drop a Namespace. Its Collections become unreachable: their Catalog
-    /// entries and Documents stay behind under the old IDs until garbage
-    /// collection exists.
+    /// entries and Documents stay behind under the old IDs until Garbage
+    /// Collection reclaims them.
     pub fn drop_namespace(&mut self, name: &str) -> Result<()> {
         self.resolve_namespace(name)?;
         self.write(keys::namespace_entry_key(name), None)
@@ -198,7 +290,7 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// Drop a Collection. Its Documents become unreachable and stay behind
-    /// until garbage collection exists.
+    /// until Garbage Collection reclaims them.
     pub fn drop_collection(&mut self, collection: &CollectionPath) -> Result<()> {
         let (ns_id, _) = self.resolve_collection(collection)?;
         self.write(
@@ -235,8 +327,9 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// The Collection's entry, with its schema and Indexes, as this
-    /// Transaction sees it. Records the dependencies on both the Namespace
-    /// and the Collection.
+    /// Transaction sees it. Records the dependencies on the Namespace, the
+    /// Collection and every Index, so a writer aborts if any of them changes
+    /// (ADR 0014).
     pub(crate) fn collection_entry(
         &mut self,
         collection: &CollectionPath,
@@ -247,9 +340,20 @@ impl<E: StorageEngine> Transaction<'_, E> {
             .read(&key)?
             .ok_or_else(|| Error::NoSuchCollection(collection.clone()))?;
         self.depend_on_catalog_entry(key);
-        CollectionEntry::decode(ns_id, &value)
+        let mut entry = CollectionEntry::decode(ns_id, &value)?;
+        for (key, bytes) in self.scan(&keys::index_catalog_prefix(ns_id, entry.id))? {
+            let index = CollectionEntry::decode_index(&key, &bytes)?;
+            // Writes look up each indexed field's type in the schema.
+            if !entry.schema.contains_key(&index.path) {
+                return Err(Error::Corruption("index on an undeclared field".into()));
+            }
+            entry.indexes.push(index);
+            self.depend_on_catalog_entry(key);
+        }
+        Ok(entry)
     }
 
+    /// Rewrite the Collection's entry: its schema and `nextIndexId`.
     pub(crate) fn write_collection_entry(&mut self, entry: &CollectionEntry) -> Result<()> {
         self.write(
             keys::collection_entry_key(entry.namespace_id, &entry.name),
@@ -257,11 +361,39 @@ impl<E: StorageEngine> Transaction<'_, E> {
         )
     }
 
+    /// Write `index`'s Catalog entry in the Collection `entry`.
+    pub(crate) fn write_index_entry(
+        &mut self,
+        entry: &CollectionEntry,
+        index: &IndexDef,
+    ) -> Result<()> {
+        self.write(
+            keys::index_catalog_key(entry.namespace_id, entry.id, index.id),
+            Some(CollectionEntry::encode_index(index)),
+        )
+    }
+
+    /// Write a Tombstone on `index`'s Catalog entry in the Collection `entry`.
+    pub(crate) fn drop_index_entry(
+        &mut self,
+        entry: &CollectionEntry,
+        index: &IndexDef,
+    ) -> Result<()> {
+        self.write(
+            keys::index_catalog_key(entry.namespace_id, entry.id, index.id),
+            None,
+        )
+    }
+
     /// A random ID for a new Namespace (`namespace_id: None`) or for a new
     /// Collection in the Namespace `namespace_id`. Indexes are numbered per
     /// Collection instead.
     fn allocate_id(&mut self, namespace_id: Option<u32>) -> Result<u32> {
-        self.allocate_id_from(std::iter::repeat_with(random_id), namespace_id)
+        let node = self.node;
+        self.allocate_id_from(
+            std::iter::repeat_with(|| (node.id_generator.catalog_id)()),
+            namespace_id,
+        )
     }
 
     /// The first of `candidates` whose ID key was never written, at any
@@ -299,16 +431,12 @@ fn pick_unused(
     Err(Error::IdsExhausted)
 }
 
-/// A random 32-bit ID.
-fn random_id() -> u32 {
-    getrandom::u32().expect("the OS random number generator failed")
-}
-
 fn entry(name: &str, id: u32) -> Vec<u8> {
     encode(&doc! { "name": name, "id": i64::from(id) })
 }
 
-fn entry_id(bytes: &[u8]) -> Result<u32> {
+/// The ID in a Namespace or Collection entry.
+pub(crate) fn entry_id(bytes: &[u8]) -> Result<u32> {
     read_u32(&document::decode(bytes)?, "id")
 }
 
@@ -317,6 +445,12 @@ fn entry_name(bytes: &[u8]) -> Result<String> {
         .get_str("name")
         .map(str::to_owned)
         .map_err(|e| Error::Corruption(format!("catalog entry name: {e}")))
+}
+
+/// The `path` field of a schema field or an Index. Stored paths were checked
+/// when declared, so `None` means the entry is corrupt.
+fn read_path(doc: &Document) -> Option<FieldPath> {
+    doc.get_str("path").ok().and_then(|p| p.parse().ok())
 }
 
 fn read_u32(doc: &Document, field: &str) -> Result<u32> {
@@ -342,10 +476,66 @@ mod tests {
     use crate::Node;
 
     #[test]
+    fn catalog_cache_answers_misses_and_defers_newer_entries_to_the_engine() {
+        let cache = CatalogCache::default();
+        let shop = keys::namespace_entry_key("shop");
+        assert_eq!(cache.read_at(&shop, 0), Some(None), "never written: absent");
+
+        let write_set = WriteSet::from([
+            (shop.clone(), Some(entry("shop", 7))),
+            (keys::namespace_id_key(7), Some(Vec::new())),
+        ]);
+        cache.record(5, &write_set);
+        assert_eq!(cache.read_at(&shop, 4), None, "newer than the Snapshot");
+        assert_eq!(cache.read_at(&shop, 5), Some(Some(entry("shop", 7))));
+        assert!(!keys::is_catalog_entry_key(&keys::namespace_id_key(7)));
+        assert!(keys::is_catalog_entry_key(&keys::collection_entry_key(
+            7, "orders"
+        )));
+    }
+
+    #[test]
+    fn catalog_cache_lists_a_collections_indexes_or_defers_to_the_engine() {
+        let cache = CatalogCache::default();
+        let prefix = keys::index_catalog_prefix(7, 9);
+        let (ix0, ix1) = (
+            keys::index_catalog_key(7, 9, 0),
+            keys::index_catalog_key(7, 9, 1),
+        );
+        cache.record(3, &WriteSet::from([(ix0.clone(), Some(vec![1]))]));
+        cache.record(5, &WriteSet::from([(ix1.clone(), Some(vec![2]))]));
+        cache.record(6, &WriteSet::from([(ix0, None)]));
+        let other = keys::index_catalog_key(7, 10, 0);
+        cache.record(8, &WriteSet::from([(other, Some(vec![3]))]));
+
+        assert_eq!(cache.scan_at(&prefix, 5), None, "Index 0 dropped since");
+        assert_eq!(
+            cache.scan_at(&prefix, 6),
+            Some(BTreeMap::from([(ix1, vec![2])])),
+            "Tombstones are left out; other Collections are not listed"
+        );
+    }
+
+    #[test]
+    fn purging_forgets_only_tombstones_at_or_below_the_horizon() {
+        let cache = CatalogCache::default();
+        let shop = keys::namespace_entry_key("shop");
+        let toys = keys::namespace_entry_key("toys");
+        cache.record(3, &WriteSet::from([(toys.clone(), Some(entry("toys", 8)))]));
+        cache.record(4, &WriteSet::from([(shop.clone(), None)]));
+        cache.record(6, &WriteSet::from([(toys.clone(), None)]));
+
+        cache.purge_tombstones(5);
+        let cached = cache.0.read().unwrap();
+        assert!(!cached.contains_key(&shop), "dropped before the Horizon");
+        assert_eq!(cached.get(&toys), Some(&(6, None)), "dropped after it");
+    }
+
+    #[test]
     fn id_of_an_empty_namespace_is_in_use() {
         let node = Node::new(MemoryEngine::new()).unwrap();
         node.create_namespace("shop").unwrap();
-        let mut txn = node.begin();
+        let mut txn = node.begin_transaction();
         let taken = txn.resolve_namespace("shop").unwrap();
         assert_eq!(txn.allocate_id_from([taken, 7], None).unwrap(), 7);
     }
@@ -356,7 +546,7 @@ mod tests {
         node.create_namespace("shop").unwrap();
         let orders = "shop.orders".parse().unwrap();
         node.create_collection(&orders).unwrap();
-        let mut txn = node.begin();
+        let mut txn = node.begin_transaction();
         let (ns_id, taken) = txn.resolve_collection(&orders).unwrap();
         assert_eq!(txn.allocate_id_from([taken, 7], Some(ns_id)).unwrap(), 7);
     }
@@ -374,7 +564,7 @@ mod tests {
         let n = "n".parse().unwrap();
         node.set_field_type(&orders, &n, int).unwrap();
         let index_ids = || {
-            let entry = node.begin().collection_entry(&orders).unwrap();
+            let entry = node.begin_transaction().collection_entry(&orders).unwrap();
             entry.indexes.iter().map(|ix| ix.id).collect::<Vec<_>>()
         };
         node.create_index(&orders, &n, false).unwrap();
@@ -388,7 +578,7 @@ mod tests {
     #[test]
     fn concurrent_draws_of_one_id_conflict() {
         let node = Node::new(MemoryEngine::new()).unwrap();
-        let (mut t1, mut t2) = (node.begin(), node.begin());
+        let (mut t1, mut t2) = (node.begin_transaction(), node.begin_transaction());
         t1.allocate_id_from([7], None).unwrap();
         t2.allocate_id_from([7], None).unwrap();
         t1.commit().unwrap();

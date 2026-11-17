@@ -8,6 +8,7 @@ A document database in Rust, built as a learning and research project: correctne
 
 ```
 cargo run -p psdb-cli
+scripts/seed.sh && cargo run -p psdb-cli -- --data-dir data   # with mock shop data
 cargo test --workspace
 ```
 
