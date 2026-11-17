@@ -4,9 +4,11 @@ mod common;
 
 use common::collection;
 
-use bson::{Bson, doc, oid::ObjectId, spec::BinarySubtype};
-use psdb_core::{Error, Limits, Node};
+use bson::{Binary, Bson, doc, oid::ObjectId, spec::BinarySubtype};
+use psdb_core::wal::SimDisk;
+use psdb_core::{Error, IdGenerator, Limits, Node};
 use psdb_storage_memory::MemoryEngine;
+use uuid::Uuid;
 
 #[test]
 fn insert_get_replace_delete() {
@@ -43,6 +45,32 @@ fn insert_get_replace_delete() {
             .replace(&collection("shop.orders"), &id, doc! {})
             .unwrap(),
         "replace never creates"
+    );
+}
+
+#[test]
+fn generated_ids_come_from_the_injected_generator() {
+    let fixed = Uuid::from_u128(42);
+    let id_generator = IdGenerator {
+        document_id: Box::new(move || fixed),
+        ..IdGenerator::default()
+    };
+    let node = Node::open_with(
+        MemoryEngine::new(),
+        SimDisk::new().file(),
+        Limits::default(),
+        id_generator,
+    )
+    .unwrap();
+    node.create_namespace("shop").unwrap();
+    node.create_collection(&collection("shop.orders")).unwrap();
+    let id = node.insert(&collection("shop.orders"), doc! {}).unwrap();
+    assert_eq!(
+        id,
+        Bson::Binary(Binary {
+            subtype: BinarySubtype::Uuid,
+            bytes: fixed.as_bytes().to_vec(),
+        })
     );
 }
 
