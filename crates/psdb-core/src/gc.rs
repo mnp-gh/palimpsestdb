@@ -77,6 +77,7 @@ impl<E: StorageEngine> Node<E> {
                 start: keys::namespaces_prefix(),
                 end: None,
             },
+            batch_keys: BATCH_KEYS,
             current: Vec::new(),
             seen_newest: false,
             dead_id_follows: false,
@@ -101,6 +102,8 @@ pub struct GcPass<'node, E: StorageEngine> {
     stats: GcStats,
     /// The keys not yet visited.
     range: KeyRange,
+    /// [`BATCH_KEYS`], unless a test sets it.
+    batch_keys: usize,
     /// The logical key being visited, and whether its newest Version at
     /// the Horizon was already seen.
     current: Vec<u8>,
@@ -126,6 +129,14 @@ pub struct GcPass<'node, E: StorageEngine> {
 }
 
 impl<E: StorageEngine> GcPass<'_, E> {
+    /// Close each batch at the first logical key after visiting `n`
+    /// physical keys, so tests can commit between small batches.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_batch_keys(mut self, n: usize) -> Self {
+        self.batch_keys = n;
+        self
+    }
+
     /// Delete the next batch of keys; once every key is visited, finish
     /// the pass and return what it removed.
     ///
@@ -137,6 +148,7 @@ impl<E: StorageEngine> GcPass<'_, E> {
             horizon,
             stats,
             range,
+            batch_keys,
             current,
             seen_newest,
             dead_id_follows,
@@ -166,7 +178,7 @@ impl<E: StorageEngine> GcPass<'_, E> {
             if logical != current.as_slice() {
                 // Close the batch only between keys: deleting a Tombstone
                 // without the Versions under it would show them to readers.
-                if visited > BATCH_KEYS {
+                if visited > *batch_keys {
                     next_start = Some(key.to_vec());
                     return ControlFlow::Break(());
                 }

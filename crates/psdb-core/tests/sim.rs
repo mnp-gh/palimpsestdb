@@ -341,7 +341,9 @@ fn run(
             },
             Action::StartGc => {
                 if gc.is_none() {
-                    gc = Some(node.start_garbage_collection());
+                    // Small batches, so commits and crashes land between them;
+                    // smaller ones rarely get past the Catalog before a crash.
+                    gc = Some(node.start_garbage_collection().with_batch_keys(8));
                 }
             }
             Action::GcStep => {
