@@ -1,6 +1,6 @@
 # v0.4.1: Catalog from engine
 
-Status: ready-for-agent
+Status: ready-for-human (implemented on `v0.4.1-catalog-from-engine`)
 
 Refactor with no behaviour change. Recovery fills the Catalog cache from the Storage Engine instead of from replayed WAL Records, so v0.4.2 can replay only part of the WAL. Terms follow [GLOSSARY.md](../../GLOSSARY.md).
 
