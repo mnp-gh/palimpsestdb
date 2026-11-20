@@ -33,6 +33,7 @@
 //! Collection entry to move the counter, so concurrent creates conflict.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 use std::sync::RwLock;
 
 use bson::{Bson, Document, doc};
@@ -58,6 +59,37 @@ pub(crate) struct CatalogCache(RwLock<BTreeMap<Vec<u8>, CachedVersion>>);
 type CachedVersion = (u64, Option<Vec<u8>>);
 
 impl CatalogCache {
+    /// The newest Version of every Catalog entry in `engine`, Tombstones
+    /// included.
+    pub(crate) fn load<E: StorageEngine>(engine: &E) -> Result<Self> {
+        let mut cached = BTreeMap::new();
+        let mut failure = None;
+        let system = KeyRange::prefix(&keys::SYSTEM_NAMESPACE.to_be_bytes());
+        engine.scan(&system, &mut |key, value| {
+            // The check reads only the first 8 bytes, so it works on physical keys.
+            if !keys::is_catalog_entry_key(key) {
+                return ControlFlow::Continue(());
+            }
+            let version = keys::split_physical(key)
+                .and_then(|(logical, ts)| Ok((logical.to_vec(), (ts, mvcc::decode_value(value)?))));
+            match version {
+                // Versions are newest first: keep the first of each key.
+                Ok((logical, version)) => {
+                    cached.entry(logical).or_insert(version);
+                    ControlFlow::Continue(())
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    ControlFlow::Break(())
+                }
+            }
+        })?;
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(Self(RwLock::new(cached))),
+        }
+    }
+
     /// The value of the Catalog entry `logical` at `snapshot_ts`, or `None`
     /// if its newest Version is newer than the Snapshot, so only the engine
     /// has the answer.
@@ -529,6 +561,34 @@ mod tests {
         let cached = cache.0.read().unwrap();
         assert!(!cached.contains_key(&shop), "dropped before the Horizon");
         assert_eq!(cached.get(&toys), Some(&(6, None)), "dropped after it");
+    }
+
+    #[test]
+    fn reopen_loads_the_cache_from_the_engine_tombstones_included() {
+        let disk = crate::wal::SimDisk::new();
+        let open = || {
+            Node::open_with(
+                MemoryEngine::new(),
+                disk.file(),
+                crate::Limits::default(),
+                crate::IdGenerator::default(),
+            )
+            .unwrap()
+        };
+        let node = open();
+        node.create_namespace("shop").unwrap();
+        let orders: CollectionPath = "shop.orders".parse().unwrap();
+        node.create_collection(&orders).unwrap();
+        let namespace_id = node.begin_transaction().resolve_namespace("shop").unwrap();
+        node.drop_collection(&orders).unwrap();
+        let dropped_at = node.latest_visible_commit_ts();
+        drop(node);
+
+        let node = open();
+        let entry = keys::collection_entry_key(namespace_id, "orders");
+        let cached = node.catalog_cache.0.read().unwrap();
+        assert_eq!(cached.get(&entry), Some(&(dropped_at, None)));
+        assert!(cached.contains_key(&keys::namespace_entry_key("shop")));
     }
 
     #[test]
