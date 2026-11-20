@@ -228,16 +228,15 @@ impl<E: StorageEngine> Node<E> {
             return Err(Error::EngineNotEmpty);
         }
         let (wal, records) = Wal::open(Box::new(wal))?;
-        let catalog_cache = CatalogCache::default();
         let mut last = 0;
         for record in &records {
             engine.write_batch(mvcc::commit_batch(
                 record.commit_ts,
                 transaction::writes(&record.write_set),
             ))?;
-            catalog_cache.record(record.commit_ts, &record.write_set);
             last = record.commit_ts;
         }
+        let catalog_cache = CatalogCache::load(&engine)?;
         let node = Self::from_parts(engine, limits, id_generator, last, Some(wal), catalog_cache);
         node.drop_building_indexes()?;
         Ok(node)
