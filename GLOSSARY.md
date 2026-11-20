@@ -166,8 +166,12 @@ One committed Transaction in the WAL: its Commit Timestamp and Write Set. Aborte
 _Avoid_: Log entry, journal entry
 
 **Recovery**:
-Replaying the WAL into the Storage Engine when a Node opens, then dropping every Index still Building, since no build survives a restart. A torn last WAL Record is cut off; damage anywhere else stops the Node from opening rather than lose Durable Transactions.
+Bringing the Storage Engine level with the WAL when a Node opens: replaying every WAL Record not yet Applied, then dropping every Index still Building, since no build survives a restart. The Storage Engine may be behind the WAL after a crash, never ahead; if it is ahead, the Node does not open. A torn last WAL Record is cut off; damage anywhere else stops the Node from opening rather than lose Durable Transactions.
 _Avoid_: Restore, repair
+
+**Checkpoint**:
+Making the Storage Engine durable up to a point, then cutting the WAL Records it no longer needs. The WAL remembers where it was cut, so Recovery can still tell an engine that is level with the WAL from one that is ahead of it.
+_Avoid_: Snapshot (that is what a Transaction reads), trim (when the whole step is meant), compaction
 
 **Durable**:
 A Transaction is Durable once its commit is guaranteed to survive a crash.

@@ -8,7 +8,11 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | v0.2 | Durability | Done |
 | v0.3 | Indexes | Done |
 | v0.4 | Concurrency | Done |
-| v0.4.1 | Persistent engine | Planned |
+| v0.4.1 | Catalog from engine | Planned |
+| v0.4.2 | Resume Recovery | Planned |
+| v0.4.3 | Streaming find | Planned |
+| v0.4.4 | Persistent engine | Planned |
+| v0.4.5 | Checkpoint | Planned |
 | v0.5 | Serializable | Planned |
 | v0.6 | Server | Planned |
 | v0.7 | Access | Planned |
@@ -63,11 +67,30 @@ A single-threaded library with no network, no durability and no garbage collecti
 - The commit-time check for strict-field changes and Index creation on empty Collections compares a per-Collection timestamp of the last Document commit instead of scanning the Collection under the commit lock
 - Document ID and Catalog ID seams (`IdGenerator`, passed to `Node::open_with`); deterministic simulator over the simulated WAL disk, interleaving Transactions, Index build chunks, GC steps and crashes
 
-## v0.4.1: Persistent engine
+## v0.4.1: Catalog from engine
 
-- `fjall` Storage Engine, passing the conformance suite, with block compression (LZ4 or zstd) enabled
-- Streaming scans: `find` iterates instead of loading the whole Collection into memory
-- Recovery replays only WAL Records above the engine's `applied_up_to` (today it replays the whole WAL into an empty engine). The Catalog cache is filled by replay today, so it must then be filled by scanning the engine's Catalog entries, Tombstones included
+- Refactor, no behaviour change: after replay, `open` fills the Catalog cache by scanning the engine's Catalog entries, Tombstones included, instead of recording each replayed WAL Record. Prepares Recovery that replays only part of the WAL
+
+## v0.4.2: Resume Recovery
+
+- Recovery replays only WAL Records above the engine's `applied_up_to` and accepts an engine that already holds data ([ADR 0015](./adr/0015-wal-is-the-authority-engine-may-lag.md)). An engine ahead of the WAL, or a non-empty engine without `applied_up_to`, is Corruption; `EngineNotEmpty` goes
+- Storage Engine contract: a `write_batch` survives a crash whole or not at all, and the batches that survive are a prefix of those written
+- `Arc<E>` is a Storage Engine, so tests reopen the same `MemoryEngine`; the simulator rebuilds the engine from a random prefix of its batches on each crash
+
+## v0.4.3: Streaming find
+
+- `find`, `scan` and `scan_range` return iterators built from chunked rescans at the Snapshot (chunk size in `Limits`); the Storage Engine trait is unchanged. Results stay in Document ID order; Index plans buffer candidate keys, not Documents
+
+## v0.4.4: Persistent engine
+
+- `fjall` Storage Engine in its own crate, one partition, LZ4 block compression; `write_batch` writes the journal unsynced, `flush` syncs
+- Conformance suite gains reopen checks (`run_reopen`) next to `run_all`
+
+## v0.4.5: Checkpoint
+
+- Explicit `Node::checkpoint()`: under the commit lock, flush the engine, then replace the WAL with a header recording `trimmed_up_to` (new file, sync, rename, directory sync); WAL format version bumps ([ADR 0015](./adr/0015-wal-is-the-authority-engine-may-lag.md))
+- Only an engine whose `is_durable()` is true may be checkpointed (the in-memory engine is not); in the simulator a flush raises the shortest prefix a crash may keep
+- Running Checkpoints automatically waits for v0.6
 
 ## v0.5: Serializable
 
@@ -79,7 +102,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 - `tokio` network front end ([ADR 0007](./adr/0007-runtime-model.md)) with its own wire protocol ([ADR 0003](./adr/0003-own-wire-protocol.md))
 - Rust client with a retrying `with_transaction` helper; CLI over the network
-- Group-commit thread, checkpoints, CPU thread pool
+- Group-commit thread, automatic Checkpoints, CPU thread pool
 
 ## v0.7: Access
 
