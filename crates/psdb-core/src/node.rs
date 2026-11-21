@@ -157,33 +157,24 @@ impl CommitState {
 }
 
 impl<E: StorageEngine> Node<E> {
-    /// Open over an empty engine with default [`Limits`], keeping nothing
-    /// durable. Fails with [`Error::EngineNotEmpty`] if the engine holds
-    /// data: its Versions would clash with the Commit Timestamps this Node
-    /// gives out, which start again from the beginning.
+    /// Open over `engine` with default [`Limits`], keeping nothing
+    /// durable. An engine that already holds data, such as one shared
+    /// through an `Arc` with a Node now dropped, is reopened where it left
+    /// off. Fails with [`Error::Corruption`] if it holds data without
+    /// `applied_up_to`.
     pub fn new(engine: E) -> Result<Self> {
         Self::with_limits(engine, Limits::default())
     }
 
-    /// Open over an empty engine with custom [`Limits`], keeping nothing
+    /// Open over `engine` with custom [`Limits`], keeping nothing
     /// durable. Fails as [`new`](Self::new) does.
     pub fn with_limits(engine: E, limits: Limits) -> Result<Self> {
-        if mvcc::any_version_under(&engine, &[])? {
-            return Err(Error::EngineNotEmpty);
-        }
-        Ok(Self::from_parts(
-            engine,
-            limits,
-            IdGenerator::default(),
-            0,
-            None,
-            CatalogCache::default(),
-        ))
+        Self::recover(engine, limits, IdGenerator::default(), None)
     }
 
     /// Open a durable Node whose WAL lives in `dir`, creating `dir` and
-    /// the WAL if needed, and replay the WAL into `engine`, which must be
-    /// empty. Fails with [`Error::Io`] if another Node has `dir` open.
+    /// the WAL if needed, and replay into `engine` the WAL Records it does
+    /// not hold yet. Fails with [`Error::Io`] if another Node has `dir` open.
     ///
     /// ```
     /// use bson::doc;
@@ -212,32 +203,53 @@ impl<E: StorageEngine> Node<E> {
 
     /// Open a durable Node over any [`WalFile`], such as a `SimDisk` file
     /// in tests (feature `testing`), taking new IDs from `id_generator`, and replay
-    /// the WAL into `engine`, which must be empty.
+    /// into `engine` the WAL Records above its `applied_up_to` (ADR 0015).
     ///
-    /// Fails with [`Error::EngineNotEmpty`], [`Error::UnrecognisedWal`] or
-    /// [`Error::Corruption`] without changing the WAL. On success, a torn
-    /// write at the WAL's end has been truncated, and a WAL cut off while
-    /// being created has been rewritten.
+    /// Fails with [`Error::UnrecognisedWal`], or with [`Error::Corruption`]
+    /// for a damaged WAL, an engine that holds data without
+    /// `applied_up_to`, or an engine ahead of the WAL, without changing any
+    /// WAL Record. A torn write at the WAL's end is truncated, and a WAL
+    /// cut off while being created is rewritten.
     pub fn open_with(
         engine: E,
         wal: impl WalFile + 'static,
         limits: Limits,
         id_generator: IdGenerator,
     ) -> Result<Self> {
-        if mvcc::any_version_under(&engine, &[])? {
-            return Err(Error::EngineNotEmpty);
-        }
-        let (wal, records) = Wal::open(Box::new(wal))?;
-        let mut last = 0;
-        for record in &records {
-            engine.write_batch(mvcc::commit_batch(
-                record.commit_ts,
-                transaction::writes(&record.write_set),
-            ))?;
-            last = record.commit_ts;
-        }
+        let wal = Wal::open(Box::new(wal))?;
+        Self::recover(engine, limits, id_generator, Some(wal))
+    }
+
+    /// Bring `engine` level with the WAL, if any, by replaying the Records
+    /// above its `applied_up_to`, then fill the Catalog cache from it.
+    fn recover(
+        engine: E,
+        limits: Limits,
+        id_generator: IdGenerator,
+        wal: Option<(Wal, Vec<wal::Record>)>,
+    ) -> Result<Self> {
+        let mut last = mvcc::applied_up_to(&engine)?;
+        let wal = match wal {
+            None => None,
+            Some((wal, records)) => {
+                let wal_last = records.last().map_or(0, |r| r.commit_ts);
+                if last > wal_last {
+                    return Err(Error::Corruption(format!(
+                        "the storage engine holds commits up to {last}, past the WAL's last Record {wal_last}"
+                    )));
+                }
+                for record in records.iter().filter(|r| r.commit_ts > last) {
+                    engine.write_batch(mvcc::commit_batch(
+                        record.commit_ts,
+                        transaction::writes(&record.write_set),
+                    ))?;
+                }
+                last = wal_last;
+                Some(wal)
+            }
+        };
         let catalog_cache = CatalogCache::load(&engine)?;
-        let node = Self::from_parts(engine, limits, id_generator, last, Some(wal), catalog_cache);
+        let node = Self::from_parts(engine, limits, id_generator, last, wal, catalog_cache);
         node.drop_building_indexes()?;
         Ok(node)
     }

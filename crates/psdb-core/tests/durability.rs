@@ -4,10 +4,13 @@ mod common;
 
 use common::{collection, durable_shop, open};
 
+use std::ops::ControlFlow;
+use std::sync::Arc;
+
 use bson::{Bson, doc};
 use psdb_core::wal::SimDisk;
 use psdb_core::{Error, FieldPath, FieldSchema, FieldType, IdGenerator, Limits, Node};
-use psdb_storage::{StorageEngine, WriteBatch};
+use psdb_storage::{KeyRange, StorageEngine, WriteBatch};
 use psdb_storage_memory::MemoryEngine;
 
 #[test]
@@ -69,26 +72,124 @@ fn a_data_directory_is_open_in_one_node_at_a_time() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A durable Node over `engine` and the WAL on `disk`.
+fn open_shared(
+    engine: &Arc<MemoryEngine>,
+    disk: &SimDisk,
+) -> psdb_core::Result<Node<Arc<MemoryEngine>>> {
+    Node::open_with(
+        Arc::clone(engine),
+        disk.file(),
+        Limits::default(),
+        IdGenerator::default(),
+    )
+}
+
+/// Every key and value in `engine`.
+fn contents(engine: &MemoryEngine) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut all = Vec::new();
+    engine
+        .scan(&KeyRange::all(), &mut |k, v| {
+            all.push((k.to_vec(), v.to_vec()));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    all
+}
+
 #[test]
-fn engine_with_data_is_refused() {
-    let with_data = || {
-        let engine = MemoryEngine::new();
-        let mut batch = WriteBatch::new();
-        batch.put(b"k".to_vec(), b"v".to_vec());
-        engine.write_batch(batch).unwrap();
-        engine
-    };
+fn reopen_over_the_same_engine_replays_only_newer_records() {
+    let (engine, disk) = (Arc::new(MemoryEngine::new()), SimDisk::new());
+    let node = open_shared(&engine, &disk).unwrap();
+    node.create_namespace("shop").unwrap();
+    node.create_collection(&collection("shop.orders")).unwrap();
+    node.insert(&collection("shop.orders"), doc! { "_id": 1 })
+        .unwrap();
+    node.delete(&collection("shop.orders"), &Bson::Int32(1))
+        .unwrap();
+    let mut txn = node.begin_transaction();
+    txn.insert(&collection("shop.orders"), doc! { "_id": 2 })
+        .unwrap();
+    let last = txn.commit().unwrap();
+    // Removes `_id: 1`'s Versions; replaying its WAL Records would bring them back.
+    node.collect_garbage().unwrap();
+    let before = contents(&engine);
+    drop(node);
+
+    let node = open_shared(&engine, &disk).unwrap();
+    assert_eq!(contents(&engine), before, "nothing replayed");
+    let mut txn = node.begin_transaction();
+    txn.insert(&collection("shop.orders"), doc! { "_id": 3 })
+        .unwrap();
+    assert_eq!(txn.commit().unwrap(), last + 1);
+    drop(node);
+
+    // The WAL agrees: a fresh engine replays every Record.
+    let node = open(&disk).unwrap();
+    assert_eq!(
+        node.find(&collection("shop.orders"), &doc! {}).unwrap(),
+        [doc! { "_id": 2 }, doc! { "_id": 3 }]
+    );
+}
+
+#[test]
+fn reopen_over_a_lagging_engine_replays_what_it_lacks() {
     let disk = SimDisk::new();
+    let node = durable_shop(&disk);
+    drop(node);
+    // An engine that holds the first two commits only, as a crash may leave it.
+    let engine = Arc::new(MemoryEngine::new());
+    let node = open_shared(&engine, &disk).unwrap();
+    drop(node);
+    let node = open(&disk).unwrap();
+    node.insert(&collection("shop.orders"), doc! { "_id": 1 })
+        .unwrap();
+    drop(node);
+
+    let node = open_shared(&engine, &disk).unwrap();
+    assert_eq!(
+        node.find(&collection("shop.orders"), &doc! {}).unwrap(),
+        [doc! { "_id": 1 }]
+    );
+}
+
+#[test]
+fn engine_ahead_of_the_wal_or_without_applied_up_to_is_refused() {
+    let engine = Arc::new(MemoryEngine::new());
+    durable_shop_over(&engine, &SimDisk::new());
     assert!(matches!(
-        Node::open_with(
-            with_data(),
-            disk.file(),
-            Limits::default(),
-            IdGenerator::default()
-        ),
-        Err(Error::EngineNotEmpty)
+        open_shared(&engine, &SimDisk::new()),
+        Err(Error::Corruption(_))
     ));
-    assert!(matches!(Node::new(with_data()), Err(Error::EngineNotEmpty)));
+
+    let with_data = MemoryEngine::new();
+    let mut batch = WriteBatch::new();
+    batch.put(b"k".to_vec(), b"v".to_vec());
+    with_data.write_batch(batch).unwrap();
+    let with_data = Arc::new(with_data);
+    assert!(matches!(
+        open_shared(&with_data, &SimDisk::new()),
+        Err(Error::Corruption(_))
+    ));
+    assert!(matches!(Node::new(with_data), Err(Error::Corruption(_))));
+}
+
+#[test]
+fn a_node_without_a_wal_reopens_its_engine() {
+    let engine = Arc::new(MemoryEngine::new());
+    let node = Node::new(Arc::clone(&engine)).unwrap();
+    node.create_namespace("shop").unwrap();
+    drop(node);
+    let node = Node::new(engine).unwrap();
+    assert_eq!(node.list_namespaces().unwrap(), ["shop"]);
+    node.create_namespace("toys").unwrap();
+}
+
+/// Create `shop.orders` in a durable Node over `engine`, then drop it.
+fn durable_shop_over(engine: &Arc<MemoryEngine>, disk: &SimDisk) {
+    let node = open_shared(engine, disk).unwrap();
+    node.create_namespace("shop").unwrap();
+    node.create_collection(&collection("shop.orders")).unwrap();
 }
 
 #[test]

@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 pub mod conformance;
 
@@ -232,4 +233,24 @@ pub trait StorageEngine: Send + Sync {
     /// Make every batch written so far durable. A no-op for engines that
     /// keep nothing on disk.
     fn flush(&self) -> Result<()>;
+}
+
+/// A shared engine, so a Node can be reopened over the engine a dropped
+/// one used.
+impl<E: StorageEngine + ?Sized> StorageEngine for Arc<E> {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        (**self).get(key)
+    }
+
+    fn scan(&self, range: &KeyRange, visit: &mut ScanVisitor<'_>) -> Result<()> {
+        (**self).scan(range, visit)
+    }
+
+    fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        (**self).write_batch(batch)
+    }
+
+    fn flush(&self) -> Result<()> {
+        (**self).flush()
+    }
 }
