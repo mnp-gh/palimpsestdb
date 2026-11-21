@@ -56,7 +56,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 
 ## Flows
 
-**Opening.** `Node::open` opens the WAL file and locks it, so a second Node on the same directory fails to open. `Wal::open` reads every record, truncates a torn one at the end, and fsyncs the file, so no record it returns can be lost to a later power cut. `Node::open_with` writes each record into the empty engine with `mvcc::commit_batch` and records its Catalog entries in the Catalog cache, and the last record's Commit Timestamp becomes the next Snapshot. `Node::new` skips all of this and keeps nothing durable; it too refuses an engine that holds data.
+**Opening.** `Node::open` opens the WAL file and locks it, so a second Node on the same directory fails to open. `Wal::open` reads every record, truncates a torn one at the end, and fsyncs the file, so no record it returns can be lost to a later power cut. `Node::open_with` reads the engine's `applied_up_to` (0 for an empty engine) and writes each record above it into the engine with `mvcc::commit_batch`, then fills the Catalog cache from the engine, and the last record's Commit Timestamp becomes the next Snapshot (ADR 0015). An engine ahead of the WAL, or one that holds data without `applied_up_to`, is Corruption. `Node::new` skips the WAL and keeps nothing durable; it resumes from the engine's `applied_up_to`.
 
 **Beginning** (`Node::begin_transaction`) never takes the commit lock. Under the Snapshot registry's own lock it loads `latest_visible_commit_ts` and registers that Snapshot; dropping the Transaction unregisters it. `Node::horizon` reads the oldest registered Snapshot under the same lock, so no Snapshot registers below a Horizon already handed out.
 

@@ -42,6 +42,21 @@ pub(crate) fn commit_batch<'a>(
     batch
 }
 
+/// The Commit Timestamp of the newest commit Applied to `engine`: 0 for an
+/// empty engine, Corruption for one that holds data without it.
+pub(crate) fn applied_up_to<E: StorageEngine>(engine: &E) -> Result<u64> {
+    match engine.get(&applied_up_to_key())? {
+        Some(bytes) => bytes
+            .try_into()
+            .map(u64::from_be_bytes)
+            .map_err(|_| Error::Corruption("applied_up_to is not 8 bytes".into())),
+        None if any_version_under(engine, &[])? => Err(Error::Corruption(
+            "the storage engine holds data but no applied_up_to".into(),
+        )),
+        None => Ok(0),
+    }
+}
+
 /// Whether a stored Version value is a tombstone.
 pub(crate) fn is_tombstone(stored: &[u8]) -> bool {
     stored == [TOMBSTONE]
