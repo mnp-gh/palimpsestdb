@@ -2,13 +2,14 @@
 //! Transactions, an Index build and Garbage Collection passes over a
 //! `SimDisk`, crashing at random, and checks after every step that
 //! Snapshots never change, Indexes agree with their Documents, and Recovery
-//! keeps every acknowledged commit.
+//! keeps every acknowledged commit. A crash also keeps only a random prefix
+//! of the engine's batches (ADR 0015).
 
 mod common;
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bson::{Document, doc};
 use common::{collection, field_path};
@@ -18,6 +19,7 @@ use psdb_core::{
     Error, FieldSchema, FieldType, GcPass, IdGenerator, IndexBuild, IndexState, Limits, Node,
     Transaction,
 };
+use psdb_storage::{KeyRange, ScanVisitor, StorageEngine, WriteBatch};
 use psdb_storage_memory::MemoryEngine;
 use uuid::Builder;
 
@@ -94,7 +96,7 @@ impl Model {
 }
 
 struct Slot<'node> {
-    txn: Transaction<'node, MemoryEngine>,
+    txn: Transaction<'node, Engine>,
     /// `_id` → new `n`, or `None` for a delete.
     writes: BTreeMap<i32, Option<i32>>,
 }
@@ -151,9 +153,53 @@ impl IdCounters {
     }
 }
 
-fn open(disk: &SimDisk, counters: &IdCounters) -> Node<MemoryEngine> {
+/// A `MemoryEngine` that logs every batch, so a crash can keep any prefix
+/// of them.
+#[derive(Default)]
+struct LoggedEngine {
+    engine: MemoryEngine,
+    log: Mutex<Vec<WriteBatch>>,
+}
+
+/// Shared, so the engine outlives the Node a crash drops.
+type Engine = Arc<LoggedEngine>;
+
+impl LoggedEngine {
+    /// The engine a crash leaves: the first `keep` batches written to this one.
+    fn crashed(&self, keep: usize) -> Engine {
+        let engine = Engine::default();
+        for batch in self.log.lock().unwrap().iter().take(keep) {
+            engine.write_batch(batch.clone()).unwrap();
+        }
+        engine
+    }
+}
+
+impl StorageEngine for LoggedEngine {
+    fn get(&self, key: &[u8]) -> psdb_storage::Result<Option<Vec<u8>>> {
+        self.engine.get(key)
+    }
+
+    fn scan(&self, range: &KeyRange, visit: &mut ScanVisitor<'_>) -> psdb_storage::Result<()> {
+        self.engine.scan(range, visit)
+    }
+
+    fn write_batch(&self, batch: WriteBatch) -> psdb_storage::Result<()> {
+        // Held across the write, so the log keeps the engine's batch order.
+        let mut log = self.log.lock().unwrap();
+        self.engine.write_batch(batch.clone())?;
+        log.push(batch);
+        Ok(())
+    }
+
+    fn flush(&self) -> psdb_storage::Result<()> {
+        Ok(())
+    }
+}
+
+fn open(engine: &Engine, disk: &SimDisk, counters: &IdCounters) -> Node<Engine> {
     Node::open_with(
-        MemoryEngine::new(),
+        Arc::clone(engine),
         disk.file(),
         Limits::default(),
         counters.id_generator(),
@@ -189,7 +235,7 @@ fn crash_or_fail(what: &str, err: Error) -> Result<Stop, TestCaseError> {
 }
 
 /// Whether `orders` has a Ready Index; a crash if the Node is poisoned.
-fn ready_index(node: &Node<MemoryEngine>) -> Result<Result<bool, Stop>, TestCaseError> {
+fn ready_index(node: &Node<Engine>) -> Result<Result<bool, Stop>, TestCaseError> {
     match node.list_indexes(&collection("shop.orders")) {
         Ok(indexes) => Ok(Ok(indexes.iter().any(|i| i.state == IndexState::Ready))),
         Err(e) => crash_or_fail("list indexes", e).map(Err),
@@ -198,7 +244,7 @@ fn ready_index(node: &Node<MemoryEngine>) -> Result<Result<bool, Stop>, TestCase
 
 /// Run `actions` until they run out or the process crashes.
 fn run(
-    node: &Node<MemoryEngine>,
+    node: &Node<Engine>,
     disk: &SimDisk,
     actions: &mut impl Iterator<Item = Action>,
     model: &mut Model,
@@ -210,8 +256,8 @@ fn run(
         Err(stop) => return Ok(stop),
     };
     let mut slots: Vec<Option<Slot<'_>>> = (0..SLOTS).map(|_| None).collect();
-    let mut build: Option<IndexBuild<'_, MemoryEngine>> = None;
-    let mut gc: Option<GcPass<'_, MemoryEngine>> = None;
+    let mut build: Option<IndexBuild<'_, Engine>> = None;
+    let mut gc: Option<GcPass<'_, Engine>> = None;
     let begin = || Slot {
         txn: node.begin_transaction(),
         writes: BTreeMap::new(),
@@ -375,7 +421,7 @@ fn run(
 /// Every open Snapshot, and a new one, reads what the model says, through
 /// a full scan and through the Index when it is Ready.
 fn check(
-    node: &Node<MemoryEngine>,
+    node: &Node<Engine>,
     orders: &psdb_core::CollectionPath,
     slots: &mut [Option<Slot<'_>>],
     model: &Model,
@@ -388,7 +434,7 @@ fn check(
         values.dedup();
         prop_assert_eq!(values.len(), len, "a Ready unique Index over duplicates");
     }
-    let check_slot = |txn: &mut Transaction<'_, MemoryEngine>, view: BTreeMap<i32, i32>| {
+    let check_slot = |txn: &mut Transaction<'_, Engine>, view: BTreeMap<i32, i32>| {
         let all = txn.find(orders, &doc! {}).unwrap();
         prop_assert_eq!(all, as_docs(&view), "at Snapshot {}", txn.snapshot_ts());
         let high = txn.find(orders, &doc! { "n": { "$gte": 2 } }).unwrap();
@@ -413,7 +459,10 @@ fn simulate(actions: Vec<Action>, seed: u64) -> Result<usize, TestCaseError> {
         clock: Arc::new(AtomicU64::new(0)),
         random: Arc::new(AtomicU64::new(seed)),
     };
-    let mut node = open(&disk, &counters);
+    let mut engine = Engine::default();
+    // Picks how many engine batches each crash keeps.
+    let mut lag = seed;
+    let mut node = open(&engine, &disk, &counters);
     let orders = collection("shop.orders");
     let junk = collection("shop.junk");
     node.create_namespace("shop").unwrap();
@@ -442,7 +491,12 @@ fn simulate(actions: Vec<Action>, seed: u64) -> Result<usize, TestCaseError> {
     } = run(&node, &disk, &mut actions, &mut model)?
     {
         drop(node);
-        node = open(&disk, &counters);
+        lag = lag
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let written = engine.log.lock().unwrap().len();
+        engine = engine.crashed((lag >> 33) as usize % (written + 1));
+        node = open(&engine, &disk, &counters);
         let indexes = node.list_indexes(&orders).unwrap();
         prop_assert!(
             indexes.iter().all(|i| i.state == IndexState::Ready),

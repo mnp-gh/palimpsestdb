@@ -94,12 +94,6 @@ pub enum Error {
     /// (the write is not made), or the WAL Record would exceed 4 GiB
     /// (nothing is committed). Not an Abort, and not retryable.
     TransactionTooLarge,
-    /// A Node was opened over an engine that already holds data. Every
-    /// way of opening one starts from an empty engine: [`Node::open`]
-    /// replays its WAL into it.
-    ///
-    /// [`Node::open`]: crate::Node::open
-    EngineNotEmpty,
     /// The commit could not be confirmed Durable, or was Durable but could
     /// not be Applied: the Transaction may or may not be present after the
     /// Node is reopened. Not an Abort, and not retryable. The Node
@@ -171,9 +165,6 @@ impl fmt::Display for Error {
             Error::TransactionTooLarge => f.write_str(
                 "transaction too large: its write set would exceed the configured limit or its WAL record 4 GiB",
             ),
-            Error::EngineNotEmpty => {
-                f.write_str("the storage engine already holds data; open a node over an empty engine")
-            }
             Error::CommitOutcomeUnknown(cause) => write!(
                 f,
                 "commit outcome unknown ({cause}); the transaction may or may not survive a reopen, and the node must be reopened"

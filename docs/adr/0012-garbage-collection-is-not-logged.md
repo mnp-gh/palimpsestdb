@@ -9,6 +9,6 @@ Garbage Collection removes Versions that no active Snapshot can read, by deletin
 
 ## Consequences
 
-- Recovery may bring back Versions a pass already removed (today it replays the whole WAL into an empty engine, so all of them come back). Collection is idempotent, so the next pass removes them again.
+- Recovery may bring back Versions a pass already removed (it replays the WAL Records above the engine's `applied_up_to`, so Versions those Records wrote come back; ADR 0015). Collection is idempotent, so the next pass removes them again.
 - Replicas (v2.x) collect on their own, against their own oldest Snapshot; nothing about collection travels over replication.
 - A Version is never removed while an active Snapshot could read it, so collection never changes what a Transaction sees.
