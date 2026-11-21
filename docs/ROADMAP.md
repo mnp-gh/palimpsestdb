@@ -9,7 +9,7 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | v0.3 | Indexes | Done |
 | v0.4 | Concurrency | Done |
 | v0.4.1 | Catalog from engine | Done |
-| v0.4.2 | Resume Recovery | Planned |
+| v0.4.2 | Resume Recovery | Done |
 | v0.4.3 | Streaming find | Planned |
 | v0.4.4 | Persistent engine | Planned |
 | v0.4.5 | Checkpoint | Planned |
