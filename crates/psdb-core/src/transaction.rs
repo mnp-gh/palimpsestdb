@@ -30,14 +30,6 @@ pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
     write_set.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
 }
 
-/// The decoded Document in `bytes` if it matches `filter`, else `None`.
-fn decode_if_matches(filter: &Filter, bytes: &[u8]) -> Result<Option<Document>> {
-    if !filter.matches_raw(document::raw(bytes)?)? {
-        return Ok(None);
-    }
-    document::decode(bytes).map(Some)
-}
-
 /// Where a chunked scan of a key range stands (ADR 0016). It holds no
 /// borrow, so each step is handed the Transaction it reads through.
 struct Scan {
@@ -464,7 +456,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             };
         Ok(std::iter::from_fn(move || {
             while let Some(bytes) = candidates.next() {
-                match bytes.and_then(|bytes| decode_if_matches(&filter, &bytes)) {
+                match bytes.and_then(|bytes| Self::decode_if_matches(&filter, &bytes)) {
                     Ok(None) => continue,
                     Ok(Some(doc)) => return Some(Ok(doc)),
                     Err(e) => {
@@ -504,6 +496,14 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             }
         }
         Ok(keys)
+    }
+
+    /// The decoded Document in `bytes` if it matches `filter`, else `None`.
+    fn decode_if_matches(filter: &Filter, bytes: &[u8]) -> Result<Option<Document>> {
+        if !filter.matches_raw(document::raw(bytes)?)? {
+            return Ok(None);
+        }
+        document::decode(bytes).map(Some)
     }
 
     /// Commit. Returns the Commit Timestamp, or the Snapshot timestamp for a
