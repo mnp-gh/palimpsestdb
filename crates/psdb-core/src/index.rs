@@ -142,8 +142,8 @@ pub(crate) enum CandidateRange {
 }
 
 /// The ranges of the Collection with Catalog entry `collection` to read
-/// for `filter`, or `None` to scan the whole Collection. Every Document the filter can match is in at least one
-/// range; ranges may overlap.
+/// for `filter`, or `None` to scan the whole Collection. Every Document the
+/// filter can match is in at least one range; ranges may overlap.
 ///
 /// A comparison can use a range when it must hold for the filter to match
 /// (it is at the top level or inside `$and`), its field is `_id` or
@@ -161,16 +161,7 @@ pub(crate) fn plan(filter: &Filter, collection: &CollectionEntry) -> Option<Vec<
     let candidates: Vec<(&FieldPath, bool, CandidateRange)> = comparisons
         .into_iter()
         .filter_map(|(path, op, value)| {
-            let range = if path.as_str() == "_id" {
-                let base = collection.prefix();
-                CandidateRange::Documents(bounds(base, id_type(value)?, op, value)?)
-            } else {
-                let index = collection
-                    .index_on(path)
-                    .filter(|ix| ix.state == IndexState::Ready)?;
-                let ty = collection.schema.get(&index.path)?.field_type;
-                CandidateRange::Index(bounds(collection.index_prefix(index), ty, op, value)?)
-            };
+            let range = comparison_range(collection, path, op, value)?;
             Some((path, op == CompareOp::Eq, range))
         })
         .collect();
@@ -178,16 +169,15 @@ pub(crate) fn plan(filter: &Filter, collection: &CollectionEntry) -> Option<Vec<
         .iter()
         .find(|(path, eq, _)| *eq && path.as_str() == "_id")
         .or_else(|| candidates.iter().find(|(_, eq, _)| *eq));
-    if equality.is_none() {
-        let union = ors.iter().find_map(|branches| {
+    if equality.is_none()
+        && let Some(union) = ors.iter().find_map(|branches| {
             branches.iter().try_fold(Vec::new(), |mut ranges, branch| {
                 ranges.extend(plan(branch, collection)?);
                 Some(ranges)
             })
-        });
-        if union.is_some() {
-            return union;
-        }
+        })
+    {
+        return Some(union);
     }
     let (chosen, _, mut candidate) = equality.or_else(|| candidates.first())?.clone();
     let (CandidateRange::Index(range) | CandidateRange::Documents(range)) = &mut candidate;
@@ -198,17 +188,6 @@ pub(crate) fn plan(filter: &Filter, collection: &CollectionEntry) -> Option<Vec<
         }
     }
     Some(vec![candidate])
-}
-
-/// The Field Type whose Index keys sort `_id` values the way filters
-/// compare them with `value`. Document IDs are encoded as Index keys are,
-/// integers as in an Index on an `int` field; `_id` is never a double, so a
-/// double filter value works as it does against such an Index.
-fn id_type(value: &Bson) -> Option<FieldType> {
-    match FieldType::of(value)? {
-        FieldType::Double => Some(FieldType::Int),
-        ty => Some(ty),
-    }
 }
 
 /// Every comparison and every `$or` that must hold for `filter` to match:
@@ -224,6 +203,37 @@ fn collect_conjuncts<'f>(
             .for_each(|f| collect_conjuncts(f, comparisons, ors)),
         Filter::Compare { path, op, value } => comparisons.push((path, *op, value)),
         Filter::Or(branches) => ors.push(branches),
+    }
+}
+
+/// The range a comparison reads: Documents for `_id`, else the field's
+/// Ready Index; `None` if neither applies.
+fn comparison_range(
+    collection: &CollectionEntry,
+    path: &FieldPath,
+    op: CompareOp,
+    value: &Bson,
+) -> Option<CandidateRange> {
+    if path.as_str() == "_id" {
+        let range = bounds(collection.prefix(), id_type(value)?, op, value)?;
+        return Some(CandidateRange::Documents(range));
+    }
+    let index = collection
+        .index_on(path)
+        .filter(|ix| ix.state == IndexState::Ready)?;
+    let ty = collection.schema.get(&index.path)?.field_type;
+    let range = bounds(collection.index_prefix(index), ty, op, value)?;
+    Some(CandidateRange::Index(range))
+}
+
+/// The Field Type whose Index keys sort `_id` values the way filters
+/// compare them with `value`. Document IDs are encoded as Index keys are,
+/// integers as in an Index on an `int` field; `_id` is never a double, so a
+/// double filter value works as it does against such an Index.
+fn id_type(value: &Bson) -> Option<FieldType> {
+    match FieldType::of(value)? {
+        FieldType::Double => Some(FieldType::Int),
+        ty => Some(ty),
     }
 }
 
@@ -466,10 +476,12 @@ impl<E: StorageEngine> Node<E> {
             for namespace in t.list_namespaces()? {
                 for name in t.list_collections(&namespace)? {
                     let entry = t.collection_entry(&CollectionPath::new(&namespace, &name)?)?;
-                    for index in &entry.indexes {
-                        if index.state == IndexState::Building {
-                            t.drop_index_entry(&entry, index)?;
-                        }
+                    for index in entry
+                        .indexes
+                        .iter()
+                        .filter(|ix| ix.state == IndexState::Building)
+                    {
+                        t.drop_index_entry(&entry, index)?;
                     }
                 }
             }
