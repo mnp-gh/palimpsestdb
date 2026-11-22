@@ -186,11 +186,12 @@ impl<E: StorageEngine> GcPass<'_, E> {
                 *seen_newest = false;
                 *dead_id_follows = false;
             }
-            let reclaim = if let Some(collection) = keys::data_collection(logical)
-                && (dead_namespaces.contains(&collection.0)
-                    || dead_collections.contains(&collection))
+            let reclaim = if let Some((namespace_id, collection_id)) =
+                keys::data_collection(logical)
+                && (dead_namespaces.contains(&namespace_id)
+                    || dead_collections.contains(&(namespace_id, collection_id)))
             {
-                reclaimed_collections.insert(collection);
+                reclaimed_collections.insert((namespace_id, collection_id));
                 true
             } else if let Some(index) = keys::index_entry_ids(logical)
                 && dead_indexes.contains(&index)
