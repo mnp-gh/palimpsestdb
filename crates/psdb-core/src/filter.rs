@@ -71,14 +71,14 @@ impl Filter {
         let mut clauses = Vec::new();
         for (key, value) in filter {
             match key.as_str() {
-                "$and" => clauses.push(Filter::And(parse_list(key, value)?)),
-                "$or" => clauses.push(Filter::Or(parse_list(key, value)?)),
+                "$and" => clauses.push(Filter::And(Self::parse_list(key, value)?)),
+                "$or" => clauses.push(Filter::Or(Self::parse_list(key, value)?)),
                 op if op.starts_with('$') => {
                     return Err(Error::InvalidFilter(format!(
                         "unsupported top-level operator {op}"
                     )));
                 }
-                path => clauses.extend(parse_field(path, value)?),
+                path => clauses.extend(Self::parse_field(path, value)?),
             }
         }
         Ok(if clauses.len() == 1 {
@@ -86,6 +86,65 @@ impl Filter {
         } else {
             Filter::And(clauses)
         })
+    }
+
+    fn parse_list(op: &str, value: &Bson) -> Result<Vec<Filter>> {
+        let Bson::Array(items) = value else {
+            return Err(Error::InvalidFilter(format!(
+                "{op} takes an array of filters"
+            )));
+        };
+        if items.is_empty() {
+            return Err(Error::InvalidFilter(format!(
+                "{op} needs at least one filter"
+            )));
+        }
+        items
+            .iter()
+            .map(|item| match item {
+                Bson::Document(d) => Filter::parse(d),
+                _ => Err(Error::InvalidFilter(format!(
+                    "{op} takes an array of filters"
+                ))),
+            })
+            .collect()
+    }
+
+    fn parse_field(path: &str, value: &Bson) -> Result<Vec<Filter>> {
+        let path: FieldPath = path
+            .parse()
+            .map_err(|_| Error::InvalidFilter(format!("{path:?} is not a field path")))?;
+        let compare = |op, value: &Bson| Filter::Compare {
+            path: path.clone(),
+            op,
+            value: value.clone(),
+        };
+
+        // `{ field: { $op: v, ... } }` is a set of comparisons; any other value is
+        // an equality match, including a document whose keys are not operators.
+        let operators = match value {
+            Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => d,
+            _ => return Ok(vec![compare(CompareOp::Eq, value)]),
+        };
+        operators
+            .iter()
+            .map(|(op, v)| {
+                let op = match op.as_str() {
+                    "$eq" => CompareOp::Eq,
+                    "$ne" => CompareOp::Ne,
+                    "$gt" => CompareOp::Gt,
+                    "$gte" => CompareOp::Gte,
+                    "$lt" => CompareOp::Lt,
+                    "$lte" => CompareOp::Lte,
+                    other => {
+                        return Err(Error::InvalidFilter(format!(
+                            "unsupported operator {other}"
+                        )));
+                    }
+                };
+                Ok(compare(op, v))
+            })
+            .collect()
     }
 
     /// Whether `doc` matches this filter. Fails with
@@ -100,17 +159,17 @@ impl Filter {
     /// filter names instead of decoding the whole Document.
     pub(crate) fn matches_raw(&self, doc: &RawDocument) -> Result<bool> {
         Ok(match self {
-            Filter::And(fs) => {
-                for f in fs {
-                    if !f.matches_raw(doc)? {
+            Filter::And(clauses) => {
+                for clause in clauses {
+                    if !clause.matches_raw(doc)? {
                         return Ok(false);
                     }
                 }
                 true
             }
-            Filter::Or(fs) => {
-                for f in fs {
-                    if f.matches_raw(doc)? {
+            Filter::Or(clauses) => {
+                for clause in clauses {
+                    if clause.matches_raw(doc)? {
                         return Ok(true);
                     }
                 }
@@ -123,86 +182,20 @@ impl Filter {
     }
 }
 
-fn parse_list(op: &str, value: &Bson) -> Result<Vec<Filter>> {
-    let Bson::Array(items) = value else {
-        return Err(Error::InvalidFilter(format!(
-            "{op} takes an array of filters"
-        )));
-    };
-    if items.is_empty() {
-        return Err(Error::InvalidFilter(format!(
-            "{op} needs at least one filter"
-        )));
-    }
-    items
-        .iter()
-        .map(|item| match item {
-            Bson::Document(d) => Filter::parse(d),
-            _ => Err(Error::InvalidFilter(format!(
-                "{op} takes an array of filters"
-            ))),
-        })
-        .collect()
-}
-
-fn parse_field(path: &str, value: &Bson) -> Result<Vec<Filter>> {
-    let path: FieldPath = path
-        .parse()
-        .map_err(|_| Error::InvalidFilter(format!("{path:?} is not a field path")))?;
-    let compare = |op, value: &Bson| Filter::Compare {
-        path: path.clone(),
-        op,
-        value: value.clone(),
-    };
-
-    // `{ field: { $op: v, ... } }` is a set of comparisons; any other value is
-    // an equality match, including a document whose keys are not operators.
-    let operators = match value {
-        Bson::Document(d) if d.keys().next().is_some_and(|k| k.starts_with('$')) => d,
-        _ => return Ok(vec![compare(CompareOp::Eq, value)]),
-    };
-    operators
-        .iter()
-        .map(|(op, v)| {
-            let op = match op.as_str() {
-                "$eq" => CompareOp::Eq,
-                "$ne" => CompareOp::Ne,
-                "$gt" => CompareOp::Gt,
-                "$gte" => CompareOp::Gte,
-                "$lt" => CompareOp::Lt,
-                "$lte" => CompareOp::Lte,
-                other => {
-                    return Err(Error::InvalidFilter(format!(
-                        "unsupported operator {other}"
-                    )));
-                }
-            };
-            Ok(compare(op, v))
-        })
-        .collect()
-}
-
 fn compare_at(found: Option<&Bson>, op: CompareOp, target: &Bson) -> bool {
-    // As in MongoDB, a missing field equals null.
-    let equal = match found {
-        Some(v) => compare(v, target) == Some(Ordering::Equal),
+    let is_equal = || match found {
+        Some(v) => equal(v, target),
+        // As in MongoDB, a missing field equals null.
         None => matches!(target, Bson::Null),
     };
+    let ordering = || found.and_then(|v| compare(v, target));
     match op {
-        CompareOp::Eq => equal,
-        CompareOp::Ne => !equal,
-        _ => {
-            let Some(ordering) = found.and_then(|v| compare(v, target)) else {
-                return false;
-            };
-            match op {
-                CompareOp::Gt => ordering.is_gt(),
-                CompareOp::Gte => ordering.is_ge(),
-                CompareOp::Lt => ordering.is_lt(),
-                CompareOp::Lte => ordering.is_le(),
-                CompareOp::Eq | CompareOp::Ne => unreachable!(),
-            }
-        }
+        CompareOp::Eq => is_equal(),
+        CompareOp::Ne => !is_equal(),
+        CompareOp::Gt => ordering().is_some_and(Ordering::is_gt),
+        CompareOp::Gte => ordering().is_some_and(Ordering::is_ge),
+        CompareOp::Lt => ordering().is_some_and(Ordering::is_lt),
+        CompareOp::Lte => ordering().is_some_and(Ordering::is_le),
     }
 }
 
@@ -238,10 +231,6 @@ fn compare(a: &Bson, b: &Bson) -> Option<Ordering> {
     }
 }
 
-fn equal(a: &Bson, b: &Bson) -> bool {
-    compare(a, b) == Some(Ordering::Equal)
-}
-
 fn as_i64(v: &Bson) -> Option<i64> {
     match v {
         Bson::Int32(n) => Some(i64::from(*n)),
@@ -272,6 +261,10 @@ fn cmp_int_double(i: i64, f: f64) -> Option<Ordering> {
         // Same whole part: the fraction decides.
         0.0f64.partial_cmp(&(f - whole)).expect("finite")
     }))
+}
+
+fn equal(a: &Bson, b: &Bson) -> bool {
+    compare(a, b) == Some(Ordering::Equal)
 }
 
 #[cfg(test)]

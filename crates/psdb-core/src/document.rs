@@ -122,16 +122,15 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 
 /// Validate `doc` against `limits` and return it with its Document ID as
 /// the first field. If `doc` has no `_id`, `id` is used, or a new UUIDv7
-/// (BSON Binary subtype 4) is taken from `id_generator` when `id` is `None`. If both are
-/// present they must be the same Document ID: an int32 and an int64 of one
-/// value are, as their keys are equal.
+/// (BSON Binary subtype 4) is taken from `id_generator` when `id` is
+/// `None`. If both are present they must be the same Document ID: an int32
+/// and an int64 of one value are, as their keys are equal.
 pub(crate) fn prepare(
-    doc: Document,
+    mut doc: Document,
     id: Option<&Bson>,
     limits: &Limits,
     id_generator: &IdGenerator,
 ) -> Result<(Bson, Vec<u8>)> {
-    let mut doc = doc;
     let id_key = |id: &Bson| -> Result<Vec<u8>> {
         let mut key = Vec::new();
         keys::encode_id(id, &mut key)?;
@@ -181,10 +180,10 @@ pub(crate) fn generate_id(id_generator: &IdGenerator) -> Bson {
 /// Reject documents nested deeper than `max`. Iterative, so a very deep
 /// document cannot overflow the stack.
 fn check_depth(doc: &Document, max: usize) -> Result<()> {
-    let mut stack: Vec<(&Bson, usize)> = doc.values().map(|v| (v, 2)).collect();
     if max < 1 {
         return Err(too_deep(max));
     }
+    let mut stack: Vec<(&Bson, usize)> = doc.values().map(|v| (v, 2)).collect();
     while let Some((value, depth)) = stack.pop() {
         let children: Box<dyn Iterator<Item = &Bson>> = match value {
             Bson::Document(d) => Box::new(d.values()),
