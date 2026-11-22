@@ -99,15 +99,16 @@ pub(crate) struct CommitState {
     wal: Option<Wal>,
     /// Collection prefix → Commit Timestamp of the last commit since the
     /// Node opened that wrote a Document there. Index entries do not count.
-    /// Entries of dropped Collections stay: a few bytes each.
-    pub(crate) last_document_commit: HashMap<Vec<u8>, u64>,
+    /// Entries of dropped Collections stay: a few bytes each (see
+    /// .scratch/v1.0-hardening/issues/02-collection-updated-at-growth.md).
+    pub(crate) collection_updated_at: HashMap<Vec<u8>, u64>,
 }
 
 impl CommitState {
     pub(crate) fn new(wal: Option<Wal>) -> Self {
         Self {
             wal,
-            last_document_commit: HashMap::new(),
+            collection_updated_at: HashMap::new(),
         }
     }
 
@@ -125,7 +126,7 @@ impl CommitState {
         let commit_ts = latest_visible_commit_ts.load(Ordering::Relaxed) + 1;
         let Some(wal) = &mut self.wal else {
             engine.write_batch(mvcc::commit_batch(commit_ts, writes(write_set)))?;
-            self.record_document_commits(commit_ts, write_set);
+            self.record_collection_updates(commit_ts, write_set);
             catalog_cache.record(commit_ts, write_set);
             latest_visible_commit_ts.store(commit_ts, Ordering::Release);
             return Ok(commit_ts);
@@ -143,16 +144,17 @@ impl CommitState {
         }
         // Before publishing: a Snapshot at `commit_ts` must not find the
         // cached entry this commit replaces.
-        self.record_document_commits(commit_ts, write_set);
+        self.record_collection_updates(commit_ts, write_set);
         catalog_cache.record(commit_ts, write_set);
         latest_visible_commit_ts.store(commit_ts, Ordering::Release);
         Ok(commit_ts)
     }
 
-    fn record_document_commits(&mut self, commit_ts: u64, write_set: &WriteSet) {
+    fn record_collection_updates(&mut self, commit_ts: u64, write_set: &WriteSet) {
         for key in write_set.keys() {
             if let Some(prefix) = keys::document_collection_prefix(key) {
-                self.last_document_commit.insert(prefix.to_vec(), commit_ts);
+                self.collection_updated_at
+                    .insert(prefix.to_vec(), commit_ts);
             }
         }
     }

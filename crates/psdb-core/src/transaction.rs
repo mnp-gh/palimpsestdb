@@ -433,7 +433,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             // No entry: no Document written since the Node opened, which
             // precedes every Snapshot.
             if commit_state
-                .last_document_commit
+                .collection_updated_at
                 .get(prefix)
                 .is_some_and(|&ts| ts > self.snapshot_ts)
             {
