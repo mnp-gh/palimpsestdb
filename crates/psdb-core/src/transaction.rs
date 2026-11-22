@@ -430,31 +430,32 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     ) -> Result<Vec<Document>> {
         let filter = Filter::parse(filter)?;
         let entry = self.collection_entry(collection)?;
-        let prefix = entry.prefix();
         let candidates = match index::plan(&filter, &entry) {
             None => self.scan_range(&entry.documents()).collect::<Result<_>>()?,
             Some(ranges) => {
-                // Keyed by Document key, so a Document found through several
-                // ranges is read once, and results stay in Document ID order.
-                let mut docs = BTreeMap::new();
+                // A set of Document keys, so a Document found through several
+                // ranges is read once, in Document ID order; only the keys
+                // are held, not the Documents.
+                let prefix = entry.prefix();
+                let mut keys = BTreeSet::new();
                 for range in &ranges {
                     match range {
                         CandidateRange::Documents(range) => {
                             for item in self.scan_range(range) {
-                                let (key, bytes) = item?;
-                                docs.insert(key, bytes);
+                                keys.insert(item?.0);
                             }
                         }
                         CandidateRange::Index(range) => {
                             for item in self.scan_range(range) {
-                                let key = [prefix.as_slice(), &item?.1].concat();
-                                if !docs.contains_key(&key)
-                                    && let Some(bytes) = self.read(&key)?
-                                {
-                                    docs.insert(key, bytes);
-                                }
+                                keys.insert([prefix.as_slice(), &item?.1].concat());
                             }
                         }
+                    }
+                }
+                let mut docs = BTreeMap::new();
+                for key in keys {
+                    if let Some(bytes) = self.read(&key)? {
+                        docs.insert(key, bytes);
                     }
                 }
                 docs

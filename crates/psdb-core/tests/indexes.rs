@@ -1265,3 +1265,29 @@ fn a_writer_that_began_before_a_build_aborts() {
     build.step().unwrap();
     assert!(matches!(txn.commit(), Err(Error::CollectionChanged)));
 }
+
+#[test]
+fn index_plan_with_overlapping_ranges_returns_each_document_once() {
+    let node = Node::with_limits(
+        MemoryEngine::new(),
+        psdb_core::Limits::default().with_scan_chunk(2, usize::MAX),
+    )
+    .unwrap();
+    let orders = collection("shop.orders");
+    node.create_namespace("shop").unwrap();
+    node.create_collection(&orders).unwrap();
+    node.set_field_type(&orders, &field_path("age"), field(FieldType::Int, false))
+        .unwrap();
+    for id in 0..10 {
+        node.insert(&orders, doc! { "_id": id, "age": 10 - id })
+            .unwrap();
+    }
+    node.create_index(&orders, &field_path("age"), false)
+        .unwrap();
+    let filter = doc! { "$or": [
+        { "age": { "$gte": 2, "$lte": 6 } },
+        { "age": { "$gte": 4 } },
+    ] };
+    let found = node.find(&orders, &filter).unwrap();
+    assert_eq!(ids(&found), (0..9).map(Bson::Int32).collect::<Vec<_>>());
+}
