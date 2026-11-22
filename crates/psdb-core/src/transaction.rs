@@ -427,19 +427,19 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     ///
     /// The Documents stream: they are read from the engine a chunk at a
     /// time as the iterator advances (ADR 0016), so the Transaction stays
-    /// borrowed until the iterator is dropped. An Index plan first collects
+    /// borrowed (`'txn`) until the iterator is dropped. An Index plan first collects
     /// the keys of every candidate Document. After an error the iterator
     /// ends.
-    pub fn find(
-        &mut self,
+    pub fn find<'txn>(
+        &'txn mut self,
         collection: &CollectionPath,
         filter: &Document,
-    ) -> Result<impl Iterator<Item = Result<Document>> + '_> {
+    ) -> Result<impl Iterator<Item = Result<Document>> + 'txn> {
         let filter = Filter::parse(filter)?;
         let entry = self.collection_entry(collection)?;
         // From here on only reads, so the iterator can borrow `self` shared.
         let this = &*self;
-        let mut candidates: Box<dyn Iterator<Item = Result<Vec<u8>>> + '_> =
+        let mut candidates: Box<dyn Iterator<Item = Result<Vec<u8>>> + 'txn> =
             match index::plan(&filter, &entry) {
                 None => {
                     let documents = this.scan_range(&entry.documents());
