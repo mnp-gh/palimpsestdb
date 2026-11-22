@@ -8,7 +8,6 @@
 
 use std::fmt;
 use std::ops::ControlFlow;
-use std::sync::Arc;
 
 pub mod conformance;
 
@@ -235,9 +234,11 @@ pub trait StorageEngine: Send + Sync {
     fn flush(&self) -> Result<()>;
 }
 
-/// A shared engine, so a Node can be reopened over the engine a dropped
-/// one used.
-impl<E: StorageEngine + ?Sized> StorageEngine for Arc<E> {
+/// A shared engine, so a test can reopen a Node over the engine a dropped
+/// one used. Test-only: two live Nodes over one engine would hand out the
+/// same Commit Timestamps and overwrite each other's Versions.
+#[cfg(feature = "testing")]
+impl<E: StorageEngine + ?Sized> StorageEngine for std::sync::Arc<E> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         (**self).get(key)
     }
