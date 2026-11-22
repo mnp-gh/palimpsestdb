@@ -10,5 +10,10 @@
   "enabledPlugins": {
     "mattpocock-skills@claude-plugins-official": true,
     "ponytail@ponytail": true
+  },
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
   }
 }

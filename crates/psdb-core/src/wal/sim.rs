@@ -54,40 +54,6 @@ struct DiskState {
     fail_next_sync: bool,
 }
 
-impl DiskState {
-    fn power_loss(&mut self, keep_unsynced: usize) {
-        if !self.entry_durable {
-            self.durable.clear();
-        } else if self.data.starts_with(&self.durable) {
-            // A torn write: some of the unsynced bytes happened to reach
-            // the disk.
-            let unsynced = &self.data[self.durable.len()..];
-            let kept = &unsynced[..keep_unsynced.min(unsynced.len())];
-            self.durable.extend_from_slice(kept);
-        }
-        self.data = self.durable.clone();
-        self.generation += 1;
-        self.crash = None;
-        self.fail_next_append = false;
-        self.fail_next_sync = false;
-    }
-
-    /// Count one operation towards a scheduled crash.
-    fn tick(&mut self) -> io::Result<()> {
-        match self.crash {
-            Some((0, keep_unsynced)) => {
-                self.power_loss(keep_unsynced);
-                Err(io::Error::other("simulated power loss"))
-            }
-            Some((left, keep_unsynced)) => {
-                self.crash = Some((left - 1, keep_unsynced));
-                Ok(())
-            }
-            None => Ok(()),
-        }
-    }
-}
-
 impl SimDisk {
     /// A disk with no WAL file on it yet.
     pub fn new() -> Self {
@@ -143,6 +109,40 @@ impl SimDisk {
 
     fn lock(&self) -> MutexGuard<'_, DiskState> {
         self.state.lock().expect("lock poisoned")
+    }
+}
+
+impl DiskState {
+    fn power_loss(&mut self, keep_unsynced: usize) {
+        if !self.entry_durable {
+            self.durable.clear();
+        } else if self.data.starts_with(&self.durable) {
+            // A torn write: some of the unsynced bytes happened to reach
+            // the disk.
+            let unsynced = &self.data[self.durable.len()..];
+            let kept = &unsynced[..keep_unsynced.min(unsynced.len())];
+            self.durable.extend_from_slice(kept);
+        }
+        self.data = self.durable.clone();
+        self.generation += 1;
+        self.crash = None;
+        self.fail_next_append = false;
+        self.fail_next_sync = false;
+    }
+
+    /// Count one operation towards a scheduled crash.
+    fn tick(&mut self) -> io::Result<()> {
+        match self.crash {
+            Some((0, keep_unsynced)) => {
+                self.power_loss(keep_unsynced);
+                Err(io::Error::other("simulated power loss"))
+            }
+            Some((left, keep_unsynced)) => {
+                self.crash = Some((left - 1, keep_unsynced));
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 }
 

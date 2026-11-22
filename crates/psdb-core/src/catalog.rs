@@ -197,7 +197,7 @@ impl CollectionEntry {
         };
         let mut schema = Schema::new();
         for field in list("fields")? {
-            let path = read_path(&field).ok_or_else(|| corrupt("field path"))?;
+            let path = Self::read_path(&field).ok_or_else(|| corrupt("field path"))?;
             let field_type = field
                 .get_str("type")
                 .ok()
@@ -219,6 +219,12 @@ impl CollectionEntry {
                 Some(_) => read_u32(&doc, "nextIndexId")?,
             },
         })
+    }
+
+    /// The `path` field of a schema field or an Index. Stored paths were
+    /// checked when declared, so `None` means the entry is corrupt.
+    fn read_path(doc: &Document) -> Option<FieldPath> {
+        doc.get_str("path").ok().and_then(|p| p.parse().ok())
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -249,7 +255,7 @@ impl CollectionEntry {
             .map(|id| u32::from_be_bytes(*id))
             .ok_or_else(|| corrupt("key"))?;
         Ok(IndexDef {
-            path: read_path(&doc).ok_or_else(|| corrupt("path"))?,
+            path: Self::read_path(&doc).ok_or_else(|| corrupt("path"))?,
             id,
             unique: doc.get_bool("unique").map_err(|_| corrupt("unique"))?,
             state: match doc.get_str("state") {
@@ -477,12 +483,6 @@ fn entry_name(bytes: &[u8]) -> Result<String> {
         .get_str("name")
         .map(str::to_owned)
         .map_err(|e| Error::Corruption(format!("catalog entry name: {e}")))
-}
-
-/// The `path` field of a schema field or an Index. Stored paths were checked
-/// when declared, so `None` means the entry is corrupt.
-fn read_path(doc: &Document) -> Option<FieldPath> {
-    doc.get_str("path").ok().and_then(|p| p.parse().ok())
 }
 
 fn read_u32(doc: &Document, field: &str) -> Result<u32> {

@@ -121,32 +121,8 @@ impl Wal {
         while pos < bytes.len() {
             let Some(body) = body_at(&bytes, pos) else {
                 // Every commit is synced before the next is appended, so a
-                // torn write is always the last record. Any intact record
-                // after this one, wherever it starts, means the damage is
-                // mid-log. Searching every offset, rather than trusting this
-                // record's possibly damaged length, prefers refusing to open
-                // over dropping a Durable commit; a Document holding the
-                // bytes of a WAL record inside a torn write can make it
-                // refuse needlessly.
-                //
-                // Two cheap checks first skip the CRC32C at almost every
-                // offset, which would otherwise make the search quadratic
-                // in the size of a torn record. Commit Timestamps go up by
-                // one per record, so a Durable record after this one has a
-                // timestamp of at most `max_ts`; and its writes fit in its
-                // length.
-                let max_ts = last_ts + ((bytes.len() - pos) / (FRAME_LEN + MIN_BODY_LEN)) as u64;
-                let plausible = |p: usize| {
-                    let Some(head) = bytes.get(p..p + FRAME_LEN + MIN_BODY_LEN) else {
-                        return false;
-                    };
-                    let len = read_u32(head) as usize;
-                    let ts = read_u64(&head[FRAME_LEN..]);
-                    let count = read_u32(&head[FRAME_LEN + 8..]) as usize;
-                    (1..=max_ts).contains(&ts)
-                        && count * MIN_WRITE_LEN <= len.saturating_sub(MIN_BODY_LEN)
-                };
-                if (pos + 1..bytes.len()).any(|p| plausible(p) && body_at(&bytes, p).is_some()) {
+                // torn write is always the last record.
+                if intact_record_after(&bytes, pos, last_ts) {
                     return Err(Error::Corruption(format!(
                         "bad WAL record at byte {pos} is followed by valid records"
                     )));
@@ -192,44 +168,30 @@ fn header() -> Vec<u8> {
     out
 }
 
-/// The WAL Record of a commit. Fails with [`Error::TransactionTooLarge`] if
-/// it would exceed 4 GiB; nothing has been written then.
-pub(crate) fn encode_record<'a>(
-    commit_ts: u64,
-    writes: impl IntoIterator<Item = Write<'a>>,
-) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&commit_ts.to_be_bytes());
-    body.extend_from_slice(&[0; 4]);
-    let mut count: u32 = 0;
-    for (key, value) in writes {
-        push_bytes(&mut body, key)?;
-        match value {
-            None => body.push(TOMBSTONE),
-            Some(value) => {
-                body.push(LIVE);
-                push_bytes(&mut body, value)?;
-            }
-        }
-        count += 1;
-    }
-    body[8..12].copy_from_slice(&count.to_be_bytes());
-
-    let mut out = Vec::with_capacity(FRAME_LEN + body.len());
-    out.extend_from_slice(&len_u32(body.len())?.to_be_bytes());
-    out.extend_from_slice(&crc32c::crc32c(&body).to_be_bytes());
-    out.extend_from_slice(&body);
-    Ok(out)
-}
-
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
-    out.extend_from_slice(&len_u32(bytes.len())?.to_be_bytes());
-    out.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn len_u32(len: usize) -> Result<u32> {
-    u32::try_from(len).map_err(|_| Error::TransactionTooLarge)
+/// Whether an intact record starts anywhere after the bad record at `pos`,
+/// which makes the damage mid-log rather than a torn write.
+///
+/// Searching every offset, rather than trusting the bad record's possibly
+/// damaged length, prefers refusing to open over dropping a Durable commit;
+/// a Document holding the bytes of a WAL record inside a torn write can make
+/// it refuse needlessly.
+///
+/// Two cheap checks first skip the CRC32C at almost every offset, which
+/// would otherwise make the search quadratic in the size of a torn record.
+/// Commit Timestamps go up by one per record, so a Durable record after this
+/// one has a timestamp of at most `max_ts`; and its writes fit in its length.
+fn intact_record_after(bytes: &[u8], pos: usize, last_ts: u64) -> bool {
+    let max_ts = last_ts + ((bytes.len() - pos) / (FRAME_LEN + MIN_BODY_LEN)) as u64;
+    let plausible = |p: usize| {
+        let Some(head) = bytes.get(p..p + FRAME_LEN + MIN_BODY_LEN) else {
+            return false;
+        };
+        let len = read_u32(head) as usize;
+        let ts = read_u64(&head[FRAME_LEN..]);
+        let count = read_u32(&head[FRAME_LEN + 8..]) as usize;
+        (1..=max_ts).contains(&ts) && count * MIN_WRITE_LEN <= len.saturating_sub(MIN_BODY_LEN)
+    };
+    (pos + 1..bytes.len()).any(|p| plausible(p) && body_at(bytes, p).is_some())
 }
 
 /// The body of the record at `pos` if its length fits in the file and its
@@ -287,6 +249,46 @@ impl<'a> Reader<'a> {
         let len = read_u32(self.take(4)?) as usize;
         self.take(len)
     }
+}
+
+/// The WAL Record of a commit. Fails with [`Error::TransactionTooLarge`] if
+/// it would exceed 4 GiB; nothing has been written then.
+pub(crate) fn encode_record<'a>(
+    commit_ts: u64,
+    writes: impl IntoIterator<Item = Write<'a>>,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&commit_ts.to_be_bytes());
+    body.extend_from_slice(&[0; 4]);
+    let mut count: u32 = 0;
+    for (key, value) in writes {
+        push_bytes(&mut body, key)?;
+        match value {
+            None => body.push(TOMBSTONE),
+            Some(value) => {
+                body.push(LIVE);
+                push_bytes(&mut body, value)?;
+            }
+        }
+        count += 1;
+    }
+    body[8..12].copy_from_slice(&count.to_be_bytes());
+
+    let mut out = Vec::with_capacity(FRAME_LEN + body.len());
+    out.extend_from_slice(&len_u32(body.len())?.to_be_bytes());
+    out.extend_from_slice(&crc32c::crc32c(&body).to_be_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    out.extend_from_slice(&len_u32(bytes.len())?.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn len_u32(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| Error::TransactionTooLarge)
 }
 
 fn read_u32(bytes: &[u8]) -> u32 {

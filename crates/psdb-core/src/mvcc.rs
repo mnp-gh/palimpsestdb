@@ -97,15 +97,16 @@ pub(crate) fn latest_commit_ts<E: StorageEngine>(
     engine: &E,
     logical: &[u8],
 ) -> Result<Option<u64>> {
-    let mut found = None;
+    let mut newest = None;
     engine.scan(&KeyRange::prefix(logical), &mut |key, _| {
-        found = Some(key.to_vec());
+        newest = Some(key.to_vec());
         ControlFlow::Break(())
     })?;
-    match found {
-        Some(key) => Ok(Some(split_physical(&key)?.1)),
-        None => Ok(None),
-    }
+    let Some(key) = newest else {
+        return Ok(None);
+    };
+    let (_, ts) = split_physical(&key)?;
+    Ok(Some(ts))
 }
 
 /// Whether any Version of any key under `prefix` exists, live or deleted,

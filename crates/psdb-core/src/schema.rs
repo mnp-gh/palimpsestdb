@@ -133,9 +133,19 @@ pub struct FieldSchema {
 /// A Collection Schema: Field path → its declaration.
 pub(crate) type Schema = BTreeMap<FieldPath, FieldSchema>;
 
+impl CollectionEntry {
+    /// Fail with [`Error::TypeMismatch`] if `doc` breaks any Strict Field.
+    pub(crate) fn check_strict(&self, doc: &RawDocument) -> Result<()> {
+        for (path, field) in self.schema.iter().filter(|(_, f)| f.strict) {
+            check_field(doc, path, *field)?;
+        }
+        Ok(())
+    }
+}
+
 /// Fail with [`Error::TypeMismatch`] unless the value at `path` is missing,
 /// null, or converts exactly to the field's type.
-pub(crate) fn check_field(doc: &RawDocument, path: &FieldPath, field: FieldSchema) -> Result<()> {
+fn check_field(doc: &RawDocument, path: &FieldPath, field: FieldSchema) -> Result<()> {
     match lookup_raw(doc, path)? {
         None | Some(Bson::Null) => Ok(()),
         Some(v) if fits_exactly(&v, field.field_type) => Ok(()),
@@ -158,16 +168,6 @@ fn fits_exactly(value: &Bson, ty: FieldType) -> bool {
         (Bson::Int64(n), FieldType::Double) => n.unsigned_abs() <= TWO_53,
         (Bson::Double(f), FieldType::Double) => !f.is_nan(),
         _ => FieldType::of(value) == Some(ty),
-    }
-}
-
-impl CollectionEntry {
-    /// Fail with [`Error::TypeMismatch`] if `doc` breaks any Strict Field.
-    pub(crate) fn check_strict(&self, doc: &bson::RawDocument) -> Result<()> {
-        for (path, field) in self.schema.iter().filter(|(_, f)| f.strict) {
-            check_field(doc, path, *field)?;
-        }
-        Ok(())
     }
 }
 

@@ -18,7 +18,7 @@ use crate::index::IndexInfo;
 use crate::keys;
 use crate::mvcc;
 use crate::schema::FieldSchema;
-use crate::transaction::{self, Transaction, WriteSet, writes};
+use crate::transaction::{Transaction, WriteSet, writes};
 use crate::wal::{self, OsWalFile, Wal, WalFile};
 
 /// An embedded PalimpsestDB Node over the Storage Engine `E`.
@@ -124,23 +124,21 @@ impl CommitState {
     ) -> Result<u64> {
         // Only the commit lock's holder stores it, so this load sees the newest.
         let commit_ts = latest_visible_commit_ts.load(Ordering::Relaxed) + 1;
-        let Some(wal) = &mut self.wal else {
-            engine.write_batch(mvcc::commit_batch(commit_ts, writes(write_set)))?;
-            self.record_collection_updates(commit_ts, write_set);
-            catalog_cache.record(commit_ts, write_set);
-            latest_visible_commit_ts.store(commit_ts, Ordering::Release);
-            return Ok(commit_ts);
-        };
-        let record = wal::encode_record(commit_ts, writes(write_set))?;
-        // Once the record may be in the WAL, any failure leaves the outcome
-        // unknown, and retrying fsync is unsafe (ADR 0004).
-        let outcome = wal.append(&record).map_err(Error::Io).and_then(|()| {
-            let batch = mvcc::commit_batch(commit_ts, writes(write_set));
-            Ok(engine.write_batch(batch)?)
-        });
-        if let Err(cause) = outcome {
-            poisoned.store(true, Ordering::Relaxed);
-            return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
+        match &mut self.wal {
+            None => engine.write_batch(mvcc::commit_batch(commit_ts, writes(write_set)))?,
+            Some(wal) => {
+                let record = wal::encode_record(commit_ts, writes(write_set))?;
+                // Once the record may be in the WAL, any failure leaves the outcome
+                // unknown, and retrying fsync is unsafe (ADR 0004).
+                let outcome = wal.append(&record).map_err(Error::Io).and_then(|()| {
+                    let batch = mvcc::commit_batch(commit_ts, writes(write_set));
+                    Ok(engine.write_batch(batch)?)
+                });
+                if let Err(cause) = outcome {
+                    poisoned.store(true, Ordering::Relaxed);
+                    return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
+                }
+            }
         }
         // Before publishing: a Snapshot at `commit_ts` must not find the
         // cached entry this commit replaces.
@@ -244,7 +242,7 @@ impl<E: StorageEngine> Node<E> {
                 for record in records.iter().filter(|r| r.commit_ts > last) {
                     engine.write_batch(mvcc::commit_batch(
                         record.commit_ts,
-                        transaction::writes(&record.write_set),
+                        writes(&record.write_set),
                     ))?;
                 }
                 last = wal_last;

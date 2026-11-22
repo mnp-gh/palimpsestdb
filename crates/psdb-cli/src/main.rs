@@ -283,13 +283,15 @@ fn execute<'node>(
             let filter = if args.is_empty() {
                 Document::new()
             } else {
-                as_document(values::<1>(args)?[0].clone())?
+                let [filter] = values::<1>(args)?;
+                as_document(filter)?
             };
             let docs: Vec<_> = with_txn(node, txn, |t| t.find(&coll, &filter)?.collect())?;
-            for doc in &docs {
-                println!("{}", to_json(Bson::Document(doc.clone())));
+            let found = docs.len();
+            for doc in docs {
+                println!("{}", to_json(Bson::Document(doc)));
             }
-            println!("({} found)", docs.len());
+            println!("({found} found)");
         }
 
         "schema" => {

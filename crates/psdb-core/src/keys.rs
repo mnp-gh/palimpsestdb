@@ -90,7 +90,7 @@ pub(crate) fn data_collection(logical: &[u8]) -> Option<(u32, u32)> {
 pub(crate) fn index_catalog_ids(logical: &[u8]) -> Option<(u32, u32, u32)> {
     let rest =
         logical.strip_prefix(collection_prefix(SYSTEM_NAMESPACE, INDEXES_COLLECTION).as_slice())?;
-    let [namespace, collection, index] = *rest.as_chunks::<4>().0 else {
+    let (&[namespace, collection, index], _) = rest.as_chunks::<4>() else {
         return None;
     };
     Some((
@@ -196,7 +196,8 @@ pub(crate) fn index_catalog_key(namespace_id: u32, collection_id: u32, index_id:
 }
 
 /// Whether `logical` is a Namespace, Collection or Index Catalog entry (or
-/// a prefix of them), the keys the Catalog cache holds. Checked on every read, so it allocates nothing.
+/// a prefix of them), the keys the Catalog cache holds. Checked on every
+/// read, so it allocates nothing.
 pub(crate) fn is_catalog_entry_key(logical: &[u8]) -> bool {
     let Some((namespace, rest)) = logical.split_first_chunk::<4>() else {
         return false;
@@ -340,13 +341,10 @@ pub(crate) fn physical_key(logical: &[u8], commit_ts: u64) -> Vec<u8> {
 
 /// Split a physical key into its logical key and Commit Timestamp.
 pub(crate) fn split_physical(physical: &[u8]) -> Result<(&[u8], u64)> {
-    let split = physical
-        .len()
-        .checked_sub(TIMESTAMP_BYTES)
+    let (logical, inverted_ts) = physical
+        .split_last_chunk::<TIMESTAMP_BYTES>()
         .ok_or_else(|| Error::Corruption("physical key shorter than a timestamp".into()))?;
-    let (logical, ts) = physical.split_at(split);
-    let ts: [u8; 8] = ts.try_into().expect("split at 8 bytes from the end");
-    Ok((logical, !u64::from_be_bytes(ts)))
+    Ok((logical, !u64::from_be_bytes(*inverted_ts)))
 }
 
 #[cfg(test)]

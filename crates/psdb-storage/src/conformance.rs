@@ -36,23 +36,6 @@ pub fn run_all<E: StorageEngine>(make: impl Fn() -> E) {
     matches_model_under_random_ops(&make());
 }
 
-fn collect<E: StorageEngine>(engine: &E, range: &KeyRange) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut out = Vec::new();
-    engine
-        .scan(range, &mut |k, v| {
-            out.push((k.to_vec(), v.to_vec()));
-            ControlFlow::Continue(())
-        })
-        .expect("scan failed");
-    out
-}
-
-fn write<E: StorageEngine>(engine: &E, build: impl FnOnce(&mut WriteBatch)) {
-    let mut batch = WriteBatch::new();
-    build(&mut batch);
-    engine.write_batch(batch).expect("write_batch failed");
-}
-
 fn get_missing_key<E: StorageEngine>(engine: &E) {
     assert_eq!(
         engine.get(b"missing").unwrap(),
@@ -68,6 +51,12 @@ fn put_then_get<E: StorageEngine>(engine: &E) {
     assert_eq!(engine.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
     engine.flush().expect("flush failed");
     assert_eq!(engine.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+}
+
+fn write<E: StorageEngine>(engine: &E, build: impl FnOnce(&mut WriteBatch)) {
+    let mut batch = WriteBatch::new();
+    build(&mut batch);
+    engine.write_batch(batch).expect("write_batch failed");
 }
 
 fn later_batch_overwrites<E: StorageEngine>(engine: &E) {
@@ -127,23 +116,33 @@ fn scan_is_byte_ordered<E: StorageEngine>(engine: &E) {
             b.put(k, "v");
         }
     });
-    let got: Vec<Vec<u8>> = collect(engine, &KeyRange::all())
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
+    let got = scanned_keys(engine, &KeyRange::all());
     let mut want: Vec<Vec<u8>> = keys.iter().map(|k| k.to_vec()).collect();
     want.sort();
     assert_eq!(got, want, "scan must visit keys in unsigned byte order");
+}
+
+/// The keys `scan` visits in `range`.
+fn scanned_keys<E: StorageEngine>(engine: &E, range: &KeyRange) -> Vec<Vec<u8>> {
+    collect(engine, range).into_iter().map(|(k, _)| k).collect()
+}
+
+fn collect<E: StorageEngine>(engine: &E, range: &KeyRange) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    engine
+        .scan(range, &mut |k, v| {
+            out.push((k.to_vec(), v.to_vec()));
+            ControlFlow::Continue(())
+        })
+        .expect("scan failed");
+    out
 }
 
 fn scan_respects_range_bounds<E: StorageEngine>(engine: &E) {
     write(engine, |b| {
         b.put("a", "").put("b", "").put("c", "").put("d", "");
     });
-    let got: Vec<Vec<u8>> = collect(engine, &KeyRange::new("b", "d"))
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
+    let got = scanned_keys(engine, &KeyRange::new("b", "d"));
     assert_eq!(
         got,
         vec![b"b".to_vec(), b"c".to_vec()],
@@ -166,10 +165,7 @@ fn scan_prefix<E: StorageEngine>(engine: &E) {
             .put("ac", "")
             .put("a", "");
     });
-    let got: Vec<Vec<u8>> = collect(engine, &KeyRange::prefix(b"ab"))
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
+    let got = scanned_keys(engine, &KeyRange::prefix(b"ab"));
     assert_eq!(
         got,
         vec![b"ab".to_vec(), b"abc".to_vec(), b"ab\xff".to_vec()]
@@ -192,29 +188,6 @@ fn scan_stops_on_break<E: StorageEngine>(engine: &E) {
         })
         .unwrap();
     assert_eq!(seen, 2, "scan must stop when visit returns Break");
-}
-
-/// A small deterministic PRNG so the suite needs no dependencies.
-struct XorShift(u64);
-
-impl XorShift {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-
-    fn key(&mut self) -> Vec<u8> {
-        // A tiny alphabet with the edge bytes makes collisions and prefixes common.
-        const ALPHABET: [u8; 4] = [0x00, b'a', b'b', 0xFF];
-        let len = self.below(4) as usize;
-        (0..len).map(|_| ALPHABET[self.below(4) as usize]).collect()
-    }
 }
 
 fn matches_model_under_random_ops<E: StorageEngine>(engine: &E) {
@@ -258,5 +231,28 @@ fn matches_model_under_random_ops<E: StorageEngine>(engine: &E) {
             want,
             "scan({range:?}) in round {round}"
         );
+    }
+}
+
+/// A small deterministic PRNG so the suite needs no dependencies.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn key(&mut self) -> Vec<u8> {
+        // A tiny alphabet with the edge bytes makes collisions and prefixes common.
+        const ALPHABET: [u8; 4] = [0x00, b'a', b'b', 0xFF];
+        let len = self.below(4) as usize;
+        (0..len).map(|_| ALPHABET[self.below(4) as usize]).collect()
     }
 }
