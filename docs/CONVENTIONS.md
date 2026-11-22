@@ -21,6 +21,10 @@ The Database Layer is generic over the Storage Engine (`Node<E: StorageEngine>`)
 - Named `psdb-<area>`; split at the seams above.
 - Dependencies point down: engine crates depend only on `psdb-storage`; `psdb-core` depends on `psdb-storage` and names a concrete engine only in tests and binaries.
 
+## Code layout
+
+- Files read top-down: a function comes before the helpers it calls, and each helper sits just below its first caller. A helper that only serves one `impl` goes inside it as an associated function, so it stays next to its caller.
+
 ## Documentation
 
 - `#![deny(missing_docs)]` in every crate.
