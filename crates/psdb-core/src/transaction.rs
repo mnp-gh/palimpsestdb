@@ -423,51 +423,71 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// when one fits the filter (see [`Node::create_index`]), and the
     /// whole Collection otherwise; either way every candidate is checked
     /// against the whole filter.
+    ///
+    /// The Documents stream: they are read from the engine a chunk at a
+    /// time as the iterator advances (ADR 0016), so the Transaction stays
+    /// borrowed until the iterator is dropped. An Index plan first collects
+    /// the keys of every candidate Document. After an error the iterator
+    /// ends.
     pub fn find(
         &mut self,
         collection: &CollectionPath,
         filter: &Document,
-    ) -> Result<Vec<Document>> {
+    ) -> Result<impl Iterator<Item = Result<Document>> + '_> {
         let filter = Filter::parse(filter)?;
         let entry = self.collection_entry(collection)?;
-        let candidates = match index::plan(&filter, &entry) {
-            None => self.scan_range(&entry.documents()).collect::<Result<_>>()?,
-            Some(ranges) => {
-                // A set of Document keys, so a Document found through several
-                // ranges is read once, in Document ID order; only the keys
-                // are held, not the Documents.
-                let prefix = entry.prefix();
-                let mut keys = BTreeSet::new();
-                for range in &ranges {
-                    match range {
-                        CandidateRange::Documents(range) => {
-                            for item in self.scan_range(range) {
-                                keys.insert(item?.0);
+        let this = &*self;
+        let candidates: Box<dyn Iterator<Item = Result<Vec<u8>>> + '_> =
+            match index::plan(&filter, &entry) {
+                None => Box::new(
+                    this.scan_range(&entry.documents())
+                        .map(|r| r.map(|(_, v)| v)),
+                ),
+                Some(ranges) => {
+                    // A set of Document keys, so a Document found through
+                    // several ranges is read once, in Document ID order.
+                    let prefix = entry.prefix();
+                    let mut keys = BTreeSet::new();
+                    for range in &ranges {
+                        match range {
+                            CandidateRange::Documents(range) => {
+                                for item in this.scan_range(range) {
+                                    keys.insert(item?.0);
+                                }
                             }
-                        }
-                        CandidateRange::Index(range) => {
-                            for item in self.scan_range(range) {
-                                keys.insert([prefix.as_slice(), &item?.1].concat());
+                            CandidateRange::Index(range) => {
+                                for item in this.scan_range(range) {
+                                    keys.insert([prefix.as_slice(), &item?.1].concat());
+                                }
                             }
                         }
                     }
+                    Box::new(
+                        keys.into_iter()
+                            .filter_map(|key| this.read(&key).transpose()),
+                    )
                 }
-                let mut docs = BTreeMap::new();
-                for key in keys {
-                    if let Some(bytes) = self.read(&key)? {
-                        docs.insert(key, bytes);
+            };
+        let mut candidates = candidates;
+        Ok(std::iter::from_fn(move || {
+            while let Some(bytes) = candidates.next() {
+                let matched = bytes.and_then(|bytes| {
+                    Ok(match filter.matches_raw(document::raw(&bytes)?)? {
+                        true => Some(document::decode(&bytes)?),
+                        false => None,
+                    })
+                });
+                match matched {
+                    Ok(None) => {}
+                    Ok(Some(doc)) => return Some(Ok(doc)),
+                    Err(e) => {
+                        candidates = Box::new(std::iter::empty());
+                        return Some(Err(e));
                     }
                 }
-                docs
             }
-        };
-        let mut out = Vec::new();
-        for bytes in candidates.values() {
-            if filter.matches_raw(document::raw(bytes)?)? {
-                out.push(document::decode(bytes)?);
-            }
-        }
-        Ok(out)
+            None
+        }))
     }
 
     /// Commit. Returns the Commit Timestamp, or the Snapshot timestamp for a
