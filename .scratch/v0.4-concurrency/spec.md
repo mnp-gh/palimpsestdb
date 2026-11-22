@@ -1,6 +1,6 @@
 # v0.4: Concurrency
 
-Status: ready-for-agent
+Status: resolved
 
 A thread-safe Database Layer for embedded use with plain threads: Transactions begin and run in parallel, commits stay one at a time, Index builds no longer stop the world, and old Versions are collected. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0004](../../docs/adr/0004-database-layer-owns-wal.md), [ADR 0007](../../docs/adr/0007-runtime-model.md), [ADR 0012](../../docs/adr/0012-garbage-collection-is-not-logged.md), [ADR 0013](../../docs/adr/0013-building-indexes-take-the-lock-per-chunk.md) and [ADR 0014](../../docs/adr/0014-indexes-have-their-own-catalog-entries.md).
 

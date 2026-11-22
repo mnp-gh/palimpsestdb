@@ -1,6 +1,6 @@
 # Read-only commits take the commit lock
 
-Status: ready-for-human (fixed on main, uncommitted)
+Status: resolved
 
 Autocommit reads (`Node::get`, `Node::find`, `list_*`) run through `Node::run` (`node.rs:325`), which calls `Transaction::commit` (`transaction.rs:394`). `commit` takes the commit lock before it checks `write_set.is_empty()` (`transaction.rs:409`). So a read-only `get` waits while another thread holds the lock for its fsync (several ms with `F_FULLFSYNC` on macOS), or for an Index build chunk.
 

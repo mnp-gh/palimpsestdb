@@ -1,6 +1,6 @@
 # v0.3: Indexes
 
-Status: ready-for-human (implemented on `v0.3-indexes`)
+Status: resolved
 
 Single-field secondary Indexes, typed by a Collection Schema, kept consistent with their Documents at every Snapshot, and used by `find` when they fit the filter. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0010](../../docs/adr/0010-index-builds-commit-in-chunks.md) and [ADR 0011](../../docs/adr/0011-field-types-live-in-collection-schema.md).
 
