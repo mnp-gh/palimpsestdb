@@ -1,6 +1,6 @@
 # v0.2: Durability
 
-Status: ready-for-human (implemented on `v0.2-durability`)
+Status: resolved
 
 The in-memory Storage Engine plus a WAL owned by the Database Layer is a durable database: every commit acknowledged as COMMITTED survives a crash. Terms follow [GLOSSARY.md](../../GLOSSARY.md); the design is [ADR 0004](../../docs/adr/0004-database-layer-owns-wal.md).
 

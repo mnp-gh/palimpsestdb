@@ -1,6 +1,6 @@
 # v0.4.2: Resume Recovery
 
-Status: ready-for-human (implemented on `v0.4.2-resume-recovery`)
+Status: resolved
 
 Recovery brings an engine that already holds data level with the WAL by replaying only the WAL Records above its `applied_up_to`. Design: [ADR 0015](../../docs/adr/0015-wal-is-the-authority-engine-may-lag.md). Needs v0.4.1.
 

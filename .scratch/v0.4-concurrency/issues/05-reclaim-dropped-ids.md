@@ -1,6 +1,6 @@
 # Reclaim dropped Namespaces, Collections and Indexes
 
-Status: ready-for-agent
+Status: resolved
 Blocked by: 03, 04, 07, 09
 
 Spec: [Garbage Collection](../spec.md#garbage-collection).

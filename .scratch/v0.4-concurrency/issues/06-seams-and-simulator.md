@@ -1,6 +1,6 @@
 # Clock and random seams, deterministic simulator
 
-Status: ready-for-human (implemented on `v0.4-concurrency`)
+Status: resolved
 Blocked by: 01, 02, 03, 04, 05, 09
 
 Spec: [Seams and simulator](../spec.md#seams-and-simulator).
