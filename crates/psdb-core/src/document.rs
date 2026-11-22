@@ -41,6 +41,12 @@ pub struct Limits {
     /// Document, plus the old and new Index entries on its large fields,
     /// each up to twice the field's size once NUL bytes are escaped.
     pub max_write_set_bytes: usize,
+    /// The most values one chunk of a streaming read returns before the
+    /// next chunk rescans the engine (ADR 0016).
+    pub scan_chunk_keys: usize,
+    /// The bytes of values after which a chunk of a streaming read stops;
+    /// a chunk always returns at least one value, however large.
+    pub scan_chunk_bytes: usize,
 }
 
 impl Default for Limits {
@@ -49,6 +55,8 @@ impl Default for Limits {
             max_document_bytes: 16 * 1024 * 1024,
             max_nesting_depth: 100,
             max_write_set_bytes: 96 * 1024 * 1024,
+            scan_chunk_keys: 1_000,
+            scan_chunk_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -77,6 +85,16 @@ impl Limits {
     pub fn with_max_write_set_bytes(self, bytes: usize) -> Self {
         Self {
             max_write_set_bytes: bytes,
+            ..self
+        }
+    }
+
+    /// These limits with [`scan_chunk_keys`](Self::scan_chunk_keys) set to
+    /// `keys` and [`scan_chunk_bytes`](Self::scan_chunk_bytes) to `bytes`.
+    pub fn with_scan_chunk(self, keys: usize, bytes: usize) -> Self {
+        Self {
+            scan_chunk_keys: keys,
+            scan_chunk_bytes: bytes,
             ..self
         }
     }

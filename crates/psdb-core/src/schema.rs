@@ -206,8 +206,8 @@ impl<E: StorageEngine> Transaction<'_, E> {
         }
         let already_enforced = old.is_some_and(|o| o.strict && o.field_type == field.field_type);
         if field.strict && !already_enforced {
-            for bytes in self.scan_range(&entry.documents())?.values() {
-                check_field(document::raw(bytes)?, path, field)?;
+            for item in self.scan_range(&entry.documents()) {
+                check_field(document::raw(&item?.1)?, path, field)?;
             }
             // A Document committed concurrently was not checked.
             self.depend_on_whole_collection(entry.prefix());
