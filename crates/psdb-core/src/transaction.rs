@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
+use std::sync::atomic::Ordering;
 
 use bson::{Bson, Document, RawDocument};
 use psdb_storage::{KeyRange, StorageEngine};
@@ -393,6 +394,10 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// or not, fails with [`Error::Poisoned`].
     pub fn commit(self) -> Result<u64> {
         let node = self.node;
+        // Read-only: skip the lock, so it never waits behind another commit's fsync.
+        if self.write_set.is_empty() && !node.poisoned.load(Ordering::Relaxed) {
+            return Ok(self.snapshot_ts);
+        }
         let mut commit_state = node.commit_lock.lock().expect("lock poisoned");
         self.commit_under_lock(&mut commit_state)
     }
@@ -400,7 +405,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// [`commit`](Self::commit), for a caller already holding the commit
     /// lock.
     pub(crate) fn commit_under_lock(self, commit_state: &mut CommitState) -> Result<u64> {
-        if commit_state.poisoned {
+        if self.node.poisoned.load(Ordering::Relaxed) {
             return Err(Error::Poisoned);
         }
         // A read-only Transaction saw a consistent Snapshot and wrote nothing
@@ -444,6 +449,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             engine,
             &self.node.catalog_cache,
             &self.node.latest_visible_commit_ts,
+            &self.node.poisoned,
             &self.write_set,
         )
     }
@@ -455,5 +461,29 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
 impl<'node, E: StorageEngine> Drop for Transaction<'node, E> {
     fn drop(&mut self) {
         self.node.unregister_snapshot(self.snapshot_ts);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use psdb_storage_memory::MemoryEngine;
+
+    use crate::Node;
+
+    #[test]
+    fn read_only_commit_does_not_wait_for_the_commit_lock() {
+        let node = Node::new(MemoryEngine::new()).unwrap();
+        let held = node.commit_lock.lock().unwrap();
+        let (done, finished) = mpsc::channel();
+        thread::scope(|s| {
+            s.spawn(|| done.send(node.begin_transaction().commit()).unwrap());
+            let committed = finished.recv_timeout(Duration::from_secs(5));
+            drop(held);
+            assert!(matches!(committed, Ok(Ok(_))), "read-only commit blocked");
+        });
     }
 }

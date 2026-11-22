@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bson::{Bson, Document};
 use psdb_storage::StorageEngine;
@@ -55,6 +55,10 @@ pub struct Node<E: StorageEngine> {
     /// outside [`CommitState`] because `begin_transaction()` and reads load it without
     /// taking the commit lock.
     pub(crate) latest_visible_commit_ts: AtomicU64,
+    /// Set by the commit lock's holder when a commit's outcome is unknown;
+    /// nothing more may commit. Outside [`CommitState`] so read-only commits
+    /// check it without taking the commit lock.
+    pub(crate) poisoned: AtomicBool,
     /// Only the commit lock's holder updates it, after the engine write and
     /// before publishing. Its own lock keeps Catalog reads off the commit lock.
     pub(crate) catalog_cache: CatalogCache,
@@ -93,8 +97,6 @@ impl Default for IdGenerator {
 pub(crate) struct CommitState {
     /// `None` when nothing is durable.
     wal: Option<Wal>,
-    /// Set when a commit's outcome is unknown; nothing more may commit.
-    pub(crate) poisoned: bool,
     /// Collection prefix → Commit Timestamp of the last commit since the
     /// Node opened that wrote a Document there. Index entries do not count.
     /// Entries of dropped Collections stay: a few bytes each.
@@ -105,7 +107,6 @@ impl CommitState {
     pub(crate) fn new(wal: Option<Wal>) -> Self {
         Self {
             wal,
-            poisoned: false,
             last_document_commit: HashMap::new(),
         }
     }
@@ -117,6 +118,7 @@ impl CommitState {
         engine: &E,
         catalog_cache: &CatalogCache,
         latest_visible_commit_ts: &AtomicU64,
+        poisoned: &AtomicBool,
         write_set: &WriteSet,
     ) -> Result<u64> {
         // Only the commit lock's holder stores it, so this load sees the newest.
@@ -136,7 +138,7 @@ impl CommitState {
             Ok(engine.write_batch(batch)?)
         });
         if let Err(cause) = outcome {
-            self.poisoned = true;
+            poisoned.store(true, Ordering::Relaxed);
             return Err(Error::CommitOutcomeUnknown(Box::new(cause)));
         }
         // Before publishing: a Snapshot at `commit_ts` must not find the
@@ -158,9 +160,8 @@ impl CommitState {
 
 impl<E: StorageEngine> Node<E> {
     /// Open over `engine` with default [`Limits`], keeping nothing
-    /// durable. An engine that already holds data, such as one shared
-    /// through an `Arc` with a Node now dropped, is reopened where it left
-    /// off. Fails with [`Error::Corruption`] if it holds data without
+    /// durable. An engine that already holds data is reopened where it
+    /// left off. Fails with [`Error::Corruption`] if it holds data without
     /// `applied_up_to`.
     pub fn new(engine: E) -> Result<Self> {
         Self::with_limits(engine, Limits::default())
@@ -268,6 +269,7 @@ impl<E: StorageEngine> Node<E> {
             id_generator,
             commit_lock: Mutex::new(CommitState::new(wal)),
             latest_visible_commit_ts: AtomicU64::new(last),
+            poisoned: AtomicBool::new(false),
             catalog_cache,
             snapshot_registry: Mutex::new(BTreeMap::new()),
             gc_lock: Mutex::new(()),

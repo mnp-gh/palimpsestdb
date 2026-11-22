@@ -6,5 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+# Test support: `impl StorageEngine for Arc<E>`.
+testing = []
+
 [lints]
 workspace = true
