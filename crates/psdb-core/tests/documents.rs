@@ -246,3 +246,62 @@ fn client_supplied_object_ids_work_as_ids_and_fields() {
         .unwrap();
     assert_eq!(found.len(), 1);
 }
+
+/// A Node whose scans read at most `keys` Documents or `bytes` bytes per
+/// chunk, with `shop.orders` created.
+fn chunked_shop(keys: usize, bytes: usize) -> Node<MemoryEngine> {
+    let node = Node::with_limits(
+        MemoryEngine::new(),
+        Limits::default().with_scan_chunk(keys, bytes),
+    )
+    .unwrap();
+    node.create_namespace("shop").unwrap();
+    node.create_collection(&collection("shop.orders")).unwrap();
+    node
+}
+
+fn ids(docs: &[bson::Document]) -> Vec<i32> {
+    docs.iter().map(|d| d.get_i32("_id").unwrap()).collect()
+}
+
+#[test]
+fn find_reads_many_chunks_with_own_writes_applied() {
+    let node = chunked_shop(2, usize::MAX);
+    let orders = collection("shop.orders");
+    for id in 0..10 {
+        node.insert(&orders, doc! { "_id": id, "v": 0 }).unwrap();
+    }
+    // Several Versions and Tombstones, some on chunk boundaries.
+    for v in 1..4 {
+        node.replace(&orders, &Bson::Int32(1), doc! { "v": v })
+            .unwrap();
+        node.replace(&orders, &Bson::Int32(2), doc! { "v": v })
+            .unwrap();
+    }
+    node.delete(&orders, &Bson::Int32(3)).unwrap();
+    node.delete(&orders, &Bson::Int32(4)).unwrap();
+
+    let mut txn = node.begin_transaction();
+    txn.insert(&orders, doc! { "_id": 11 }).unwrap();
+    txn.insert(&orders, doc! { "_id": 3 }).unwrap();
+    txn.replace(&orders, &Bson::Int32(5), doc! { "v": 9 })
+        .unwrap();
+    txn.delete(&orders, &Bson::Int32(6)).unwrap();
+    txn.delete(&orders, &Bson::Int32(7)).unwrap();
+
+    let docs = txn.find(&orders, &doc! {}).unwrap();
+    assert_eq!(ids(&docs), [0, 1, 2, 3, 5, 8, 9, 11]);
+    assert_eq!(docs[1].get_i32("v").unwrap(), 3);
+    assert_eq!(docs[4].get_i32("v").unwrap(), 9);
+}
+
+#[test]
+fn find_returns_a_document_larger_than_a_chunk() {
+    let node = chunked_shop(1000, 10);
+    let orders = collection("shop.orders");
+    for id in 0..3 {
+        node.insert(&orders, doc! { "_id": id, "pad": "x".repeat(100) })
+            .unwrap();
+    }
+    assert_eq!(ids(&node.find(&orders, &doc! {}).unwrap()), [0, 1, 2]);
+}

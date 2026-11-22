@@ -30,6 +30,87 @@ pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
     write_set.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
 }
 
+/// Where a chunked scan of a key range stands (ADR 0016). It holds no
+/// borrow, so each step is handed the Transaction it reads through.
+struct Scan {
+    /// Where the next chunk starts, or `None` once the range is done or a
+    /// chunk failed.
+    next_start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
+    chunk: std::collections::btree_map::IntoIter<Vec<u8>, Vec<u8>>,
+}
+
+impl Scan {
+    fn new(range: &KeyRange) -> Self {
+        Self {
+            next_start: Some(range.start.clone()),
+            end: range.end.clone(),
+            chunk: BTreeMap::new().into_iter(),
+        }
+    }
+
+    /// The next live key and value. After the range ends or an error,
+    /// `None`.
+    fn next<E: StorageEngine>(
+        &mut self,
+        txn: &Transaction<'_, E>,
+    ) -> Option<Result<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            if let Some(item) = self.chunk.next() {
+                return Some(Ok(item));
+            }
+            let start = self.next_start.take()?;
+            let range = KeyRange {
+                start,
+                end: self.end.clone(),
+            };
+            if let Err(e) = self.read_chunk(txn, range) {
+                return Some(Err(e));
+            }
+        }
+    }
+
+    /// Read the next chunk of `range` at the Snapshot with own writes
+    /// overlaid, and set where the chunk after it starts.
+    fn read_chunk<E: StorageEngine>(
+        &mut self,
+        txn: &Transaction<'_, E>,
+        range: KeyRange,
+    ) -> Result<()> {
+        let limits = &txn.node.limits;
+        let mut live = BTreeMap::new();
+        let mut bytes = 0;
+        let mut last = None;
+        mvcc::scan_range_at(
+            &txn.node.engine,
+            &range,
+            txn.snapshot_ts,
+            &mut |key, value| {
+                bytes += value.len();
+                live.insert(key.to_vec(), value);
+                if live.len() >= limits.scan_chunk_keys || bytes >= limits.scan_chunk_bytes {
+                    last = Some(key.to_vec());
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            },
+        )?;
+        let read = match last {
+            None => range,
+            Some(last) => {
+                // Just past the oldest possible Version of `last`; keys are
+                // self-delimiting (ADR 0008), so no other logical key falls between.
+                let mut resume = keys::physical_key(&last, 0);
+                resume.push(0);
+                self.next_start = Some(resume.clone());
+                KeyRange::new(range.start, resume)
+            }
+        };
+        self.chunk = txn.overlay_own_writes(&read, live).into_iter();
+        Ok(())
+    }
+}
+
 /// A Transaction: reads see the Snapshot taken at [`Node::begin_transaction`] plus
 /// this Transaction's own writes; writes stay in its Write Set until
 /// [`commit`](Self::commit).
@@ -180,14 +261,19 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             );
             return Ok(self.overlay_own_writes(&range, cached));
         }
-        self.scan_range(&range)
+        let live = self.scan_snapshot(&range)?;
+        Ok(self.overlay_own_writes(&range, live))
     }
 
-    /// Every live value whose logical key is in `range`: the Snapshot with
-    /// own writes overlaid, in key order.
-    pub(crate) fn scan_range(&self, range: &KeyRange) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        let live = self.scan_snapshot(range)?;
-        Ok(self.overlay_own_writes(range, live))
+    /// Every live key and value in `range`: the Snapshot with own writes
+    /// overlaid, in key order, read from the engine a chunk at a time
+    /// (ADR 0016).
+    pub(crate) fn scan_range(
+        &self,
+        range: &KeyRange,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
+        let mut scan = Scan::new(range);
+        std::iter::from_fn(move || scan.next(self))
     }
 
     /// Every live value in `range` at the Snapshot, read from the engine.
@@ -346,17 +432,22 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         let entry = self.collection_entry(collection)?;
         let prefix = entry.prefix();
         let candidates = match index::plan(&filter, &entry) {
-            None => self.scan_range(&entry.documents())?,
+            None => self.scan_range(&entry.documents()).collect::<Result<_>>()?,
             Some(ranges) => {
                 // Keyed by Document key, so a Document found through several
                 // ranges is read once, and results stay in Document ID order.
                 let mut docs = BTreeMap::new();
                 for range in &ranges {
                     match range {
-                        CandidateRange::Documents(range) => docs.extend(self.scan_range(range)?),
+                        CandidateRange::Documents(range) => {
+                            for item in self.scan_range(range) {
+                                let (key, bytes) = item?;
+                                docs.insert(key, bytes);
+                            }
+                        }
                         CandidateRange::Index(range) => {
-                            for doc_id in self.scan_range(range)?.into_values() {
-                                let key = [prefix.as_slice(), &doc_id].concat();
+                            for item in self.scan_range(range) {
+                                let key = [prefix.as_slice(), &item?.1].concat();
                                 if !docs.contains_key(&key)
                                     && let Some(bytes) = self.read(&key)?
                                 {
