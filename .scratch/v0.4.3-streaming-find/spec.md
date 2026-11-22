@@ -1,6 +1,6 @@
 # v0.4.3: Streaming find
 
-Status: ready-for-agent
+Status: resolved
 
 `find` stops loading a whole Collection into memory. Independent of v0.4.1 and v0.4.2. Design: [ADR 0016](../../docs/adr/0016-streaming-reads-rescan-in-chunks.md).
 

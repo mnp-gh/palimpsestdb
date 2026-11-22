@@ -10,7 +10,7 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | v0.4 | Concurrency | Done |
 | v0.4.1 | Catalog from engine | Done |
 | v0.4.2 | Resume Recovery | Done |
-| v0.4.3 | Streaming find | Planned |
+| v0.4.3 | Streaming find | Done |
 | v0.4.4 | Persistent engine | Planned |
 | v0.4.5 | Checkpoint | Planned |
 | v0.5 | Serializable | Planned |
@@ -79,7 +79,8 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## v0.4.3: Streaming find
 
-- `find`, `scan` and `scan_range` return iterators built from chunked rescans at the Snapshot (chunk size in `Limits`); the Storage Engine trait is unchanged. Results stay in Document ID order; Index plans buffer candidate keys, not Documents
+- `Transaction::find` and Document and Index range reads return iterators built from chunked rescans at the Snapshot (chunk limits in Documents and bytes in `Limits`); the Storage Engine trait is unchanged ([ADR 0016](./adr/0016-streaming-reads-rescan-in-chunks.md)). Results stay in Document ID order; Index plans buffer candidate keys, not Documents
+- Only an explicit Transaction streams; `Node::find` (autocommit) still returns a `Vec`, as PostgreSQL's JDBC driver streams only outside autocommit. Catalog listings are not streamed
 
 ## v0.4.4: Persistent engine
 
