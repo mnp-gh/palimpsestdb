@@ -183,7 +183,9 @@ fn read_only_transactions_commit_even_if_a_collection_they_read_is_dropped() {
     node.drop_collection(&collection("shop.orders")).unwrap();
     // The Snapshot still shows the Collection and its Document.
     assert_eq!(
-        t1.find(&collection("shop.orders"), &doc! {}).unwrap().len(),
+        t1.find(&collection("shop.orders"), &doc! {})
+            .unwrap()
+            .count(),
         1
     );
     t1.commit()

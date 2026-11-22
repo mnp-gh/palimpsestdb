@@ -95,7 +95,8 @@ impl Scan {
                 ControlFlow::Continue(())
             },
         )?;
-        let read = match last {
+        // The part of `range` this chunk covers, for overlaying own writes.
+        let covered = match last {
             None => range,
             Some(last) => {
                 // Just past the oldest possible Version of `last`; keys are
@@ -106,7 +107,7 @@ impl Scan {
                 KeyRange::new(range.start, resume)
             }
         };
-        self.chunk = txn.overlay_own_writes(&read, live).into_iter();
+        self.chunk = txn.overlay_own_writes(&covered, live).into_iter();
         Ok(())
     }
 }
@@ -423,51 +424,86 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// when one fits the filter (see [`Node::create_index`]), and the
     /// whole Collection otherwise; either way every candidate is checked
     /// against the whole filter.
-    pub fn find(
-        &mut self,
+    ///
+    /// The Documents stream: they are read from the engine a chunk at a
+    /// time as the iterator advances (ADR 0016), so the Transaction stays
+    /// borrowed (`'txn`) until the iterator is dropped. An Index plan first collects
+    /// the keys of every candidate Document. After an error the iterator
+    /// ends.
+    pub fn find<'txn>(
+        &'txn mut self,
         collection: &CollectionPath,
         filter: &Document,
-    ) -> Result<Vec<Document>> {
+    ) -> Result<impl Iterator<Item = Result<Document>> + 'txn> {
         let filter = Filter::parse(filter)?;
         let entry = self.collection_entry(collection)?;
-        let candidates = match index::plan(&filter, &entry) {
-            None => self.scan_range(&entry.documents()).collect::<Result<_>>()?,
-            Some(ranges) => {
-                // A set of Document keys, so a Document found through several
-                // ranges is read once, in Document ID order; only the keys
-                // are held, not the Documents.
-                let prefix = entry.prefix();
-                let mut keys = BTreeSet::new();
-                for range in &ranges {
-                    match range {
-                        CandidateRange::Documents(range) => {
-                            for item in self.scan_range(range) {
-                                keys.insert(item?.0);
-                            }
-                        }
-                        CandidateRange::Index(range) => {
-                            for item in self.scan_range(range) {
-                                keys.insert([prefix.as_slice(), &item?.1].concat());
-                            }
-                        }
+        // From here on only reads, so the iterator can borrow `self` shared.
+        let this = &*self;
+        let mut candidates: Box<dyn Iterator<Item = Result<Vec<u8>>> + 'txn> =
+            match index::plan(&filter, &entry) {
+                None => {
+                    let documents = this.scan_range(&entry.documents());
+                    Box::new(documents.map(|item| item.map(|(_, bytes)| bytes)))
+                }
+                Some(ranges) => {
+                    let keys = this.candidate_keys(&entry.prefix(), &ranges)?;
+                    // A key whose Document is gone (`read` gives `None`) is skipped.
+                    Box::new(
+                        keys.into_iter()
+                            .filter_map(|key| this.read(&key).transpose()),
+                    )
+                }
+            };
+        Ok(std::iter::from_fn(move || {
+            while let Some(bytes) = candidates.next() {
+                match bytes.and_then(|bytes| Self::decode_if_matches(&filter, &bytes)) {
+                    Ok(None) => continue,
+                    Ok(Some(doc)) => return Some(Ok(doc)),
+                    Err(e) => {
+                        // End the iterator after its first error.
+                        candidates = Box::new(std::iter::empty());
+                        return Some(Err(e));
                     }
                 }
-                let mut docs = BTreeMap::new();
-                for key in keys {
-                    if let Some(bytes) = self.read(&key)? {
-                        docs.insert(key, bytes);
-                    }
-                }
-                docs
             }
-        };
-        let mut out = Vec::new();
-        for bytes in candidates.values() {
-            if filter.matches_raw(document::raw(bytes)?)? {
-                out.push(document::decode(bytes)?);
+            None
+        }))
+    }
+
+    /// The keys of the Documents an Index plan's `ranges` name. A set, so a
+    /// Document found through several ranges is read once, in Document ID
+    /// order.
+    fn candidate_keys(
+        &self,
+        prefix: &[u8],
+        ranges: &[CandidateRange],
+    ) -> Result<BTreeSet<Vec<u8>>> {
+        let mut keys = BTreeSet::new();
+        for range in ranges {
+            match range {
+                CandidateRange::Documents(range) => {
+                    for item in self.scan_range(range) {
+                        let (key, _) = item?;
+                        keys.insert(key);
+                    }
+                }
+                CandidateRange::Index(range) => {
+                    for item in self.scan_range(range) {
+                        let (_, doc_id) = item?;
+                        keys.insert([prefix, &doc_id].concat());
+                    }
+                }
             }
         }
-        Ok(out)
+        Ok(keys)
+    }
+
+    /// The decoded Document in `bytes` if it matches `filter`, else `None`.
+    fn decode_if_matches(filter: &Filter, bytes: &[u8]) -> Result<Option<Document>> {
+        if !filter.matches_raw(document::raw(bytes)?)? {
+            return Ok(None);
+        }
+        document::decode(bytes).map(Some)
     }
 
     /// Commit. Returns the Commit Timestamp, or the Snapshot timestamp for a

@@ -129,7 +129,9 @@ fn concurrent_threads_stress_test() {
                 let snap = txn.snapshot_ts();
                 // Horizon must never exceed any active transaction's snapshot.
                 assert!(node.horizon() <= snap);
-                txn.find(&orders, &doc! {}).unwrap();
+                txn.find(&orders, &doc! {})
+                    .unwrap()
+                    .for_each(|d| drop(d.unwrap()));
                 thread::yield_now();
             }
         }));

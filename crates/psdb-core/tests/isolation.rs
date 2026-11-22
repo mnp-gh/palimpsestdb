@@ -41,7 +41,7 @@ fn snapshot_is_stable_while_others_commit() {
         reader
             .find(&collection("shop.orders"), &doc! {})
             .unwrap()
-            .len(),
+            .count(),
         1,
         "no phantom"
     );
@@ -68,7 +68,9 @@ fn reads_see_own_writes_only() {
             .is_some()
     );
     assert_eq!(
-        t1.find(&collection("shop.orders"), &doc! {}).unwrap().len(),
+        t1.find(&collection("shop.orders"), &doc! {})
+            .unwrap()
+            .count(),
         1
     );
 
@@ -85,7 +87,8 @@ fn reads_see_own_writes_only() {
     assert!(
         t1.find(&collection("shop.orders"), &doc! {})
             .unwrap()
-            .is_empty(),
+            .next()
+            .is_none(),
         "own delete hides own insert"
     );
 }
@@ -204,13 +207,13 @@ fn snapshot_isolation_permits_write_skew() {
     assert_eq!(
         t1.find(&collection("shop.doctors"), &on_call)
             .unwrap()
-            .len(),
+            .count(),
         2
     );
     assert_eq!(
         t2.find(&collection("shop.doctors"), &on_call)
             .unwrap()
-            .len(),
+            .count(),
         2
     );
     t1.replace(
