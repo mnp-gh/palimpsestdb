@@ -265,7 +265,7 @@ fn ids(docs: &[bson::Document]) -> Vec<i32> {
 }
 
 #[test]
-fn find_reads_many_chunks_with_own_writes_applied() {
+fn find_streams_many_chunks_with_own_writes_applied() {
     let node = chunked_shop(2, usize::MAX);
     let orders = collection("shop.orders");
     for id in 0..10 {
@@ -289,7 +289,11 @@ fn find_reads_many_chunks_with_own_writes_applied() {
     txn.delete(&orders, &Bson::Int32(6)).unwrap();
     txn.delete(&orders, &Bson::Int32(7)).unwrap();
 
-    let docs = txn.find(&orders, &doc! {}).unwrap();
+    let docs: Vec<_> = txn
+        .find(&orders, &doc! {})
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
     assert_eq!(ids(&docs), [0, 1, 2, 3, 5, 8, 9, 11]);
     assert_eq!(docs[1].get_i32("v").unwrap(), 3);
     assert_eq!(docs[4].get_i32("v").unwrap(), 9);
@@ -304,4 +308,20 @@ fn find_returns_a_document_larger_than_a_chunk() {
             .unwrap();
     }
     assert_eq!(ids(&node.find(&orders, &doc! {}).unwrap()), [0, 1, 2]);
+}
+
+#[test]
+fn find_does_not_see_a_commit_between_chunks() {
+    let node = chunked_shop(2, usize::MAX);
+    let orders = collection("shop.orders");
+    for id in 0..6 {
+        node.insert(&orders, doc! { "_id": id }).unwrap();
+    }
+    let mut txn = node.begin_transaction();
+    let mut found = txn.find(&orders, &doc! {}).unwrap();
+    let mut docs: Vec<_> = found.by_ref().take(2).map(Result::unwrap).collect();
+    node.insert(&orders, doc! { "_id": 9 }).unwrap();
+    node.delete(&orders, &Bson::Int32(4)).unwrap();
+    docs.extend(found.map(Result::unwrap));
+    assert_eq!(ids(&docs), [0, 1, 2, 3, 4, 5]);
 }

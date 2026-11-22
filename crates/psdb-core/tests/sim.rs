@@ -435,11 +435,23 @@ fn check(
         prop_assert_eq!(values.len(), len, "a Ready unique Index over duplicates");
     }
     let check_slot = |txn: &mut Transaction<'_, Engine>, view: BTreeMap<i32, i32>| {
-        let all = txn.find(orders, &doc! {}).unwrap();
+        let all = txn
+            .find(orders, &doc! {})
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
         prop_assert_eq!(all, as_docs(&view), "at Snapshot {}", txn.snapshot_ts());
-        let high = txn.find(orders, &doc! { "n": { "$gte": 2 } }).unwrap();
+        let high = txn
+            .find(orders, &doc! { "n": { "$gte": 2 } })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
         prop_assert_eq!(high, as_docs(view.iter().filter(|(_, n)| **n >= 2)));
-        let three = txn.find(orders, &doc! { "n": 3 }).unwrap();
+        let three = txn
+            .find(orders, &doc! { "n": 3 })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
         prop_assert_eq!(three, as_docs(view.iter().filter(|(_, n)| **n == 3)));
         Ok(())
     };

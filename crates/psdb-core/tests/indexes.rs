@@ -212,7 +212,7 @@ proptest! {
             let _ = apply(&mut txn, op);
         }
         for f in &filters {
-            same_in_both(&mut |coll| txn.find(coll, f), f)?;
+            same_in_both(&mut |coll| txn.find(coll, f)?.collect(), f)?;
         }
     }
 }
@@ -340,13 +340,16 @@ fn snapshots_see_the_index_as_of_their_timestamp() {
     assert_eq!(
         ids(&old
             .find(&collection("shop.orders"), &doc! { "age": 30 })
-            .unwrap()),
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()),
         [Bson::Int32(7)]
     );
     assert!(
         old.find(&collection("shop.orders"), &doc! { "age": 31 })
             .unwrap()
-            .is_empty()
+            .next()
+            .is_none()
     );
     assert_eq!(
         ids(&node
@@ -369,7 +372,9 @@ fn own_writes_are_found_through_the_index() {
     assert_eq!(
         ids(&txn
             .find(&collection("shop.orders"), &doc! { "age": 5 })
-            .unwrap()),
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()),
         [Bson::Int32(2)]
     );
 }

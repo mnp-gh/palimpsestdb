@@ -418,7 +418,7 @@ impl<E: StorageEngine> Node<E> {
 
     /// Autocommit [`Transaction::find`].
     pub fn find(&self, collection: &CollectionPath, filter: &Document) -> Result<Vec<Document>> {
-        self.run(|t| t.find(collection, filter))
+        self.run(|t| t.find(collection, filter)?.collect())
     }
 
     /// Induces a panic while holding the commit lock to poison it for testing.
