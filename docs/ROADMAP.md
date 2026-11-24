@@ -13,6 +13,7 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | v0.4.3 | Streaming find | Done |
 | v0.4.4 | Persistent engine | Planned |
 | v0.4.5 | Checkpoint | Planned |
+| v0.4.6 | Unordered find | Planned |
 | v0.5 | Serializable | Planned |
 | v0.6 | Server | Planned |
 | v0.7 | Access | Planned |
@@ -94,6 +95,11 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Only an engine whose `is_durable()` is true may be checkpointed (the in-memory engine is not); in the simulator a flush raises the shortest prefix a crash may keep
 - Running Checkpoints automatically waits for v0.6
 
+## v0.4.6: Unordered find
+
+- `find` promises no order until sort exists, so an Index plan streams instead of buffering candidate keys; an `$or` drops a Document already found under an earlier branch by checking that branch's ranges ([ADR 0017](./adr/0017-find-results-are-unordered.md))
+- Catalog listings stream through the same chunked scan, so a Namespace can hold ~1M Collections
+
 ## v0.5: Serializable
 
 - Serializable Snapshot Isolation with Read Markers, escalating key → range → Collection past a configurable per-Transaction threshold; Read Markers outlive commit until every overlapping Transaction finishes ([ADR 0002](./adr/0002-ssi-not-2pl.md))
@@ -137,6 +143,8 @@ A single-threaded library with no network, no durability and no garbage collecti
 - Sparse Indexes, as an opt-in: leave out Documents whose field is null or missing, so an Index on a rarely set field stays small; `{field: null}` then scans the whole Collection. Indexes keep null and missing by default
 - A `decimal128` Field Type, with exact decimal comparison against integers and doubles in filters (today Decimal128 compares only for equality)
 - Range comparisons on binary values: filters only test binary for equality, so a `binary` Index answers equality only. Decide an order first (MongoDB: length, subtype, bytes; our key encoding: subtype, bytes)
+- Huge `$or`s: `find` drops a Document found again under a later branch by checking it against every earlier branch's ranges, so work per Document grows with the branch count ([ADR 0017](./adr/0017-find-results-are-unordered.md)). If huge `$or`s show up, put a Bloom filter over emitted IDs in front of the range check, or merge equality branches in the planner
+- A Catalog that does not fit in RAM: the Catalog cache holds the newest Version of every Catalog entry, so 1M Collections means 1M entries in memory. Listings stream since v0.4.6; the cache itself still has to shrink (load on demand, or bounded with eviction)
 
 ## v2.x: Distribution
 
