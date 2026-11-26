@@ -13,7 +13,8 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | v0.4.3 | Streaming find | Done |
 | v0.4.4 | Persistent engine | Planned |
 | v0.4.5 | Checkpoint | Planned |
-| v0.4.6 | Unordered find | Planned |
+| v0.4.6 | Pull iterators | Planned |
+| v0.4.7 | Unordered find | Planned |
 | v0.5 | Serializable | Planned |
 | v0.6 | Server | Planned |
 | v0.7 | Access | Planned |
@@ -86,19 +87,25 @@ A single-threaded library with no network, no durability and no garbage collecti
 ## v0.4.4: Persistent engine
 
 - `fjall` Storage Engine in its own crate, one partition, LZ4 block compression; `write_batch` writes the journal unsynced, `flush` syncs
-- Conformance suite gains reopen checks (`run_reopen`) next to `run_all`
-- Revisit ADR 0016: measure the per-chunk re-seek on `fjall`; if it costs enough, give the Storage Engine trait pull iterators. That needs a lock-free `MemoryEngine` iterator (a snapshot map, not a held read lock) and a new ADR replacing 0016
+- `Node::open(dir, open_engine)`: the Database Layer puts the WAL and the engine in fixed subdirectories and is handed a function that opens the engine, so an engine opens only beside its own WAL; the CLI's data directory runs on `fjall`
+- Conformance suite gains reopen checks (`run_reopen`) next to `run_all`; a `kill -9` test checks `fjall` keeps whole batches and a prefix after a process crash
 
 ## v0.4.5: Checkpoint
 
 - Explicit `Node::checkpoint()`: under the commit lock, flush the engine, then replace the WAL with a header recording `trimmed_up_to` (new file, sync, rename, directory sync); WAL format version bumps ([ADR 0015](./adr/0015-wal-is-the-authority-engine-may-lag.md))
 - Only an engine whose `is_durable()` is true may be checkpointed (the in-memory engine is not); in the simulator a flush raises the shortest prefix a crash may keep
+- A poisoned Node refuses to Checkpoint; the CLI gains `checkpoint`
 - Running Checkpoints automatically waits for v0.6
 
-## v0.4.6: Unordered find
+## v0.4.6: Pull iterators
+
+- The Storage Engine's `scan` returns an iterator the caller pulls from, promising only a loose view (ascending keys; keys not written meanwhile exactly once), so streaming reads stop rescanning in chunks and the chunk limits go ([ADR 0018](./adr/0018-storage-engine-scans-are-pull-iterators.md), superseding ADR 0016)
+- `MemoryEngine` copies a few entries at a time under its read lock and re-seeks, holding no lock between pulls
+
+## v0.4.7: Unordered find
 
 - `find` promises no order until sort exists, so an Index plan streams instead of buffering candidate keys; an `$or` drops a Document already found under an earlier branch by checking that branch's ranges ([ADR 0017](./adr/0017-find-results-are-unordered.md))
-- Catalog listings stream through the same chunked scan, so a Namespace can hold ~1M Collections
+- Catalog listings stream from the engine at the Snapshot, not the Catalog cache, so a Namespace can hold ~1M Collections
 
 ## v0.5: Serializable
 
@@ -134,6 +141,7 @@ Before v0.5 starts: Index builds can starve writers, a known v0.4 issue ([10](..
 ## v1.0: Hardening
 
 - Documentation pass, benchmarks, fuzzing, stabilised on-disk format
+- Power-loss testing of the persistent engine (data the OS had not written yet), e.g. on a fault-injecting filesystem such as LazyFS
 - Making a field Strict on a busy Collection: writers enforce it while the existing Documents are checked in chunks, like a background Index build, so a steady stream of new Documents cannot make the change abort on every retry
 - Measure the space field names cost after compression; decide on a per-Collection field-name dictionary from the numbers (Documents stay BSON until then)
 
@@ -146,7 +154,7 @@ Before v0.5 starts: Index builds can starve writers, a known v0.4 issue ([10](..
 - A `decimal128` Field Type, with exact decimal comparison against integers and doubles in filters (today Decimal128 compares only for equality)
 - Range comparisons on binary values: filters only test binary for equality, so a `binary` Index answers equality only. Decide an order first (MongoDB: length, subtype, bytes; our key encoding: subtype, bytes)
 - Huge `$or`s: `find` drops a Document found again under a later branch by checking it against every earlier branch's ranges, so work per Document grows with the branch count ([ADR 0017](./adr/0017-find-results-are-unordered.md)). If huge `$or`s show up, put a Bloom filter over emitted IDs in front of the range check, or merge equality branches in the planner
-- A Catalog that does not fit in RAM: the Catalog cache holds the newest Version of every Catalog entry, so 1M Collections means 1M entries in memory. Listings stream since v0.4.6; the cache itself still has to shrink (load on demand, or bounded with eviction)
+- A Catalog that does not fit in RAM: the Catalog cache holds the newest Version of every Catalog entry, so 1M Collections means 1M entries in memory. Listings stream from the engine since v0.4.7; the cache itself still has to shrink (load on demand, or bounded with eviction)
 
 ## v2.x: Distribution
 
