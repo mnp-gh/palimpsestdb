@@ -548,6 +548,7 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
     /// Index at most `n` Documents per chunk, so tests can interleave
     /// commits between chunks of a small Collection.
     #[cfg(any(test, feature = "testing"))]
+    #[must_use]
     pub fn with_chunk_documents(mut self, n: usize) -> Self {
         self.chunk_documents = n;
         self
@@ -562,6 +563,10 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
     ///
     /// Those of [`Node::create_index`]'s build, removing the Index on any
     /// failure but [`Error::IndexBuildCancelled`].
+    ///
+    /// # Panics
+    ///
+    /// If one of the Node's locks is poisoned; see [`Node`](crate::Node#panics).
     pub fn step(&mut self) -> Result<bool> {
         let mut commit_state = self.node.commit_lock.lock().expect("lock poisoned");
         let outcome = match self.index_next_chunk(&mut commit_state) {

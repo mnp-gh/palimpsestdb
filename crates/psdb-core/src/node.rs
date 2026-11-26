@@ -27,6 +27,12 @@ use crate::wal::{self, OsWalFile, Wal, WalFile};
 /// (ADR 0005). [`open`](Self::open) makes it durable with a WAL (ADR 0004);
 /// [`new`](Self::new) keeps nothing durable.
 ///
+/// # Panics
+///
+/// A thread that panics while holding one of a Node's locks poisons the
+/// lock: the state it guards may be half-updated. From then on, calls that
+/// take that lock panic too, and the Node must be dropped and opened again.
+///
 /// ```
 /// use bson::doc;
 /// use psdb_core::Node;
@@ -312,6 +318,10 @@ impl<E: StorageEngine> Node<E> {
 
     /// The oldest Snapshot any active Transaction reads, or the newest Visible
     /// commit when no Transaction is active (see `GLOSSARY.md`).
+    ///
+    /// # Panics
+    ///
+    /// If one of the Node's locks is poisoned; see [`Node`](crate::Node#panics).
     pub fn horizon(&self) -> u64 {
         let reg = self.snapshot_registry.lock().expect("registry poisoned");
         reg.keys()
@@ -339,6 +349,10 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Begin a Transaction with a Snapshot of everything committed so far.
+    ///
+    /// # Panics
+    ///
+    /// If one of the Node's locks is poisoned; see [`Node`](crate::Node#panics).
     pub fn begin_transaction(&self) -> Transaction<'_, E> {
         assert!(!self.commit_lock.is_poisoned(), "commit lock poisoned");
         Transaction::new(self)
@@ -514,6 +528,11 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Induces a panic while holding the commit lock to poison it for testing.
+    ///
+    /// # Panics
+    ///
+    /// Never: the panic it induces, and any from an already poisoned lock,
+    /// is caught here.
     #[cfg(any(test, feature = "testing"))]
     pub fn poison_commit_lock_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

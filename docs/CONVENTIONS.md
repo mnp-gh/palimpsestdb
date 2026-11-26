@@ -30,6 +30,11 @@ The Database Layer is generic over the Storage Engine (`Node<E: StorageEngine>`)
 ## Documentation
 
 - `#![deny(missing_docs)]` in every crate.
+- Every public function returning `Result` has an `# Errors` section, and every one that can panic a `# Panics` section (clippy `missing_errors_doc`, `missing_panics_doc`). Each lists only what is particular to the function; never copy a list:
+  - What nearly every call can return (Storage, Corruption, Transaction Too Large, no such Namespace or Collection) is written once, on `Error` under "Errors every operation can return". Lock poisoning is written once, on `Node` under "Panics".
+  - A wrapper points to what it wraps: an autocommit method says ``Those of [`Transaction::insert`], then of [`Transaction::commit`].`` A trait method points to its trait's section.
+  - A function with nothing of its own links to the shared section in one line.
+- A method that returns a new value of its own type instead of changing `self` (a builder like `Limits::with_max_document_bytes`, or `KeyRange::intersect`) is `#[must_use]` (clippy `return_self_not_must_use`), so dropping the result warns instead of silently doing nothing.
 - A `//` comment says why, which the code cannot: an invariant, a reason, a link to an ADR. Never what the code does; rename or restructure until the code says it. Deferred work is `// shortcut: <the limit>, <when to upgrade>` or a roadmap item, never `TODO`. The hook shows Claude each comment it adds, to check.
 - A README per crate stating its responsibility and its place in the dependency graph.
 - Doc examples are tests (`cargo test` runs them).

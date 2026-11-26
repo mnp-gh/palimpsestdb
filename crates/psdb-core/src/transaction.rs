@@ -470,6 +470,10 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// - [`Error::CommitOutcomeUnknown`] if the WAL or the engine fails
     ///   partway. This poisons the Node: every later commit, read-only or
     ///   not, fails with [`Error::Poisoned`].
+    ///
+    /// # Panics
+    ///
+    /// If one of the Node's locks is poisoned; see [`Node`](crate::Node#panics).
     pub fn commit(self) -> Result<u64> {
         let node = self.node;
         // Read-only: skip the lock, so it never waits behind another commit's fsync.

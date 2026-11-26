@@ -144,6 +144,7 @@ impl<E: StorageEngine> GcPass<'_, E> {
     /// Close each batch at the first logical key after visiting `n`
     /// physical keys, so tests can commit between small batches.
     #[cfg(any(test, feature = "testing"))]
+    #[must_use]
     pub fn with_batch_keys(mut self, n: usize) -> Self {
         self.batch_keys = n;
         self
@@ -152,7 +153,9 @@ impl<E: StorageEngine> GcPass<'_, E> {
     /// Delete the next batch of keys; once every key is visited, finish
     /// the pass and return what it removed.
     ///
-    /// Panics if the pass already finished.
+    /// # Panics
+    ///
+    /// If the pass already finished.
     ///
     /// # Errors
     ///

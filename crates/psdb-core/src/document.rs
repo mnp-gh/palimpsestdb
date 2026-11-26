@@ -72,6 +72,7 @@ impl Default for Limits {
 impl Limits {
     /// These limits with [`max_document_bytes`](Self::max_document_bytes)
     /// set to `bytes`.
+    #[must_use]
     pub fn with_max_document_bytes(self, bytes: usize) -> Self {
         Self {
             max_document_bytes: bytes,
@@ -81,6 +82,7 @@ impl Limits {
 
     /// These limits with [`max_nesting_depth`](Self::max_nesting_depth)
     /// set to `depth`.
+    #[must_use]
     pub fn with_max_nesting_depth(self, depth: usize) -> Self {
         Self {
             max_nesting_depth: depth,
@@ -90,6 +92,7 @@ impl Limits {
 
     /// These limits with [`max_write_set_bytes`](Self::max_write_set_bytes)
     /// set to `bytes`.
+    #[must_use]
     pub fn with_max_write_set_bytes(self, bytes: usize) -> Self {
         Self {
             max_write_set_bytes: bytes,
@@ -99,6 +102,7 @@ impl Limits {
 
     /// These limits with [`scan_chunk_keys`](Self::scan_chunk_keys) set to
     /// `keys` and [`scan_chunk_bytes`](Self::scan_chunk_bytes) to `bytes`.
+    #[must_use]
     pub fn with_scan_chunk(self, keys: usize, bytes: usize) -> Self {
         Self {
             scan_chunk_keys: keys,

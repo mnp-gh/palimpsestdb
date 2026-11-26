@@ -68,6 +68,7 @@ impl KeyRange {
     /// assert_eq!(r, KeyRange::new(b"c", b"d"));
     /// assert_eq!(KeyRange::all().intersect(&r), r);
     /// ```
+    #[must_use]
     pub fn intersect(&self, other: &KeyRange) -> KeyRange {
         let end = match (&self.end, &other.end) {
             (Some(a), Some(b)) => Some(a.min(b).clone()),

@@ -32,9 +32,6 @@ unused_qualifications = "warn"
 # Code quality: all of pedantic, minus lints that are noise here.
 pedantic = { level = "warn", priority = -1 }
 must_use_candidate = "allow"
-return_self_not_must_use = "allow"
-# Every Mutex lock can panic on poisoning; documenting each adds nothing.
-missing_panics_doc = "allow"
 # Performance lints from nursery (the perf group is already on by default;
 # see nnethercote.github.io/perf-book). Not significant_drop_tightening: lock
 # scopes here are correctness decisions.
