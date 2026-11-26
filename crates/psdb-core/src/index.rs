@@ -107,6 +107,11 @@ impl IndexEntry {
 
 /// The Index key component for `value` (`None` when the field is missing),
 /// or `None` if an Index on a field of Field Type `ty` leaves the value out.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "the casts saturate or round, which keeps the order"
+)]
 pub(crate) fn key_component(value: Option<&Bson>, ty: FieldType) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match (value, ty) {
@@ -123,7 +128,7 @@ pub(crate) fn key_component(value: Option<&Bson>, ty: FieldType) -> Option<Vec<u
         // Every pair of numbers was handled above; the other Field Types are
         // Document ID types, encoded as Document IDs are.
         (Some(v), _) if FieldType::of(v) == Some(ty) => {
-            keys::encode_id(v, &mut out).expect("every Document ID type encodes")
+            keys::encode_id(v, &mut out).expect("every Document ID type encodes");
         }
         _ => return None,
     }

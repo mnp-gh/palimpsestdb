@@ -7,6 +7,7 @@
 //! A commit in flight at the crash may or may not survive. Two kinds of
 //! crash: simulated power loss on a [`SimDisk`], which drops unsynced bytes,
 //! and killing a real child process, which exercises the real filesystem.
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
 #![allow(
     clippy::disallowed_methods,
     reason = "crashes are tested on the real filesystem with random kill points"
@@ -225,7 +226,7 @@ fn kill_keeps_exactly_a_prefix_of_commits() {
         // Inserted in order 0, 1, 2, …, so an unbroken run with nothing
         // invented is exactly 0..n.
         assert!(
-            ids.iter().copied().eq(0..ids.len() as i32),
+            ids.iter().copied().eq(0..i32::try_from(ids.len()).unwrap()),
             "round {round}: {ids:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();

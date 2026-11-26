@@ -1,4 +1,5 @@
 //! Insert, get, replace, delete and find on one Collection.
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
 
 mod common;
 

@@ -245,6 +245,10 @@ pub(crate) const TWO_63: f64 = 9_223_372_036_854_775_808.0;
 
 /// Compare an integer with a double without converting the integer, which
 /// would round integers above 2⁵³ and make equality non-transitive.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`whole` is checked to be in the i64 range"
+)]
 fn cmp_int_double(i: i64, f: f64) -> Option<Ordering> {
     if f.is_nan() {
         return None;
@@ -359,8 +363,9 @@ mod tests {
         #[test]
         fn int_double_order_agrees_with_exact_arithmetic(i: i64, f in prop::num::f64::NORMAL | prop::num::f64::ZERO) {
             // An i128 holds every i64 and every integral double in range exactly.
+            #[expect(clippy::cast_possible_truncation, reason = "`f` is integral and in range")]
             let exact = if f.fract() == 0.0 && f.abs() < 1e38 {
-                Some((i as i128).cmp(&(f as i128)))
+                Some(i128::from(i).cmp(&(f as i128)))
             } else {
                 None
             };

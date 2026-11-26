@@ -141,6 +141,10 @@ impl<E: StorageEngine> GcPass<'_, E> {
     /// the pass and return what it removed.
     ///
     /// Panics if the pass already finished.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "shortcut: one long step, split when it next grows"
+    )]
     pub fn step(&mut self) -> Result<Option<GcStats>> {
         assert!(!self.done, "stepped a finished Garbage Collection pass");
         let Self {

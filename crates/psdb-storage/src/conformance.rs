@@ -14,6 +14,7 @@
 //! atomicity and ordering, read-your-writes). Crash behaviour needs a
 //! persistent engine and is checked by the crash tests that arrive with the
 //! WAL.
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
@@ -249,6 +250,7 @@ impl XorShift {
         self.next() % n
     }
 
+    #[expect(clippy::cast_possible_truncation, reason = "values are below 4")]
     fn key(&mut self) -> Vec<u8> {
         // A tiny alphabet with the edge bytes makes collisions and prefixes common.
         const ALPHABET: [u8; 4] = [0x00, b'a', b'b', 0xFF];

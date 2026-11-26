@@ -4,6 +4,11 @@
 //! `{"_id": {"$uuid": "0192f3a8-..."}, "n": 1}`. With `--data-dir <path>`
 //! every commit is durable in a WAL in that directory; without it,
 //! everything is lost on exit.
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a shell talks to the terminal"
+)]
 
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
@@ -176,7 +181,7 @@ impl Input {
                         return Some(line);
                     }
                     // Ctrl-C discards the current line, like most shells.
-                    Err(ReadlineError::Interrupted) => continue,
+                    Err(ReadlineError::Interrupted) => {}
                     Err(ReadlineError::Eof) => return None,
                     Err(e) => {
                         eprintln!("error: reading input: {e}");
@@ -201,6 +206,10 @@ impl Input {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "shortcut: one long step, split when it next grows"
+)]
 fn execute<'node>(
     node: &'node MemNode,
     txn: &mut Option<Txn<'node>>,
@@ -229,6 +238,10 @@ fn execute<'node>(
             println!("aborted");
         }
 
+        #[expect(
+            clippy::redundant_closure_for_method_calls,
+            reason = "`Transaction::list_namespaces` is not general over the Transaction lifetime"
+        )]
         "namespaces" => print_names(&with_txn(node, txn, |t| t.list_namespaces())?),
         "create-ns" => with_txn(node, txn, |t| t.create_namespace(rest))?,
         "drop-ns" => with_txn(node, txn, |t| t.drop_namespace(rest))?,
@@ -416,7 +429,7 @@ fn words(text: &str) -> Vec<&str> {
 
 /// Parse exactly `N` whitespace-separated Extended JSON values.
 fn values<const N: usize>(text: &str) -> Result<[Bson; N], String> {
-    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
+    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<Value>();
     let mut parsed = Vec::new();
     loop {
         // Where the next argument starts, for pointing at it in errors.

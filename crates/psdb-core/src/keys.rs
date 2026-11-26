@@ -315,7 +315,7 @@ pub(crate) fn type_tag(component: &[u8]) -> u8 {
 /// Big-endian bytes of `n` with the sign bit flipped, so negative numbers
 /// sort before positive ones.
 fn flip_sign(n: i64) -> [u8; 8] {
-    ((n as u64) ^ (1 << 63)).to_be_bytes()
+    (n.cast_unsigned() ^ (1 << 63)).to_be_bytes()
 }
 
 /// Append `bytes` with each `0x00` escaped as `0x00 0xFF`, then the
@@ -497,7 +497,7 @@ mod tests {
             Bson::Double(1.0),
             Bson::Null,
             Bson::Array(vec![]),
-            Bson::Document(Default::default()),
+            Bson::Document(bson::Document::new()),
         ] {
             assert!(
                 matches!(encode_id(&id, &mut Vec::new()), Err(Error::InvalidId(_))),

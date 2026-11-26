@@ -162,9 +162,10 @@ fn check_field(doc: &RawDocument, path: &FieldPath, field: FieldSchema) -> Resul
 fn fits_exactly(value: &Bson, ty: FieldType) -> bool {
     const TWO_53: u64 = 1 << 53;
     match (value, ty) {
-        (Bson::Int32(_) | Bson::Int64(_), FieldType::Int) => true,
+        (Bson::Int32(_) | Bson::Int64(_), FieldType::Int) | (Bson::Int32(_), FieldType::Double) => {
+            true
+        }
         (Bson::Double(f), FieldType::Int) => f.fract() == 0.0 && *f >= -TWO_63 && *f < TWO_63,
-        (Bson::Int32(_), FieldType::Double) => true,
         (Bson::Int64(n), FieldType::Double) => n.unsigned_abs() <= TWO_53,
         (Bson::Double(f), FieldType::Double) => !f.is_nan(),
         _ => FieldType::of(value) == Some(ty),

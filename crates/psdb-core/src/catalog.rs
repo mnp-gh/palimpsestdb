@@ -93,6 +93,7 @@ impl CatalogCache {
     /// The value of the Catalog entry `logical` at `snapshot_ts`, or `None`
     /// if its newest Version is newer than the Snapshot, so only the engine
     /// has the answer.
+    #[expect(clippy::option_option, reason = "the outer None means ask the engine")]
     pub(crate) fn read_at(&self, logical: &[u8], snapshot_ts: u64) -> Option<Option<Vec<u8>>> {
         match self.0.read().expect("catalog cache poisoned").get(logical) {
             None => Some(None),

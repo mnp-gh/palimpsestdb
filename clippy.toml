@@ -24,3 +24,9 @@ disallowed-types = [
     { path = "std::fs::File", reason = "do I/O through a seam such as WalFile" },
     { path = "std::fs::OpenOptions", reason = "do I/O through a seam such as WalFile" },
 ]
+
+allow-unwrap-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+# Proper nouns, not code; ".." keeps clippy's defaults.
+doc-valid-idents = ["PalimpsestDB", "MongoDB", "UUIDv7", "ObjectIds", ".."]

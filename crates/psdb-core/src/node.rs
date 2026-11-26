@@ -320,9 +320,7 @@ impl<E: StorageEngine> Node<E> {
 
     /// Begin a Transaction with a Snapshot of everything committed so far.
     pub fn begin_transaction(&self) -> Transaction<'_, E> {
-        if self.commit_lock.is_poisoned() {
-            panic!("commit lock poisoned");
-        }
+        assert!(!self.commit_lock.is_poisoned(), "commit lock poisoned");
         Transaction::new(self)
     }
 
@@ -346,6 +344,10 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::list_namespaces`].
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "`Transaction::list_namespaces` is not general over the Transaction lifetime"
+    )]
     pub fn list_namespaces(&self) -> Result<Vec<String>> {
         self.run(|t| t.list_namespaces())
     }
@@ -427,7 +429,7 @@ impl<E: StorageEngine> Node<E> {
     #[cfg(any(test, feature = "testing"))]
     pub fn poison_commit_lock_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = self.commit_lock.lock().unwrap();
+            let _guard = self.commit_lock.lock();
             panic!("test induced panic to poison commit lock");
         }));
     }

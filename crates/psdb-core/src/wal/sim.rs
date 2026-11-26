@@ -102,7 +102,7 @@ impl SimDisk {
     /// Replace the file with `bytes`, already durable.
     pub fn set_contents(&self, bytes: Vec<u8>) {
         let mut state = self.lock();
-        state.data = bytes.clone();
+        state.data.clone_from(&bytes);
         state.durable = bytes;
         state.entry_durable = true;
     }
@@ -184,7 +184,8 @@ impl WalFile for SimWalFile {
             return Err(io::Error::other("injected fsync failure"));
         }
         state.tick()?;
-        state.durable = state.data.clone();
+        let state = &mut *state;
+        state.durable.clone_from(&state.data);
         Ok(())
     }
 

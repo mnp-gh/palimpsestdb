@@ -370,7 +370,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         Ok(std::iter::from_fn(move || {
             while let Some(bytes) = candidates.next() {
                 match bytes.and_then(|bytes| Self::decode_if_matches(&filter, &bytes)) {
-                    Ok(None) => continue,
+                    Ok(None) => {}
                     Ok(Some(doc)) => return Some(Ok(doc)),
                     Err(e) => {
                         // End the iterator after its first error.
@@ -499,7 +499,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     pub fn abort(self) {}
 }
 
-impl<'node, E: StorageEngine> Drop for Transaction<'node, E> {
+impl<E: StorageEngine> Drop for Transaction<'_, E> {
     fn drop(&mut self) {
         self.node.unregister_snapshot(self.snapshot_ts);
     }

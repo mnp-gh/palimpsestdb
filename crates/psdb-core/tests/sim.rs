@@ -4,6 +4,7 @@
 //! Snapshots never change, Indexes agree with their Documents, and Recovery
 //! keeps every acknowledged commit. A crash also keeps only a random prefix
 //! of the engine's batches (ADR 0015).
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
 
 mod common;
 
@@ -133,6 +134,10 @@ struct IdCounters {
 }
 
 impl IdCounters {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "splitmix64 keeps the low 32 bits"
+    )]
     fn id_generator(&self) -> IdGenerator {
         let clock = self.clock.clone();
         let random = self.random.clone();
@@ -243,6 +248,10 @@ fn ready_index(node: &Node<Engine>) -> Result<Result<bool, Stop>, TestCaseError>
 }
 
 /// Run `actions` until they run out or the process crashes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "shortcut: one long step, split when it next grows"
+)]
 fn run(
     node: &Node<Engine>,
     disk: &SimDisk,

@@ -1,5 +1,6 @@
 //! Indexes, the Collection Schema, Strict Fields and unique Indexes
 //! (ADR 0010, ADR 0011).
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
 
 mod common;
 
@@ -111,10 +112,11 @@ fn filter() -> impl Strategy<Value = Document> {
     ]
 }
 
-fn doc_with(id: i32, v: &Option<Bson>) -> Document {
-    match v {
-        Some(v) => doc! { "_id": id, "a": { "v": v.clone() } },
-        None => doc! { "_id": id, "a": {} },
+fn doc_with(id: i32, v: Option<&Bson>) -> Document {
+    if let Some(v) = v {
+        doc! { "_id": id, "a": { "v": v.clone() } }
+    } else {
+        doc! { "_id": id, "a": {} }
     }
 }
 
@@ -124,9 +126,9 @@ fn doc_with(id: i32, v: &Option<Bson>) -> Document {
 fn apply(txn: &mut Transaction<'_, MemoryEngine>, op: &Op) -> psdb_core::Result<()> {
     for coll in [collection("shop.orders"), collection("shop.plain")] {
         match op {
-            Op::Insert(id, v) => txn.insert(&coll, doc_with(*id, v)).map(|_| ())?,
+            Op::Insert(id, v) => txn.insert(&coll, doc_with(*id, v.as_ref())).map(|_| ())?,
             Op::Replace(id, v) => txn
-                .replace(&coll, &Bson::Int32(*id), doc_with(*id, v))
+                .replace(&coll, &Bson::Int32(*id), doc_with(*id, v.as_ref()))
                 .map(|_| ())?,
             Op::Delete(id) => txn.delete(&coll, &Bson::Int32(*id)).map(|_| ())?,
         }
@@ -933,7 +935,7 @@ fn write_set_cap_fails_the_write_that_crosses_it() {
     txn.commit().unwrap();
     assert_eq!(
         node.find(&collection("d.c"), &doc! {}).unwrap().len(),
-        written as usize
+        usize::try_from(written).unwrap()
     );
 }
 
@@ -1275,7 +1277,7 @@ fn a_writer_that_began_before_a_build_aborts() {
 fn index_plan_with_overlapping_ranges_returns_each_document_once() {
     let node = Node::with_limits(
         MemoryEngine::new(),
-        psdb_core::Limits::default().with_scan_chunk(2, usize::MAX),
+        Limits::default().with_scan_chunk(2, usize::MAX),
     )
     .unwrap();
     let orders = collection("shop.orders");
