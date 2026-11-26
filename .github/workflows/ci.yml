@@ -1,8 +1,11 @@
 name: CI
 
-# Runs when a pull request is opened and on every push to it afterwards.
+# Runs on every push to a pull request, and on every push to main: two
+# pull requests that pass apart can still break main together.
 on:
   pull_request:
+  push:
+    branches: [main]
 
 jobs:
   check:
