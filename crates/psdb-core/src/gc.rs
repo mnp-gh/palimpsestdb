@@ -216,10 +216,10 @@ impl<E: StorageEngine> GcPass<'_, E> {
             self.seen_newest = false;
             self.dead_id_follows = false;
         }
-        if self.reclaim(logical) {
+        if self.under_dead_id(logical) {
             self.stats.versions_removed += 1;
             self.stats.tombstones_removed += u64::from(mvcc::is_tombstone(value));
-            self.delete(key, logical, batch);
+            self.queue_delete(key, logical, batch);
             return Ok(ControlFlow::Continue(()));
         }
         if ts > self.horizon {
@@ -234,18 +234,16 @@ impl<E: StorageEngine> GcPass<'_, E> {
         }
         self.stats.versions_removed += 1;
         self.note_drop(logical, value)?;
-        self.delete(key, logical, batch);
+        self.queue_delete(key, logical, batch);
         Ok(ControlFlow::Continue(()))
     }
 
     /// Whether `logical` belongs to a dropped Namespace, Collection or
-    /// Index found so far, so every Version of it goes.
-    fn reclaim(&mut self, logical: &[u8]) -> bool {
+    /// Index found so far, so every Version of it goes. Notes what that
+    /// reclaims, for the stats and the Catalog cache.
+    fn under_dead_id(&mut self, logical: &[u8]) -> bool {
         if let Some((namespace_id, collection_id)) = keys::data_collection(logical)
-            && (self.dead_namespaces.contains(&namespace_id)
-                || self
-                    .dead_collections
-                    .contains(&(namespace_id, collection_id)))
+            && self.collection_is_dead(namespace_id, collection_id)
         {
             self.reclaimed_collections
                 .insert((namespace_id, collection_id));
@@ -261,16 +259,21 @@ impl<E: StorageEngine> GcPass<'_, E> {
             self.uncached.insert(logical.to_vec());
             true
         } else if let Some((namespace_id, collection_id, _)) = keys::index_catalog_ids(logical)
-            && (self.dead_namespaces.contains(&namespace_id)
-                || self
-                    .dead_collections
-                    .contains(&(namespace_id, collection_id)))
+            && self.collection_is_dead(namespace_id, collection_id)
         {
             self.uncached.insert(logical.to_vec());
             true
         } else {
             false
         }
+    }
+
+    /// Whether the Collection, or its Namespace, was found dropped.
+    fn collection_is_dead(&self, namespace_id: u32, collection_id: u32) -> bool {
+        self.dead_namespaces.contains(&namespace_id)
+            || self
+                .dead_collections
+                .contains(&(namespace_id, collection_id))
     }
 
     /// Record the ID a deleted Catalog Version of `logical` frees: the
@@ -305,8 +308,9 @@ impl<E: StorageEngine> GcPass<'_, E> {
         Ok(())
     }
 
-    /// Delete `key` in `batch`, or hold it back if it is a Catalog key.
-    fn delete(&mut self, key: &[u8], logical: &[u8], batch: &mut WriteBatch) {
+    /// Queue `key` for deletion in `batch`, or hold it back if it is a
+    /// Catalog key.
+    fn queue_delete(&mut self, key: &[u8], logical: &[u8], batch: &mut WriteBatch) {
         if keys::is_system_key(logical) {
             self.held_back.push(key.to_vec());
         } else {

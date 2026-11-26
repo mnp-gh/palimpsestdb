@@ -27,49 +27,38 @@ fn run(script: &str) -> (bool, String) {
 
 #[test]
 fn every_command_does_what_it_prints() {
-    let script = r#"create-ns shop
-namespaces
-create-coll shop.orders
-colls shop
-set-type shop.orders n int strict
-set-type shop.orders m int
-schema shop.orders
-create-index shop.orders n unique
-create-index shop.orders m
-indexes shop.orders
-drop-index shop.orders m
-unset-type shop.orders m
-schema shop.orders
-indexes shop.orders
-insert shop.orders {"_id": 1, "n": 5}
-insert shop.orders {"_id": 2, "n": 7}
-get shop.orders 1
-replace shop.orders 2 {"n": 8}
-delete shop.orders 1
-get shop.orders 1
-find shop.orders {"n": {"$gt": 6}}
-find shop.orders
-"#;
-    let expected = r#"shop
-orders
-m: int
-n: int strict
-n unique
-m
-n: int strict
-n unique
-1
-2
-{"_id":1,"n":5}
-replaced
-deleted
-not found
-{"_id":2,"n":8}
-(1 found)
-{"_id":2,"n":8}
-(1 found)
-"#;
-    assert_eq!(run(script), (true, expected.to_owned()));
+    // Each command and what it prints; most print nothing.
+    let steps = [
+        ("create-ns shop", ""),
+        ("namespaces", "shop\n"),
+        ("create-coll shop.orders", ""),
+        ("colls shop", "orders\n"),
+        ("set-type shop.orders n int strict", ""),
+        ("set-type shop.orders m int", ""),
+        ("schema shop.orders", "m: int\nn: int strict\n"),
+        ("create-index shop.orders n unique", ""),
+        ("create-index shop.orders m", ""),
+        ("indexes shop.orders", "n unique\nm\n"),
+        ("drop-index shop.orders m", ""),
+        ("unset-type shop.orders m", ""),
+        ("schema shop.orders", "n: int strict\n"),
+        ("indexes shop.orders", "n unique\n"),
+        (r#"insert shop.orders {"_id": 1, "n": 5}"#, "1\n"),
+        (r#"insert shop.orders {"_id": 2, "n": 7}"#, "2\n"),
+        ("get shop.orders 1", "{\"_id\":1,\"n\":5}\n"),
+        (r#"replace shop.orders 2 {"n": 8}"#, "replaced\n"),
+        ("delete shop.orders 1", "deleted\n"),
+        ("get shop.orders 1", "not found\n"),
+        (
+            r#"find shop.orders {"n": {"$gt": 6}}"#,
+            "{\"_id\":2,\"n\":8}\n(1 found)\n",
+        ),
+        ("find shop.orders", "{\"_id\":2,\"n\":8}\n(1 found)\n"),
+    ];
+    let commands: Vec<&str> = steps.iter().map(|(command, _)| *command).collect();
+    let script = commands.join("\n") + "\n";
+    let expected: String = steps.iter().map(|(_, output)| *output).collect();
+    assert_eq!(run(&script), (true, expected));
 }
 
 #[test]

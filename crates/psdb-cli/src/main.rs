@@ -236,7 +236,8 @@ fn execute<'node>(
 
         #[expect(
             clippy::redundant_closure_for_method_calls,
-            reason = "`Transaction::list_namespaces` is not general over the Transaction lifetime"
+            reason = "the suggested `Transaction::list_namespaces` does not compile: \
+            a method path cannot accept a Transaction of any lifetime, as `with_txn` requires"
         )]
         "namespaces" => print_names(&with_txn(node, txn, |t| t.list_namespaces())?),
         "create-ns" => with_txn(node, txn, |t| t.create_namespace(rest))?,

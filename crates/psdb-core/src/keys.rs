@@ -517,18 +517,20 @@ mod tests {
     /// here even if every encoder and decoder changes with it.
     #[test]
     fn key_layout_matches_adr_0008_byte_for_byte() {
-        let doc = |component: &[u8]| [&[0, 0, 0, 7, 0, 0, 0, 9][..], component].concat();
+        // A Document's key in Namespace 7, Collection 9. Integers and dates
+        // flip the sign bit (0x80 here), so negatives sort first.
+        let in_collection_7_9 = |id: &[u8]| [&[0, 0, 0, 7, 0, 0, 0, 9][..], id].concat();
         assert_eq!(
             document_key(7, 9, &Bson::Int32(5)).unwrap(),
-            doc(&[0x10, 0x80, 0, 0, 0, 0, 0, 0, 5])
+            in_collection_7_9(&[0x10, 0x80, 0, 0, 0, 0, 0, 0, 5])
         );
         assert_eq!(
             document_key(7, 9, &Bson::Int64(-1)).unwrap(),
-            doc(&[0x10, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+            in_collection_7_9(&[0x10, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
         );
         assert_eq!(
             document_key(7, 9, &Bson::String("a\0b".into())).unwrap(),
-            doc(&[0x20, b'a', 0x00, 0xFF, b'b', 0x00, 0x00])
+            in_collection_7_9(&[0x20, b'a', 0x00, 0xFF, b'b', 0x00, 0x00])
         );
         let uuid = Binary {
             subtype: BinarySubtype::Uuid,
@@ -536,19 +538,19 @@ mod tests {
         };
         assert_eq!(
             document_key(7, 9, &Bson::Binary(uuid)).unwrap(),
-            doc(&[0x30, 0x04, 0x01, 0x00, 0xFF, 0x00, 0x00])
+            in_collection_7_9(&[0x30, 0x04, 0x01, 0x00, 0xFF, 0x00, 0x00])
         );
         assert_eq!(
             document_key(7, 9, &Bson::ObjectId(ObjectId::from_bytes([3; 12]))).unwrap(),
-            doc(&[[0x40].as_slice(), &[3; 12]].concat())
+            in_collection_7_9(&[[0x40].as_slice(), &[3; 12]].concat())
         );
         assert_eq!(
             document_key(7, 9, &Bson::Boolean(true)).unwrap(),
-            doc(&[0x50, 0x01])
+            in_collection_7_9(&[0x50, 0x01])
         );
         assert_eq!(
             document_key(7, 9, &Bson::DateTime(DateTime::from_millis(1))).unwrap(),
-            doc(&[0x60, 0x80, 0, 0, 0, 0, 0, 0, 1])
+            in_collection_7_9(&[0x60, 0x80, 0, 0, 0, 0, 0, 0, 1])
         );
 
         let component = |push: fn(&mut Vec<u8>)| {

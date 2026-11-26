@@ -8,7 +8,7 @@
 //! crash: simulated power loss on a [`SimDisk`], which drops unsynced bytes,
 //! and killing a real child process, which exercises the real filesystem.
 #![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
-#![allow(
+#![expect(
     clippy::disallowed_methods,
     reason = "crashes are tested on the real filesystem with random kill points"
 )]

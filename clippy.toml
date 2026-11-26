@@ -1,6 +1,6 @@
 # Clock, I/O and randomness go through seams so the deterministic simulator
 # can drive the system (docs/CONVENTIONS.md). Seam implementations opt out
-# with `#[allow(clippy::disallowed_methods, reason = "...")]`.
+# with `#[expect(clippy::disallowed_methods, reason = "...")]`.
 disallowed-methods = [
     { path = "std::time::Instant::now", reason = "read time through the Clock seam" },
     { path = "std::time::SystemTime::now", reason = "read time through the Clock seam" },

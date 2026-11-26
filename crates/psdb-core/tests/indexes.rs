@@ -94,10 +94,11 @@ fn value_of(field_type: FieldType) -> BoxedStrategy<Bson> {
 fn op(field_type: FieldType) -> impl Strategy<Value = Op> {
     // Negative too, so `_id` ranges cross zero.
     let id = -3..4i32;
-    let v = prop::option::weighted(0.8, prop_oneof![3 => value_of(field_type), 1 => value()]);
+    let maybe_value =
+        prop::option::weighted(0.8, prop_oneof![3 => value_of(field_type), 1 => value()]);
     prop_oneof![
-        (id.clone(), v.clone()).prop_map(|(i, v)| Op::Insert(i, v)),
-        (id.clone(), v).prop_map(|(i, v)| Op::Replace(i, v)),
+        (id.clone(), maybe_value.clone()).prop_map(|(i, v)| Op::Insert(i, v)),
+        (id.clone(), maybe_value).prop_map(|(i, v)| Op::Replace(i, v)),
         id.prop_map(Op::Delete),
     ]
 }
@@ -170,7 +171,7 @@ fn create_index(node: &Node<MemoryEngine>, unique: bool) {
 }
 
 /// A write may fail only for a reason the generated writes can cause.
-fn expected_outcome(outcome: psdb_core::Result<()>, unique: bool) -> Result<(), TestCaseError> {
+fn check_failure_reason(outcome: psdb_core::Result<()>, unique: bool) -> Result<(), TestCaseError> {
     match outcome {
         Ok(()) | Err(Error::TypeMismatch(_) | Error::DuplicateId(_)) => Ok(()),
         Err(Error::DuplicateValue(_)) if unique => Ok(()),
@@ -227,7 +228,7 @@ proptest! {
             }
             // What each write did is checked by comparing the Collections;
             // here only that it failed, if it did, for a reason it may.
-            expected_outcome(node.run(|t| apply(t, op)), unique)?;
+            check_failure_reason(node.run(|t| apply(t, op)), unique)?;
         }
         if build_after >= ops.len() {
             create_index(&node, unique);
@@ -248,7 +249,7 @@ proptest! {
         }
         let mut txn = node.begin_transaction();
         for op in &own_writes {
-            expected_outcome(apply(&mut txn, op), unique)?;
+            check_failure_reason(apply(&mut txn, op), unique)?;
         }
         for f in &filters {
             same_in_both(&mut |coll| txn.find(coll, f)?.collect(), f)?;

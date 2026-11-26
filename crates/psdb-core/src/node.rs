@@ -86,7 +86,7 @@ pub struct IdGenerator {
     pub catalog_id: Box<dyn Fn() -> u32 + Send + Sync>,
 }
 
-#[allow(
+#[expect(
     clippy::disallowed_methods,
     reason = "the OS clock and random number generator behind the IdGenerator seam"
 )]
@@ -234,13 +234,13 @@ impl<E: StorageEngine> Node<E> {
     ///
     /// # Errors
     ///
-    /// None of these changes any WAL Record.
-    ///
     /// - [`Error::UnrecognisedWal`] if the WAL has the wrong magic number or
     ///   an unknown format version.
     /// - [`Error::Corruption`] for a damaged WAL, an engine that holds data
     ///   without `applied_up_to`, or an engine ahead of the WAL.
     /// - [`Error::Io`] if `wal` fails.
+    ///
+    /// None of these changes any WAL Record.
     pub fn open_with(
         engine: E,
         wal: impl WalFile + 'static,
@@ -396,7 +396,8 @@ impl<E: StorageEngine> Node<E> {
     /// Those of [`Transaction::list_namespaces`], then of [`Transaction::commit`].
     #[expect(
         clippy::redundant_closure_for_method_calls,
-        reason = "`Transaction::list_namespaces` is not general over the Transaction lifetime"
+        reason = "the suggested `Transaction::list_namespaces` does not compile: \
+            a method path cannot accept a Transaction of any lifetime, as `run` requires"
     )]
     pub fn list_namespaces(&self) -> Result<Vec<String>> {
         self.run(|t| t.list_namespaces())
@@ -528,12 +529,11 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Induces a panic while holding the commit lock to poison it for testing.
-    ///
-    /// # Panics
-    ///
-    /// Never: the panic it induces, and any from an already poisoned lock,
-    /// is caught here.
     #[cfg(any(test, feature = "testing"))]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "every panic in it, induced or from a poisoned lock, is caught there"
+    )]
     pub fn poison_commit_lock_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = self.commit_lock.lock().expect("lock poisoned");

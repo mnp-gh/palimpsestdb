@@ -6,7 +6,11 @@
 input=$(cat)
 file=$(jq -r '.tool_input.file_path // empty' <<< "$input")
 [[ "$file" =~ \.(rs|toml)$ ]] || exit 0
-[[ "$file" == *.rs ]] && files=("$file") || files=()
+if [[ "$file" == *.rs ]]; then
+  files=("$file")
+else
+  files=()
+fi
 
 if ! out=$(CARGO_TERM_COLOR=never "$CLAUDE_PROJECT_DIR"/scripts/lint.sh "${files[@]}" 2>&1); then
   # Keep each error, its location and its notes. Drop code snippets, links,
@@ -21,10 +25,15 @@ fi
 
 # Plain `//` comment lines in the new text that the replaced text lacked.
 added=$(jq -r '
+  # The plain `//` lines of a text, without their indentation.
   def comments: [splits("\n") | select(test("^\\s*//($|[^/!])")) | sub("^\\s+"; "")];
-  (.tool_input | [.new_string, .content, (.edits[]?.new_string)] | map(select(.)) | join("\n") | comments)
-  - (.tool_input | [.old_string, (.edits[]?.old_string)] | map(select(.)) | join("\n") | comments)
-  | unique | .[:5] | .[]' <<< "$input")
+  # Edit sends old_string and new_string, Write content, MultiEdit edits[];
+  # map(select(.)) drops the fields this tool did not send.
+  .tool_input
+  | ([.new_string, .content, (.edits[]?.new_string)] | map(select(.)) | join("\n") | comments) as $new
+  | ([.old_string, (.edits[]?.old_string)] | map(select(.)) | join("\n") | comments) as $old
+  # At most 5: enough to prompt a second look, cheap to read.
+  | $new - $old | unique | .[:5] | .[]' <<< "$input")
 [[ -n "$added" ]] || exit 0
 jq -n --arg comments "$added" '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext:
   ("New comments:\n" + $comments + "\nKeep only those saying why; delete any saying what.")}}'

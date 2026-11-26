@@ -1,5 +1,5 @@
 //! The I/O seam under the WAL.
-#![allow(
+#![expect(
     clippy::disallowed_methods,
     clippy::disallowed_types,
     reason = "OsWalFile is the OS side of the WalFile seam"

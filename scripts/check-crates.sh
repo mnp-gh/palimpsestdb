@@ -4,7 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-problems=$(cargo metadata --no-deps --format-version 1 | jq -r '
+# Captured first, so a failing cargo or jq stops the script (set -e).
+dependency_problems=$(cargo metadata --no-deps --format-version 1 | jq -r '
   .packages[]
   | .name as $name
   # The psdb crates each crate may name as a normal dependency; null means
@@ -17,13 +18,21 @@ problems=$(cargo metadata --no-deps --format-version 1 | jq -r '
     (if $allowed == null then empty else
        .dependencies[]
        | select(.kind == null and (.name | startswith("psdb-")))
-       | select(.name as $d | $allowed | index($d) | not)
+       | select(.name | IN($allowed[]) | not)
        | "\($name): may not depend on \(.name) (dependencies point down)"
      end)
 ')
+problems=()
+while IFS= read -r problem; do
+  if [[ -n "$problem" ]]; then
+    problems+=("$problem")
+  fi
+done <<< "$dependency_problems"
 for dir in crates/*/; do
-  [[ -f "$dir/README.md" ]] || problems+=$'\n'"${dir%/}: missing README.md"
+  [[ -f "$dir/README.md" ]] || problems+=("${dir%/}: missing README.md")
 done
 
-problems=$(sed '/^$/d' <<< "$problems")
-[[ -z "$problems" ]] || { echo "$problems"; exit 1; }
+if (( ${#problems[@]} > 0 )); then
+  printf '%s\n' "${problems[@]}"
+  exit 1
+fi

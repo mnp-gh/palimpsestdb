@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(
+    #[expect(
         clippy::disallowed_methods,
         reason = "a wall-clock bound on replay time"
     )]
@@ -480,15 +480,24 @@ mod tests {
     /// computed with a separate bitwise CRC32C, not the `crc32c` crate.
     #[test]
     fn file_layout_matches_the_documented_bytes() {
-        assert_eq!(header(), b"PSDBWAL\0\x00\x00\x00\x01");
-        let expected = b"\x00\x00\x00\x1d\xd4\x48\x61\x21\
-            \x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\
-            \x00\x00\x00\x01a\x01\x00\x00\x00\x011\
-            \x00\x00\x00\x01b\x00";
+        // Magic, then format version 1.
+        assert_eq!(header(), [&b"PSDBWAL\0"[..], &[0, 0, 0, 1]].concat());
+        #[rustfmt::skip]
+        let expected = [
+            &[0, 0, 0, 29][..],         // body length
+            &[0xD4, 0x48, 0x61, 0x21],  // CRC32C of the body
+            &[0, 0, 0, 0, 0, 0, 0, 1],  // body: Commit Timestamp 1
+            &[0, 0, 0, 2],              //   2 writes
+            &[0, 0, 0, 1], b"a",        //   key "a"
+            &[0x01, 0, 0, 0, 1], b"1",  //     live, value "1"
+            &[0, 0, 0, 1], b"b",        //   key "b"
+            &[0x00],                    //     tombstone
+        ]
+        .concat();
         let writes: [(&[u8], Option<&[u8]>); 2] = [(b"a", Some(b"1")), (b"b", None)];
         assert_eq!(record(1, &writes), expected);
         let mut file = header();
-        file.extend_from_slice(expected);
+        file.extend_from_slice(&expected);
         let disk = SimDisk::new();
         disk.set_contents(file);
         assert_eq!(

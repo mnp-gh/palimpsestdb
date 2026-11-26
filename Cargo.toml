@@ -49,6 +49,9 @@ print_stdout = "warn"
 print_stderr = "warn"
 unwrap_used = "warn"
 allow_attributes_without_reason = "warn"
+# `expect`, not `allow`: it fails once the lint stops firing, so an
+# exception cannot outlive its reason.
+allow_attributes = "warn"
 # Seams for Clock, I/O and randomness: see clippy.toml.
 disallowed_methods = "deny"
 disallowed_types = "deny"

@@ -77,7 +77,7 @@ const CODE: &str = "commented-out code: delete it, git keeps the history";
 /// The problems in one file's `source`, in line order.
 fn check(source: &str) -> Vec<Problem> {
     let mut problems = Vec::new();
-    // Consecutive plain `//` comment lines: (line number, text).
+    // Consecutive plain `//` comment lines, checked together for code.
     let mut run: Vec<(usize, &str)> = Vec::new();
     for (index, line) in source.lines().enumerate() {
         let number = index + 1;
@@ -88,20 +88,14 @@ fn check(source: &str) -> Vec<Problem> {
                 message: MARKER,
             });
         }
-        if let Some(text) = comment.filter(|c| !c.starts_with('/') && !c.starts_with('!')) {
+        let plain = comment.filter(|c| !c.starts_with('/') && !c.starts_with('!'));
+        if let Some(text) = plain {
             run.push((number, text.trim()));
         } else {
-            problems.extend(code_lines(&run).map(|line| Problem {
-                line,
-                message: CODE,
-            }));
-            run.clear();
+            report_code(&mut run, &mut problems);
         }
     }
-    problems.extend(code_lines(&run).map(|line| Problem {
-        line,
-        message: CODE,
-    }));
+    report_code(&mut run, &mut problems);
     problems.sort_by_key(|p| p.line);
     problems
 }
@@ -112,9 +106,20 @@ fn has_marker(comment: &str) -> bool {
         .any(|word| matches!(word, "TODO" | "FIXME" | "XXX" | "HACK"))
 }
 
+/// Report the lines of `run` that are commented-out code, and empty it.
+fn report_code(run: &mut Vec<(usize, &str)>, problems: &mut Vec<Problem>) {
+    for line in code_lines(run) {
+        problems.push(Problem {
+            line,
+            message: CODE,
+        });
+    }
+    run.clear();
+}
+
 /// Line numbers of `comments` (consecutive comment lines) that lie in a run
 /// of at most [`MAX_RUN`] lines parsing as code.
-fn code_lines(comments: &[(usize, &str)]) -> impl Iterator<Item = usize> {
+fn code_lines(comments: &[(usize, &str)]) -> Vec<usize> {
     let mut hit = vec![false; comments.len()];
     for start in 0..comments.len() {
         for end in start..comments.len().min(start + MAX_RUN) {
@@ -128,37 +133,57 @@ fn code_lines(comments: &[(usize, &str)]) -> impl Iterator<Item = usize> {
         .iter()
         .zip(hit)
         .filter_map(|(&(line, _), hit)| hit.then_some(line))
-        .collect::<Vec<_>>()
-        .into_iter()
+        .collect()
 }
 
-/// Whether `text` parses as Rust that is more than a bare word, literal or
-/// arithmetic on words, trying the ways a fragment is usually cut out of
-/// code: missing its `;`, its receiver, its enclosing `match` or a brace.
+/// Whether `text`, comment lines without their `//`, is Rust code.
+///
+/// First prose is ruled out cheaply: text with no code punctuation (`Ok`,
+/// `a - b`) or with a line that ends a sentence. Then `text` is parsed, as
+/// is and in the shapes code is usually cut to; it is code if one parses
+/// to more than a lone word.
 fn is_code(text: &str) -> bool {
-    // rustfmt never ends a line with a lone `.`; prose ends sentences so.
-    let ends_sentence = |line: &str| line.ends_with('.') && !line.ends_with("..");
-    if !text.contains(|c| ";(){}[]=.!:".contains(c)) || text.lines().any(ends_sentence) {
+    if !has_code_punctuation(text) || text.lines().any(ends_sentence) {
         return false;
     }
-    [
+    let mut candidates = vec![
         text.to_owned(),
+        // A statement without its `;`.
         format!("{text};"),
+        // An unclosed block: `if done {`.
         format!("{text} }}"),
+        // The end of one: `}`.
         format!("{{ {text}"),
-        format!("x{text}"),
-        format!("x{text};"),
+        // A match arm: `Some(x) => return x,`.
         format!("match x {{ {text} }}"),
-    ]
-    .iter()
-    .any(|candidate| {
-        syn::parse_str::<Block>(&format!("{{ {candidate} }}")).is_ok_and(|block| {
-            block
-                .stmts
-                .iter()
-                .any(|s| !matches!(s, Stmt::Expr(Expr::Path(_) | Expr::Lit(_), None)))
-        })
+    ];
+    // A call without its receiver: `.map(|r| r.len())`. Only then, or `1.5`
+    // would read as the field access `x1.5`.
+    if text.starts_with('.') {
+        candidates.push(format!("x{text}"));
+        candidates.push(format!("x{text};"));
+    }
+    // Each candidate becomes a block's body, so statements parse.
+    candidates.iter().any(|candidate| {
+        syn::parse_str::<Block>(&format!("{{ {candidate} }}"))
+            .is_ok_and(|block| block.stmts.iter().any(is_more_than_a_word))
     })
+}
+
+fn has_code_punctuation(text: &str) -> bool {
+    text.contains(|c| ";(){}[]=.!:".contains(c))
+}
+
+/// rustfmt never ends a line of code with a lone `.`; prose ends sentences
+/// so.
+fn ends_sentence(line: &str) -> bool {
+    line.ends_with('.') && !line.ends_with("..")
+}
+
+/// A lone path or literal (`Ok`, `42`) parses, but is as likely a word of
+/// prose.
+fn is_more_than_a_word(stmt: &Stmt) -> bool {
+    !matches!(stmt, Stmt::Expr(Expr::Path(_) | Expr::Lit(_), _))
 }
 
 #[cfg(test)]
@@ -197,6 +222,9 @@ mod tests {
             "// `whole` is checked to be in the i64 range",
             "// Ok",
             "// 42",
+            // Punctuation, but a lone path or literal: a reference, not code.
+            "// keys::encode_id",
+            "// 1.5",
             "// a - b",
             "// Done.\n// a - b",
             "/// let x = 1; in a doc comment is an example, not dead code",
@@ -204,7 +232,7 @@ mod tests {
             "//! let x = 1;",
             "// shortcut: a hint, not a guarantee; use a fair lock (ADR 0013).",
         ] {
-            assert_eq!(flagged(prose), [0; 0], "{prose}");
+            assert_eq!(flagged(prose), Vec::<usize>::new(), "{prose}");
         }
     }
 
@@ -214,6 +242,9 @@ mod tests {
             flagged("// TODO: speed this up\n/// FIXME\nlet todo = 1;"),
             [1, 2]
         );
-        assert_eq!(flagged("// TODOs are tracked in the roadmap"), [0; 0]);
+        assert_eq!(
+            flagged("// TODOs are tracked in the roadmap"),
+            Vec::<usize>::new()
+        );
     }
 }

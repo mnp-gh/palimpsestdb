@@ -8,7 +8,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -177,9 +177,12 @@ impl Slot<'_> {
     }
 
     /// Commit and check the result against the model, recording it there
-    /// on success. `ready`: whether `orders` has a Ready unique Index.
-    /// Returns why to stop, if the Node crashed.
-    fn commit(self, model: &mut Model, ready: bool) -> Result<Option<Stop>, TestCaseError> {
+    /// on success. Returns why to stop, if the Node crashed.
+    fn commit(
+        self,
+        model: &mut Model,
+        has_ready_unique_index: bool,
+    ) -> Result<Option<Stop>, TestCaseError> {
         let snapshot = self.txn.snapshot_ts();
         let mut after = model.latest().clone();
         apply(&mut after, &self.writes);
@@ -193,7 +196,7 @@ impl Slot<'_> {
                     // A Building Index lets a duplicate of a Document it
                     // has not reached yet commit; its build then fails
                     // (ADR 0013).
-                    if let (true, Some(value)) = (ready, value) {
+                    if let (true, Some(value)) = (has_ready_unique_index, value) {
                         let sharing = after.values().filter(|&v| v == value).count();
                         prop_assert_eq!(sharing, 1, "duplicate n {} committed", value);
                     }
@@ -210,11 +213,11 @@ impl Slot<'_> {
             }
             Err(Error::DuplicateValue(_)) => {
                 // The commit would have left two Documents sharing a value.
-                let mut values: Vec<_> = after.values().collect();
-                let len = values.len();
-                values.sort();
-                values.dedup();
-                prop_assert!(values.len() < len, "DuplicateValue with no duplicate");
+                let distinct: BTreeSet<_> = after.values().collect();
+                prop_assert!(
+                    distinct.len() < after.len(),
+                    "DuplicateValue with no duplicate"
+                );
             }
             Err(Error::WriteConflict | Error::CollectionChanged) => {}
             Err(e) => return crash_or_fail("commit", &e).map(Some),
