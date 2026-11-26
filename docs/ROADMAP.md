@@ -85,6 +85,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 ## v0.4.4: Persistent engine
 
+- CI (GitHub Actions, on every push and pull request, toolchain from `rust-toolchain.toml`) running what the lint hook runs: `cargo fmt --check`, `cargo clippy -- -D warnings` both with `--all-targets` and on the plain library (dev-dependencies turn on `testing`), and `scripts/check-crates.sh`; plus `cargo test` and `cargo doc` with warnings denied. The hook only covers edits made through Claude Code
 - `fjall` Storage Engine in its own crate, one partition, LZ4 block compression; `write_batch` writes the journal unsynced, `flush` syncs
 - Conformance suite gains reopen checks (`run_reopen`) next to `run_all`
 - Revisit ADR 0016: measure the per-chunk re-seek on `fjall`; if it costs enough, give the Storage Engine trait pull iterators. That needs a lock-free `MemoryEngine` iterator (a snapshot map, not a held read lock) and a new ADR replacing 0016
