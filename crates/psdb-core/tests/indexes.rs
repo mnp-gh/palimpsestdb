@@ -347,7 +347,7 @@ fn membership_follows_the_documents_current_type() {
             .find(&collection("shop.orders"), &doc! { "age": 30 })
             .unwrap())
     };
-    assert!(find30().is_empty());
+    assert_eq!(find30(), []);
     node.replace(
         &collection("shop.orders"),
         &Bson::Int32(7),
@@ -361,7 +361,7 @@ fn membership_follows_the_documents_current_type() {
         doc! { "age": "x" },
     )
     .unwrap();
-    assert!(find30().is_empty());
+    assert_eq!(find30(), []);
 }
 
 #[test]
@@ -528,10 +528,10 @@ fn failed_write_leaves_nothing_behind() {
     );
     assert!(matches!(dup, Err(Error::DuplicateValue(_))));
     txn.commit().unwrap();
-    assert!(
+    assert_eq!(
         node.find(&collection("shop.orders"), &doc! { "a": 2 })
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        []
     );
 }
 
@@ -839,11 +839,7 @@ fn an_old_snapshot_still_sees_a_dropped_index() {
         old.list_indexes(&collection("shop.orders")).unwrap().len(),
         1
     );
-    assert!(
-        node.list_indexes(&collection("shop.orders"))
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.list_indexes(&collection("shop.orders")).unwrap(), []);
 }
 
 /// `shop.orders` after a unique Index build on `n` failed with Duplicate
@@ -870,11 +866,7 @@ fn failed_unique_build() -> Node<MemoryEngine> {
 #[test]
 fn building_a_unique_index_over_duplicates_fails_and_leaves_no_index() {
     let node = failed_unique_build();
-    assert!(
-        node.list_indexes(&collection("shop.orders"))
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.list_indexes(&collection("shop.orders")).unwrap(), []);
     // The orphaned entries never surface in a later Index.
     node.create_index(&collection("shop.orders"), &field_path("n"), false)
         .unwrap();
@@ -935,11 +927,7 @@ fn index_build_cut_off_by_power_loss_is_rebuilt_after_reopen() {
     );
     drop(node);
     let node = common::open(&disk).unwrap();
-    assert!(
-        node.list_indexes(&collection("shop.orders"))
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.list_indexes(&collection("shop.orders")).unwrap(), []);
     // The replayed chunk holds an entry for `n: 0`. If the new build reused
     // its Index ID, that orphan would make the value look taken.
     node.delete(&collection("shop.orders"), &Bson::Int32(0))
@@ -1106,11 +1094,7 @@ fn orphaned_index_entries_do_not_make_a_collection_look_non_empty() {
     .unwrap();
     // The failed build's entries share the Collection's range, below its
     // Documents.
-    assert!(
-        node.find(&collection("shop.orders"), &doc! {})
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.find(&collection("shop.orders"), &doc! {}).unwrap(), []);
     node.run(|t| t.create_index_on_empty(&collection("shop.orders"), &field_path("n"), true))
         .unwrap();
 }
@@ -1264,7 +1248,7 @@ fn a_duplicate_ahead_of_a_unique_build_fails_it_and_removes_the_index() {
         }
     };
     assert!(matches!(outcome, Err(Error::DuplicateValue(_))));
-    assert!(states(&node).is_empty());
+    assert_eq!(states(&node), []);
 }
 
 #[test]

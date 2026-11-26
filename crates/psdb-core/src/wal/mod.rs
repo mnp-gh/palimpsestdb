@@ -350,7 +350,7 @@ mod tests {
     fn appended_records_are_read_back() {
         let disk = SimDisk::new();
         let (mut wal, records) = Wal::open(Box::new(disk.file())).unwrap();
-        assert!(records.is_empty());
+        assert_eq!(records, []);
         wal.append(&record(1, &[(b"k", Some(b"v"))])).unwrap();
         wal.append(&record(2, &[(b"k", None)])).unwrap();
         drop(wal);

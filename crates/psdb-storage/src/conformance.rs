@@ -149,10 +149,11 @@ fn scan_respects_range_bounds<E: StorageEngine>(engine: &E) {
         vec![b"b".to_vec(), b"c".to_vec()],
         "start is inclusive, end exclusive"
     );
-    assert!(collect(engine, &KeyRange::new("x", "z")).is_empty());
+    assert_eq!(collect(engine, &KeyRange::new("x", "z")), []);
     for empty in [KeyRange::new("d", "b"), KeyRange::new("b", "b")] {
-        assert!(
-            collect(engine, &empty).is_empty(),
+        assert_eq!(
+            collect(engine, &empty),
+            [],
             "an empty range (end <= start) visits nothing: {empty:?}"
         );
     }

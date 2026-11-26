@@ -6,6 +6,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The toolchain rust-toolchain.toml pins, as CI uses, even when another Rust
+# (Homebrew's, say) comes first on PATH: an older clippy misses newer lints.
+if command -v rustup > /dev/null; then
+  PATH="$(dirname "$(rustup which cargo)"):$PATH"
+fi
+
 cargo clippy --workspace --all-targets --quiet -- -D warnings
 cargo clippy --workspace --quiet -- -D warnings
 scripts/check-crates.sh

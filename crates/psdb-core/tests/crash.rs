@@ -183,7 +183,7 @@ fn kill_child() {
     node.create_namespace("shop").unwrap();
     node.create_collection(&collection("shop.orders")).unwrap();
     let mut out = std::io::stdout().lock();
-    for id in 0.. {
+    for id in 0..i32::MAX {
         node.insert(&collection("shop.orders"), doc! { "_id": id, "v": 0 })
             .unwrap();
         writeln!(out, "acknowledged {id}").unwrap();
