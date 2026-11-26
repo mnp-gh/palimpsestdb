@@ -21,15 +21,15 @@ fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
     root
 }
 
-/// Run `psdb-lint` in `dir` with `args`: exit success, and stdout.
-fn lint(dir: &Path, args: &[&str]) -> (bool, String) {
+/// Run `psdb-lint` in `dir` with `args`: exit code, and stdout.
+fn lint(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_psdb-lint"))
         .args(args)
         .current_dir(dir)
         .output()
         .unwrap();
     (
-        output.status.success(),
+        output.status.code(),
         String::from_utf8(output.stdout).unwrap(),
     )
 }
@@ -50,9 +50,10 @@ fn walks_every_rust_file_under_crates_and_fails_on_a_problem() {
             ("a/notes.txt", "// TODO: not Rust, so not checked\n"),
         ],
     );
-    let (ok, out) = lint(&root, &[]);
+    let (code, out) = lint(&root, &[]);
     fs::remove_dir_all(&root).unwrap();
-    assert!(!ok);
+    // 1, not just failure: a panic fails too.
+    assert_eq!(code, Some(1));
     let bad = Path::new("crates/a/src/deep/bad.rs").display().to_string();
     assert_eq!(
         out,
@@ -69,9 +70,9 @@ fn passes_and_prints_nothing_on_clean_files() {
         "clean",
         &[("a/src/lib.rs", "// Why: a reason.\nfn f() {}\n")],
     );
-    let (ok, out) = lint(&root, &["crates/a/src/lib.rs"]);
-    let (ok_all, out_all) = lint(&root, &[]);
+    let (code, out) = lint(&root, &["crates/a/src/lib.rs"]);
+    let (code_all, out_all) = lint(&root, &[]);
     fs::remove_dir_all(&root).unwrap();
-    assert_eq!((ok, out.as_str()), (true, ""));
-    assert_eq!((ok_all, out_all.as_str()), (true, ""));
+    assert_eq!((code, out.as_str()), (Some(0), ""));
+    assert_eq!((code_all, out_all.as_str()), (Some(0), ""));
 }

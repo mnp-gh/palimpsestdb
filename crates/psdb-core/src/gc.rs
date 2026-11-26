@@ -463,6 +463,9 @@ mod tests {
         index(&node, &orders, "n", false);
         node.insert(&orders, doc! { "_id": 1, "n": 1 }).unwrap();
         node.insert(&orders, doc! { "_id": 2, "n": 2 }).unwrap();
+        // Its Tombstone goes with the Collection, and must be counted.
+        node.insert(&orders, doc! { "_id": 3, "n": 3 }).unwrap();
+        node.delete(&orders, &3.into()).unwrap();
         let (namespace_id, id) = ids(&node, &orders);
         node.drop_collection(&orders).unwrap();
 
