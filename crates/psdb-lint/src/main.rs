@@ -30,18 +30,18 @@ fn main() -> ExitCode {
         Ok(args)
     };
     let result = paths.and_then(|paths| {
-        let mut problems = 0;
+        let mut clean = true;
         for path in paths {
             for problem in check(&fs::read_to_string(&path)?) {
                 println!("{}:{}: {}", path.display(), problem.line, problem.message);
-                problems += 1;
+                clean = false;
             }
         }
-        Ok(problems)
+        Ok(clean)
     });
     match result {
-        Ok(0) => ExitCode::SUCCESS,
-        Ok(_) => ExitCode::FAILURE,
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("psdb-lint: {e}");
             ExitCode::from(2)
