@@ -2,6 +2,8 @@
 
 How PalimpsestDB code is shaped. Vocabulary follows [GLOSSARY.md](../GLOSSARY.md); scope per version follows [ROADMAP.md](./ROADMAP.md).
 
+What a machine can check is checked: `cargo clippy --all-targets -- -D warnings` (lints in `Cargo.toml`, seam bans in `clippy.toml`) `scripts/check-crates.sh` (crate names, READMEs, dependency direction) and `psdb-lint` (no TODO markers or commented-out code). `scripts/lint.sh` runs them all; a Claude Code hook runs it after every edit, and CI on every pull request. The rest of this file is for review.
+
 ## SOLID, applied at the seams
 
 SOLID is applied to modules and crates, and strictly only to substitutability.
@@ -28,6 +30,13 @@ The Database Layer is generic over the Storage Engine (`Node<E: StorageEngine>`)
 ## Documentation
 
 - `#![deny(missing_docs)]` in every crate.
+- Every public function returning `Result` has an `# Errors` section, and every one that can panic a `# Panics` section (clippy `missing_errors_doc`, `missing_panics_doc`). Each lists only what is particular to the function; never copy a list:
+  - What nearly every call can return (Storage, Corruption, Transaction Too Large, no such Namespace or Collection) is written once, on `Error` under "Errors every operation can return". Lock poisoning is written once, on `Node` under "Panics".
+  - A wrapper points to what it wraps: an autocommit method says ``Those of [`Transaction::insert`], then of [`Transaction::commit`].`` A trait method points to its trait's section.
+  - A function with nothing of its own links to the shared section in one line.
+- A lint exception is `#[expect(lint, reason = "...")]`, never `#[allow]`: `expect` fails once the lint stops firing, so it cannot outlive its reason (clippy `allow_attributes`). The one exception is a lint that fires in some builds but not others, such as `dead_code` in `tests/common`, shared by test crates that each use part of it. The lint checks item attributes, not module-level `#![allow]`, so review those.
+- A method that returns a new value of its own type instead of changing `self` (a builder like `Limits::with_max_document_bytes`, or `KeyRange::intersect`) is `#[must_use]` (clippy `return_self_not_must_use`), so dropping the result warns instead of silently doing nothing.
+- A `//` comment says why, which the code cannot: an invariant, a reason, a link to an ADR. Never what the code does; rename or restructure until the code says it. Deferred work is `// shortcut: <the limit>, <when to upgrade>` or a roadmap item, never `TODO`. The hook shows Claude each comment it adds, to check.
 - A README per crate stating its responsibility and its place in the dependency graph.
 - Doc examples are tests (`cargo test` runs them).
 - Domain terms in code, comments and tests use the glossary's words.
@@ -38,3 +47,6 @@ The Database Layer is generic over the Storage Engine (`Node<E: StorageEngine>`)
 - Conformance suite per seam trait, run against every implementation.
 - Property tests with `proptest` from v0.1.
 - Crash tests from v0.2; deterministic simulator from v0.4; Elle-style history checker from v0.5.
+- A test must be able to fail. Its expected value never comes from the code under test: use a model, a hand-written known answer, or a second implementation. Every on-disk format has a test with its bytes written out by hand from the spec.
+- Randomized tests must reach the behaviour they claim to test: a generator that rarely produces the interesting case (a duplicate, a full Index) is a coverage gap even when the test passes.
+- Before opening a pull request that changes non-test code, run `scripts/mutants.sh`: it mutates only the lines the branch changes, so its cost follows the change (a typical feature: about a minute). A mutant no test notices is a changed line no test would catch being wrong: add the test. One that cannot change behaviour goes in `.cargo/mutants.toml` with a comment saying why. Not in CI or the hook: each mutant reruns the tests.

@@ -1,5 +1,6 @@
 //! Indexes, the Collection Schema, Strict Fields and unique Indexes
 //! (ADR 0010, ADR 0011).
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
 
 mod common;
 
@@ -42,37 +43,62 @@ enum Op {
 }
 
 fn value() -> impl Strategy<Value = Bson> {
-    // Few distinct values of each Field Type, so that equal values, and
-    // ints, doubles and coerced keys, collide often.
+    let typed: Vec<_> = FieldType::ALL.into_iter().map(value_of).collect();
     prop_oneof![
-        (-3i32..3).prop_map(Bson::Int32),
-        (-3i64..3).prop_map(Bson::Int64),
-        prop::sample::select(vec![-1.5, -0.0, 0.5, 1.0, 2.5, f64::NAN, f64::INFINITY])
-            .prop_map(Bson::Double),
-        prop::sample::select(vec!["a", "b", "1"]).prop_map(|s| Bson::String(s.into())),
-        prop::sample::select(vec![-1i64, 0, 5])
-            .prop_map(|ms| Bson::DateTime(DateTime::from_millis(ms))),
-        any::<bool>().prop_map(Bson::Boolean),
-        prop::sample::select(vec![1u8, 2])
-            .prop_map(|b| Bson::ObjectId(ObjectId::from_bytes([b; 12]))),
-        prop::sample::select(vec![vec![], vec![1u8], vec![1, 0]]).prop_map(|bytes| {
-            Bson::Binary(Binary {
-                subtype: BinarySubtype::Generic,
-                bytes,
-            })
-        }),
+        prop::strategy::Union::new(typed),
         Just(Bson::Null),
         Just(Bson::Array(vec![Bson::Int32(1)])),
         Just(Bson::Document(doc! { "x": 1 })),
     ]
 }
 
-fn op() -> impl Strategy<Value = Op> {
+/// Few distinct values of `field_type`, so that equal values, and ints,
+/// doubles and coerced keys, collide often.
+fn value_of(field_type: FieldType) -> BoxedStrategy<Bson> {
+    match field_type {
+        FieldType::Int => prop_oneof![
+            (-3i32..3).prop_map(Bson::Int32),
+            (-3i64..3).prop_map(Bson::Int64),
+        ]
+        .boxed(),
+        FieldType::Double => {
+            prop::sample::select(vec![-1.5, -0.0, 0.5, 1.0, 2.5, f64::NAN, f64::INFINITY])
+                .prop_map(Bson::Double)
+                .boxed()
+        }
+        FieldType::String => prop::sample::select(vec!["a", "b", "1"])
+            .prop_map(|s| Bson::String(s.into()))
+            .boxed(),
+        FieldType::Date => prop::sample::select(vec![-1i64, 0, 5])
+            .prop_map(|ms| Bson::DateTime(DateTime::from_millis(ms)))
+            .boxed(),
+        FieldType::Bool => any::<bool>().prop_map(Bson::Boolean).boxed(),
+        FieldType::ObjectId => prop::sample::select(vec![1u8, 2])
+            .prop_map(|b| Bson::ObjectId(ObjectId::from_bytes([b; 12])))
+            .boxed(),
+        FieldType::Binary => prop::sample::select(vec![vec![], vec![1u8], vec![1, 0]])
+            .prop_map(|bytes| {
+                Bson::Binary(Binary {
+                    subtype: BinarySubtype::Generic,
+                    bytes,
+                })
+            })
+            .boxed(),
+        other => panic!("no values for {other:?}; add them here"),
+    }
+}
+
+/// Writes to `_id`s that collide often, with values mostly of `field_type`:
+/// a Strict Field refuses the others, so drawing every type evenly would
+/// leave an Index on one almost empty.
+fn op(field_type: FieldType) -> impl Strategy<Value = Op> {
     // Negative too, so `_id` ranges cross zero.
     let id = -3..4i32;
+    let maybe_value =
+        prop::option::weighted(0.8, prop_oneof![3 => value_of(field_type), 1 => value()]);
     prop_oneof![
-        (id.clone(), prop::option::of(value())).prop_map(|(i, v)| Op::Insert(i, v)),
-        (id.clone(), prop::option::of(value())).prop_map(|(i, v)| Op::Replace(i, v)),
+        (id.clone(), maybe_value.clone()).prop_map(|(i, v)| Op::Insert(i, v)),
+        (id.clone(), maybe_value).prop_map(|(i, v)| Op::Replace(i, v)),
         id.prop_map(Op::Delete),
     ]
 }
@@ -111,10 +137,11 @@ fn filter() -> impl Strategy<Value = Document> {
     ]
 }
 
-fn doc_with(id: i32, v: &Option<Bson>) -> Document {
-    match v {
-        Some(v) => doc! { "_id": id, "a": { "v": v.clone() } },
-        None => doc! { "_id": id, "a": {} },
+fn doc_with(id: i32, v: Option<&Bson>) -> Document {
+    if let Some(v) = v {
+        doc! { "_id": id, "a": { "v": v.clone() } }
+    } else {
+        doc! { "_id": id, "a": {} }
     }
 }
 
@@ -124,9 +151,9 @@ fn doc_with(id: i32, v: &Option<Bson>) -> Document {
 fn apply(txn: &mut Transaction<'_, MemoryEngine>, op: &Op) -> psdb_core::Result<()> {
     for coll in [collection("shop.orders"), collection("shop.plain")] {
         match op {
-            Op::Insert(id, v) => txn.insert(&coll, doc_with(*id, v)).map(|_| ())?,
+            Op::Insert(id, v) => txn.insert(&coll, doc_with(*id, v.as_ref())).map(|_| ())?,
             Op::Replace(id, v) => txn
-                .replace(&coll, &Bson::Int32(*id), doc_with(*id, v))
+                .replace(&coll, &Bson::Int32(*id), doc_with(*id, v.as_ref()))
                 .map(|_| ())?,
             Op::Delete(id) => txn.delete(&coll, &Bson::Int32(*id)).map(|_| ())?,
         }
@@ -140,6 +167,15 @@ fn create_index(node: &Node<MemoryEngine>, unique: bool) {
     match node.create_index(&collection("shop.orders"), &field_path("a.v"), unique) {
         Err(Error::DuplicateValue(_)) if unique => {}
         other => other.unwrap(),
+    }
+}
+
+/// A write may fail only for a reason the generated writes can cause.
+fn check_failure_reason(outcome: psdb_core::Result<()>, unique: bool) -> Result<(), TestCaseError> {
+    match outcome {
+        Ok(()) | Err(Error::TypeMismatch(_) | Error::DuplicateId(_)) => Ok(()),
+        Err(Error::DuplicateValue(_)) if unique => Ok(()),
+        Err(e) => Err(TestCaseError::fail(format!("unexpected {e:?}"))),
     }
 }
 
@@ -167,12 +203,15 @@ proptest! {
     /// Documents and in a Transaction that has written more of its own.
     #[test]
     fn index_backed_find_matches_a_full_scan(
-        field_type in prop::sample::select(FieldType::ALL.to_vec()),
+        (field_type, ops, own_writes) in prop::sample::select(FieldType::ALL.to_vec())
+            .prop_flat_map(|ty| (
+                Just(ty),
+                prop::collection::vec(op(ty), 0..30),
+                prop::collection::vec(op(ty), 0..10),
+            )),
         strict in any::<bool>(),
         unique in any::<bool>(),
-        ops in prop::collection::vec(op(), 0..30),
         build_after in 0..30usize,
-        own_writes in prop::collection::vec(op(), 0..10),
         filters in prop::collection::vec(filter(), 1..8),
     ) {
         let node = common::shop();
@@ -187,8 +226,9 @@ proptest! {
             if n == build_after {
                 create_index(&node, unique);
             }
-            // Outcomes are checked by comparing the Collections, not here.
-            let _ = node.run(|t| apply(t, op));
+            // What each write did is checked by comparing the Collections;
+            // here only that it failed, if it did, for a reason it may.
+            check_failure_reason(node.run(|t| apply(t, op)), unique)?;
         }
         if build_after >= ops.len() {
             create_index(&node, unique);
@@ -209,7 +249,7 @@ proptest! {
         }
         let mut txn = node.begin_transaction();
         for op in &own_writes {
-            let _ = apply(&mut txn, op);
+            check_failure_reason(apply(&mut txn, op), unique)?;
         }
         for f in &filters {
             same_in_both(&mut |coll| txn.find(coll, f)?.collect(), f)?;
@@ -308,7 +348,7 @@ fn membership_follows_the_documents_current_type() {
             .find(&collection("shop.orders"), &doc! { "age": 30 })
             .unwrap())
     };
-    assert!(find30().is_empty());
+    assert_eq!(find30(), []);
     node.replace(
         &collection("shop.orders"),
         &Bson::Int32(7),
@@ -322,7 +362,7 @@ fn membership_follows_the_documents_current_type() {
         doc! { "age": "x" },
     )
     .unwrap();
-    assert!(find30().is_empty());
+    assert_eq!(find30(), []);
 }
 
 #[test]
@@ -489,10 +529,10 @@ fn failed_write_leaves_nothing_behind() {
     );
     assert!(matches!(dup, Err(Error::DuplicateValue(_))));
     txn.commit().unwrap();
-    assert!(
+    assert_eq!(
         node.find(&collection("shop.orders"), &doc! { "a": 2 })
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        []
     );
 }
 
@@ -800,11 +840,7 @@ fn an_old_snapshot_still_sees_a_dropped_index() {
         old.list_indexes(&collection("shop.orders")).unwrap().len(),
         1
     );
-    assert!(
-        node.list_indexes(&collection("shop.orders"))
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.list_indexes(&collection("shop.orders")).unwrap(), []);
 }
 
 /// `shop.orders` after a unique Index build on `n` failed with Duplicate
@@ -831,11 +867,7 @@ fn failed_unique_build() -> Node<MemoryEngine> {
 #[test]
 fn building_a_unique_index_over_duplicates_fails_and_leaves_no_index() {
     let node = failed_unique_build();
-    assert!(
-        node.list_indexes(&collection("shop.orders"))
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.list_indexes(&collection("shop.orders")).unwrap(), []);
     // The orphaned entries never surface in a later Index.
     node.create_index(&collection("shop.orders"), &field_path("n"), false)
         .unwrap();
@@ -896,11 +928,7 @@ fn index_build_cut_off_by_power_loss_is_rebuilt_after_reopen() {
     );
     drop(node);
     let node = common::open(&disk).unwrap();
-    assert!(
-        node.list_indexes(&collection("shop.orders"))
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.list_indexes(&collection("shop.orders")).unwrap(), []);
     // The replayed chunk holds an entry for `n: 0`. If the new build reused
     // its Index ID, that orphan would make the value look taken.
     node.delete(&collection("shop.orders"), &Bson::Int32(0))
@@ -933,7 +961,7 @@ fn write_set_cap_fails_the_write_that_crosses_it() {
     txn.commit().unwrap();
     assert_eq!(
         node.find(&collection("d.c"), &doc! {}).unwrap().len(),
-        written as usize
+        usize::try_from(written).unwrap()
     );
 }
 
@@ -1067,11 +1095,7 @@ fn orphaned_index_entries_do_not_make_a_collection_look_non_empty() {
     .unwrap();
     // The failed build's entries share the Collection's range, below its
     // Documents.
-    assert!(
-        node.find(&collection("shop.orders"), &doc! {})
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.find(&collection("shop.orders"), &doc! {}).unwrap(), []);
     node.run(|t| t.create_index_on_empty(&collection("shop.orders"), &field_path("n"), true))
         .unwrap();
 }
@@ -1225,7 +1249,7 @@ fn a_duplicate_ahead_of_a_unique_build_fails_it_and_removes_the_index() {
         }
     };
     assert!(matches!(outcome, Err(Error::DuplicateValue(_))));
-    assert!(states(&node).is_empty());
+    assert_eq!(states(&node), []);
 }
 
 #[test]
@@ -1275,7 +1299,7 @@ fn a_writer_that_began_before_a_build_aborts() {
 fn index_plan_with_overlapping_ranges_returns_each_document_once() {
     let node = Node::with_limits(
         MemoryEngine::new(),
-        psdb_core::Limits::default().with_scan_chunk(2, usize::MAX),
+        Limits::default().with_scan_chunk(2, usize::MAX),
     )
     .unwrap();
     let orders = collection("shop.orders");

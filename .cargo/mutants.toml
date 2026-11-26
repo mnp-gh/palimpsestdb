@@ -1,0 +1,15 @@
+# cargo-mutants, run through scripts/mutants.sh before a pull request that
+# changes non-test code (docs/CONVENTIONS.md).
+# Each exclusion says why no test should catch it.
+
+exclude_globs = [
+    # The conformance suites' own random-input generators: mutating one
+    # weakens a test, it changes no behaviour of the code under test.
+    "crates/psdb-storage/src/conformance.rs",
+]
+
+exclude_re = [
+    # Equivalent: without this arm, `(Null, Null)` falls through to
+    # `_ if a == b`, which returns the same `Equal`.
+    'delete match arm \(Bson::Null, Bson::Null\) in compare',
+]

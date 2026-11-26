@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use bson::{Bson, Document, RawDocument};
 use psdb_storage::{KeyRange, StorageEngine};
 
-use crate::catalog::CollectionEntry;
+use crate::catalog::{Cached, CollectionEntry};
 use crate::collection_path::CollectionPath;
 use crate::document;
 use crate::error::{Error, Result};
@@ -101,7 +101,8 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             return Ok(own.clone());
         }
         if keys::is_catalog_entry_key(logical)
-            && let Some(cached) = self.node.catalog_cache.read_at(logical, self.snapshot_ts)
+            && let Cached::Known(cached) =
+                self.node.catalog_cache.read_at(logical, self.snapshot_ts)
         {
             // Debug builds check the cache against the engine; release builds skip the read.
             debug_assert_eq!(
@@ -226,6 +227,16 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
 
     /// Insert a Document. If it has no `_id`, a UUIDv7 is generated.
     /// Returns the Document ID.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidId`] if `_id` is not a valid Document ID.
+    /// - [`Error::InvalidDocument`] if the Document breaks a [`Limits`](crate::Limits) limit.
+    /// - [`Error::DuplicateId`] if a Document with this `_id` exists.
+    /// - [`Error::TypeMismatch`] if it gives a Strict Field a value of
+    ///   another type.
+    /// - [`Error::DuplicateValue`] if it gives a unique Index a value another
+    ///   Document has.
     pub fn insert(&mut self, collection: &CollectionPath, doc: Document) -> Result<Bson> {
         let entry = self.collection_entry(collection)?;
         let (id, bytes) = document::prepare(doc, None, &self.node.limits, &self.node.id_generator)?;
@@ -238,6 +249,10 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     }
 
     /// The Document with this Document ID, if it exists.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidId`] if `id` is not a valid Document ID.
     pub fn get(&mut self, collection: &CollectionPath, id: &Bson) -> Result<Option<Document>> {
         let (ns_id, coll_id) = self.resolve_collection(collection)?;
         let key = keys::document_key(ns_id, coll_id, id)?;
@@ -249,6 +264,16 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// Replace the whole Document with this Document ID. `doc` may omit
     /// `_id`; if present it must equal `id`. Returns `false` if no such
     /// Document exists (nothing is written).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidId`] if `id` is not a valid Document ID.
+    /// - [`Error::InvalidDocument`] if `doc` has another `_id`, or breaks a
+    ///   [`Limits`](crate::Limits) limit.
+    /// - [`Error::TypeMismatch`] if it gives a Strict Field a value of
+    ///   another type.
+    /// - [`Error::DuplicateValue`] if it gives a unique Index a value another
+    ///   Document has.
     pub fn replace(
         &mut self,
         collection: &CollectionPath,
@@ -268,6 +293,10 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
 
     /// Delete the Document with this Document ID. Returns `false` if no such
     /// Document exists.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidId`] if `id` is not a valid Document ID.
     pub fn delete(&mut self, collection: &CollectionPath, id: &Bson) -> Result<bool> {
         let entry = self.collection_entry(collection)?;
         let key = keys::document_key(entry.namespace_id, entry.id, id)?;
@@ -341,8 +370,12 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// The Documents stream: they are read from the engine a chunk at a
     /// time as the iterator advances (ADR 0016), so the Transaction stays
     /// borrowed (`'txn`) until the iterator is dropped. An Index plan first collects
-    /// the keys of every candidate Document. After an error the iterator
-    /// ends.
+    /// the keys of every candidate Document.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFilter`] if `filter` cannot be parsed. The iterator
+    /// yields the read errors, and ends after the first.
     pub fn find<'txn>(
         &'txn mut self,
         collection: &CollectionPath,
@@ -370,7 +403,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         Ok(std::iter::from_fn(move || {
             while let Some(bytes) = candidates.next() {
                 match bytes.and_then(|bytes| Self::decode_if_matches(&filter, &bytes)) {
-                    Ok(None) => continue,
+                    Ok(None) => {}
                     Ok(Some(doc)) => return Some(Ok(doc)),
                     Err(e) => {
                         // End the iterator after its first error.
@@ -422,17 +455,25 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     /// Commit. Returns the Commit Timestamp, or the Snapshot timestamp for a
     /// Transaction that wrote nothing.
     ///
-    /// Aborts with [`Error::WriteConflict`] if a concurrent Transaction
-    /// committed a write to any key this one wrote, or with
-    /// [`Error::CollectionChanged`] if a Catalog entry this one used changed
-    /// since its Snapshot. Both are retryable. A Transaction that wrote
-    /// nothing always commits, unless the Node is poisoned.
+    /// # Errors
     ///
-    /// In a durable Node, fails with [`Error::TransactionTooLarge`] if
-    /// its WAL Record would exceed 4 GiB, before anything is written. Fails
-    /// with [`Error::CommitOutcomeUnknown`] if the WAL or the engine fails
-    /// partway, which poisons the Node: every later commit, read-only
-    /// or not, fails with [`Error::Poisoned`].
+    /// A Transaction that wrote nothing always commits, unless the Node is
+    /// poisoned. Otherwise:
+    ///
+    /// - [`Error::WriteConflict`] (an Abort, retryable) if a concurrent
+    ///   Transaction committed a write to any key this one wrote.
+    /// - [`Error::CollectionChanged`] (an Abort, retryable) if a Catalog
+    ///   entry this one used changed since its Snapshot, or a Document was
+    ///   committed to a Collection whose every Document this one checked.
+    /// - [`Error::TransactionTooLarge`], in a durable Node, if its WAL Record
+    ///   would exceed 4 GiB; nothing is written.
+    /// - [`Error::CommitOutcomeUnknown`] if the WAL or the engine fails
+    ///   partway. This poisons the Node: every later commit, read-only or
+    ///   not, fails with [`Error::Poisoned`].
+    ///
+    /// # Panics
+    ///
+    /// If one of the Node's locks is poisoned; see [`Node`](crate::Node#panics).
     pub fn commit(self) -> Result<u64> {
         let node = self.node;
         // Read-only: skip the lock, so it never waits behind another commit's fsync.
@@ -499,7 +540,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     pub fn abort(self) {}
 }
 
-impl<'node, E: StorageEngine> Drop for Transaction<'node, E> {
+impl<E: StorageEngine> Drop for Transaction<'_, E> {
     fn drop(&mut self) {
         self.node.unregister_snapshot(self.snapshot_ts);
     }

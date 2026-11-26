@@ -4,6 +4,11 @@
 //! `{"_id": {"$uuid": "0192f3a8-..."}, "n": 1}`. With `--data-dir <path>`
 //! every commit is durable in a WAL in that directory; without it,
 //! everything is lost on exit.
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a shell talks to the terminal"
+)]
 
 use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
@@ -176,7 +181,7 @@ impl Input {
                         return Some(line);
                     }
                     // Ctrl-C discards the current line, like most shells.
-                    Err(ReadlineError::Interrupted) => continue,
+                    Err(ReadlineError::Interrupted) => {}
                     Err(ReadlineError::Eof) => return None,
                     Err(e) => {
                         eprintln!("error: reading input: {e}");
@@ -229,6 +234,11 @@ fn execute<'node>(
             println!("aborted");
         }
 
+        #[expect(
+            clippy::redundant_closure_for_method_calls,
+            reason = "the suggested `Transaction::list_namespaces` does not compile: \
+            a method path cannot accept a Transaction of any lifetime, as `with_txn` requires"
+        )]
         "namespaces" => print_names(&with_txn(node, txn, |t| t.list_namespaces())?),
         "create-ns" => with_txn(node, txn, |t| t.create_namespace(rest))?,
         "drop-ns" => with_txn(node, txn, |t| t.drop_namespace(rest))?,
@@ -242,119 +252,18 @@ fn execute<'node>(
             with_txn(node, txn, |t| t.drop_collection(&coll))?;
         }
 
-        "insert" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [doc] = values::<1>(args)?;
-            let doc = as_document(doc)?;
-            let id = with_txn(node, txn, |t| t.insert(&coll, doc))?;
-            println!("{}", to_json(id));
-        }
-        "get" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [id] = values::<1>(args)?;
-            match with_txn(node, txn, |t| t.get(&coll, &id))? {
-                Some(doc) => println!("{}", to_json(Bson::Document(doc))),
-                None => not_found(&id),
-            }
-        }
-        "replace" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [id, doc] = values::<2>(args)?;
-            let doc = as_document(doc)?;
-            let replaced = with_txn(node, txn, |t| t.replace(&coll, &id, doc))?;
-            if replaced {
-                println!("replaced");
-            } else {
-                not_found(&id);
-            }
-        }
-        "delete" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [id] = values::<1>(args)?;
-            let deleted = with_txn(node, txn, |t| t.delete(&coll, &id))?;
-            if deleted {
-                println!("deleted");
-            } else {
-                not_found(&id);
-            }
-        }
-        "find" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let filter = if args.is_empty() {
-                Document::new()
-            } else {
-                let [filter] = values::<1>(args)?;
-                as_document(filter)?
-            };
-            let docs: Vec<_> = with_txn(node, txn, |t| t.find(&coll, &filter)?.collect())?;
-            let found = docs.len();
-            for doc in docs {
-                println!("{}", to_json(Bson::Document(doc)));
-            }
-            println!("({found} found)");
-        }
+        "insert" => insert(node, txn, rest)?,
+        "get" => get(node, txn, rest)?,
+        "replace" => replace(node, txn, rest)?,
+        "delete" => delete(node, txn, rest)?,
+        "find" => find(node, txn, rest)?,
 
-        "schema" => {
-            let coll = collection_path(rest)?;
-            for (path, field) in with_txn(node, txn, |t| t.collection_schema(&coll))? {
-                let strict = if field.strict { " strict" } else { "" };
-                println!("{path}: {}{strict}", field.field_type);
-            }
-        }
-        "set-type" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let (path, field_type, strict) = match words(args)[..] {
-                [path, ty] => (path, ty, false),
-                [path, ty, "strict"] => (path, ty, true),
-                _ => return Err("usage: set-type <ns>.<coll> <path> <type> [strict]".into()),
-            };
-            let field_type: FieldType = field_type.parse().map_err(message)?;
-            let field = FieldSchema { field_type, strict };
-            let path = field_path(path)?;
-            with_txn(node, txn, |t| t.set_field_type(&coll, &path, field))?;
-        }
-        "unset-type" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [path] = words(args)[..] else {
-                return Err("usage: unset-type <ns>.<coll> <path>".into());
-            };
-            let path = field_path(path)?;
-            with_txn(node, txn, |t| t.remove_field_type(&coll, &path))?;
-        }
-        "indexes" => {
-            let coll = collection_path(rest)?;
-            for index in with_txn(node, txn, |t| t.list_indexes(&coll))? {
-                let unique = if index.unique { " unique" } else { "" };
-                let building = match index.state {
-                    IndexState::Building => " building",
-                    IndexState::Ready => "",
-                };
-                println!("{}{unique}{building}", index.path);
-            }
-        }
-        "create-index" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let (path, unique) = match words(args)[..] {
-                [path] => (path, false),
-                [path, "unique"] => (path, true),
-                _ => return Err("usage: create-index <ns>.<coll> <path> [unique]".into()),
-            };
-            let path = field_path(path)?;
-            match txn {
-                Some(open) => open.create_index_on_empty(&coll, &path, unique),
-                // Builds from existing Documents, committing on its own.
-                None => node.create_index(&coll, &path, unique),
-            }
-            .map_err(message)?;
-        }
-        "drop-index" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [path] = words(args)[..] else {
-                return Err("usage: drop-index <ns>.<coll> <path>".into());
-            };
-            let path = field_path(path)?;
-            with_txn(node, txn, |t| t.drop_index(&coll, &path))?;
-        }
+        "schema" => schema(node, txn, rest)?,
+        "set-type" => set_type(node, txn, rest)?,
+        "unset-type" => unset_type(node, txn, rest)?,
+        "indexes" => indexes(node, txn, rest)?,
+        "create-index" => create_index(node, txn, rest)?,
+        "drop-index" => drop_index(node, txn, rest)?,
 
         "gc" => {
             let stats = node.collect_garbage().map_err(message)?;
@@ -370,6 +279,180 @@ fn execute<'node>(
         other => return Err(format!("unknown command {other:?}; type `help`")),
     }
     Ok(Outcome::Continue)
+}
+
+fn insert<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [doc] = values::<1>(args)?;
+    let doc = as_document(doc)?;
+    let id = with_txn(node, txn, |t| t.insert(&coll, doc))?;
+    println!("{}", to_json(id));
+    Ok(())
+}
+
+fn get<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [id] = values::<1>(args)?;
+    match with_txn(node, txn, |t| t.get(&coll, &id))? {
+        Some(doc) => println!("{}", to_json(Bson::Document(doc))),
+        None => not_found(&id),
+    }
+    Ok(())
+}
+
+fn replace<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [id, doc] = values::<2>(args)?;
+    let doc = as_document(doc)?;
+    let replaced = with_txn(node, txn, |t| t.replace(&coll, &id, doc))?;
+    if replaced {
+        println!("replaced");
+    } else {
+        not_found(&id);
+    }
+    Ok(())
+}
+
+fn delete<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [id] = values::<1>(args)?;
+    let deleted = with_txn(node, txn, |t| t.delete(&coll, &id))?;
+    if deleted {
+        println!("deleted");
+    } else {
+        not_found(&id);
+    }
+    Ok(())
+}
+
+fn find<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let filter = if args.is_empty() {
+        Document::new()
+    } else {
+        let [filter] = values::<1>(args)?;
+        as_document(filter)?
+    };
+    let docs: Vec<_> = with_txn(node, txn, |t| t.find(&coll, &filter)?.collect())?;
+    let found = docs.len();
+    for doc in docs {
+        println!("{}", to_json(Bson::Document(doc)));
+    }
+    println!("({found} found)");
+    Ok(())
+}
+
+fn schema<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let coll = collection_path(rest)?;
+    for (path, field) in with_txn(node, txn, |t| t.collection_schema(&coll))? {
+        let strict = if field.strict { " strict" } else { "" };
+        println!("{path}: {}{strict}", field.field_type);
+    }
+    Ok(())
+}
+
+fn set_type<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let (path, field_type, strict) = match words(args)[..] {
+        [path, ty] => (path, ty, false),
+        [path, ty, "strict"] => (path, ty, true),
+        _ => return Err("usage: set-type <ns>.<coll> <path> <type> [strict]".into()),
+    };
+    let field_type: FieldType = field_type.parse().map_err(message)?;
+    let field = FieldSchema { field_type, strict };
+    let path = field_path(path)?;
+    with_txn(node, txn, |t| t.set_field_type(&coll, &path, field))
+}
+
+fn unset_type<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [path] = words(args)[..] else {
+        return Err("usage: unset-type <ns>.<coll> <path>".into());
+    };
+    let path = field_path(path)?;
+    with_txn(node, txn, |t| t.remove_field_type(&coll, &path))
+}
+
+fn indexes<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let coll = collection_path(rest)?;
+    for index in with_txn(node, txn, |t| t.list_indexes(&coll))? {
+        let unique = if index.unique { " unique" } else { "" };
+        let building = match index.state {
+            IndexState::Building => " building",
+            IndexState::Ready => "",
+        };
+        println!("{}{unique}{building}", index.path);
+    }
+    Ok(())
+}
+
+fn create_index<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let (path, unique) = match words(args)[..] {
+        [path] => (path, false),
+        [path, "unique"] => (path, true),
+        _ => return Err("usage: create-index <ns>.<coll> <path> [unique]".into()),
+    };
+    let path = field_path(path)?;
+    match txn {
+        Some(open) => open.create_index_on_empty(&coll, &path, unique),
+        // Builds from existing Documents, committing on its own.
+        None => node.create_index(&coll, &path, unique),
+    }
+    .map_err(message)
+}
+
+fn drop_index<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [path] = words(args)[..] else {
+        return Err("usage: drop-index <ns>.<coll> <path>".into());
+    };
+    let path = field_path(path)?;
+    with_txn(node, txn, |t| t.drop_index(&coll, &path))
 }
 
 /// Run `work` in the open transaction, or in its own autocommit transaction
@@ -388,6 +471,10 @@ fn with_txn<'node, T>(
 
 /// The error as a message to print. Exits instead if the Node can no
 /// longer commit, so a script fed to `psdb` stops with a non-zero status.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used as `map_err(message)`, which hands over the error"
+)]
 fn message(e: psdb_core::Error) -> String {
     if e.requires_reopen() {
         eprintln!("error: {e}");
@@ -416,7 +503,7 @@ fn words(text: &str) -> Vec<&str> {
 
 /// Parse exactly `N` whitespace-separated Extended JSON values.
 fn values<const N: usize>(text: &str) -> Result<[Bson; N], String> {
-    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>();
+    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<Value>();
     let mut parsed = Vec::new();
     loop {
         // Where the next argument starts, for pointing at it in errors.
@@ -441,14 +528,13 @@ fn values<const N: usize>(text: &str) -> Result<[Bson; N], String> {
         .map_err(|_| format!("expected {N} JSON value(s), got {count}"))
 }
 
-/// Refuse integers above `i64::MAX`, which BSON would silently store as
-/// rounded doubles.
-// shortcut: serde_json already parses integers above u64::MAX as doubles,
-// so those still round silently; catching them needs its
-// `arbitrary_precision` feature.
+/// Refuse integers outside the `i64` range, which BSON would silently store
+/// as rounded doubles. Needs `serde_json`'s `arbitrary_precision`: without
+/// it, integers beyond `u64` already arrive as doubles.
 fn too_large_integers(json: &Value) -> Result<(), String> {
     match json {
-        Value::Number(n) if n.is_u64() && !n.is_i64() => Err(format!(
+        // An integer literal is never `is_f64`, however large.
+        Value::Number(n) if !n.is_i64() && !n.is_f64() => Err(format!(
             "{n} does not fit a 64-bit integer; write {n}.0 to store it as a rounded double"
         )),
         Value::Array(items) => items.iter().try_for_each(too_large_integers),
@@ -502,5 +588,71 @@ fn not_found(id: &Bson) {
 fn print_names(names: &[String]) {
     for name in names {
         println!("{name}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one(text: &str) -> Result<Bson, String> {
+        values::<1>(text).map(|[value]| value)
+    }
+
+    #[test]
+    fn integers_that_fit_stay_integers() {
+        assert_eq!(one("42").unwrap(), Bson::Int32(42));
+        assert_eq!(one("9223372036854775807").unwrap(), Bson::Int64(i64::MAX));
+        assert_eq!(one("-9223372036854775808").unwrap(), Bson::Int64(i64::MIN));
+    }
+
+    #[test]
+    fn integers_too_large_for_64_bits_are_refused() {
+        for text in [
+            "9223372036854775808",
+            "18446744073709551616",
+            "100000000000000000000",
+            "-9223372036854775809",
+            r#"{"a": [1, 100000000000000000000]}"#,
+        ] {
+            let err = one(text).unwrap_err();
+            assert!(
+                err.contains("does not fit a 64-bit integer"),
+                "{text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn doubles_stay_doubles() {
+        assert_eq!(one("1.5").unwrap(), Bson::Double(1.5));
+        assert_eq!(one("1e3").unwrap(), Bson::Double(1000.0));
+        assert_eq!(one("100000000000000000000.0").unwrap(), Bson::Double(1e20));
+        assert_eq!(one("-0.0").unwrap(), Bson::Double(-0.0));
+    }
+
+    #[test]
+    fn extended_json_still_parses() {
+        assert_eq!(one(r#"{"$numberLong": "5"}"#).unwrap(), Bson::Int64(5));
+        assert_eq!(
+            one(r#"{"$numberDouble": "2.5"}"#).unwrap(),
+            Bson::Double(2.5)
+        );
+        assert_eq!(
+            one(r#"{"$date": "2024-01-02T03:04:05Z"}"#).unwrap(),
+            Bson::DateTime(bson::DateTime::from_millis(1_704_164_645_000))
+        );
+        assert_eq!(
+            one(r#"{"a": {"b": [1, 2.5, "x", null, true]}}"#).unwrap(),
+            Bson::Document(bson::doc! { "a": { "b": [1, 2.5, "x", null, true] } })
+        );
+    }
+
+    #[test]
+    fn numbers_print_as_relaxed_extended_json() {
+        assert_eq!(to_json(Bson::Int32(42)), "42");
+        assert_eq!(to_json(Bson::Int64(i64::MAX)), "9223372036854775807");
+        assert_eq!(to_json(Bson::Double(1.5)), "1.5");
+        assert_eq!(to_json(Bson::Double(1e20)), "1e+20");
     }
 }

@@ -90,11 +90,7 @@ fn recreated_collection_starts_empty() {
             .unwrap(),
         None
     );
-    assert!(
-        node.find(&collection("shop.orders"), &doc! {})
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.find(&collection("shop.orders"), &doc! {}).unwrap(), []);
 }
 
 #[test]
@@ -104,7 +100,7 @@ fn recreated_namespace_starts_empty() {
         .unwrap();
     node.drop_namespace("shop").unwrap();
     node.create_namespace("shop").unwrap();
-    assert!(node.list_collections("shop").unwrap().is_empty());
+    assert_eq!(node.list_collections("shop").unwrap(), Vec::<String>::new());
 }
 
 #[test]

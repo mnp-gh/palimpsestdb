@@ -90,14 +90,12 @@ impl CatalogCache {
         }
     }
 
-    /// The value of the Catalog entry `logical` at `snapshot_ts`, or `None`
-    /// if its newest Version is newer than the Snapshot, so only the engine
-    /// has the answer.
-    pub(crate) fn read_at(&self, logical: &[u8], snapshot_ts: u64) -> Option<Option<Vec<u8>>> {
+    /// What the cache knows of the Catalog entry `logical` at `snapshot_ts`.
+    pub(crate) fn read_at(&self, logical: &[u8], snapshot_ts: u64) -> Cached {
         match self.0.read().expect("catalog cache poisoned").get(logical) {
-            None => Some(None),
-            Some((ts, value)) if *ts <= snapshot_ts => Some(value.clone()),
-            Some(_) => None,
+            None => Cached::Known(None),
+            Some((ts, value)) if *ts <= snapshot_ts => Cached::Known(value.clone()),
+            Some(_) => Cached::AskEngine,
         }
     }
 
@@ -164,6 +162,16 @@ impl CatalogCache {
             .expect("catalog cache poisoned")
             .retain(|_, (ts, value)| value.is_some() || *ts > horizon);
     }
+}
+
+/// What the Catalog cache knows of an entry at a Snapshot.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Cached {
+    /// The entry's value at the Snapshot: `None` if absent or deleted.
+    Known(Option<Vec<u8>>),
+    /// Its newest Version is newer than the Snapshot, so only the engine
+    /// has the answer.
+    AskEngine,
 }
 
 /// A Collection's Catalog entry.
@@ -290,6 +298,12 @@ impl CollectionEntry {
 
 impl<E: StorageEngine> Transaction<'_, E> {
     /// Create a Namespace.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidName`] if `name` breaks the naming rules.
+    /// - [`Error::NamespaceExists`] if one with that name exists.
+    /// - [`Error::IdsExhausted`] if no unused Namespace ID turned up.
     pub fn create_namespace(&mut self, name: &str) -> Result<()> {
         validate_name(name)?;
         let key = keys::namespace_entry_key(name);
@@ -303,12 +317,20 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// Drop a Namespace. Its Collections become unreachable: their Catalog
     /// entries and Documents stay behind under the old IDs until Garbage
     /// Collection reclaims them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchNamespace`] if it does not exist.
     pub fn drop_namespace(&mut self, name: &str) -> Result<()> {
         self.resolve_namespace(name)?;
         self.write(keys::namespace_entry_key(name), None)
     }
 
     /// The names of every Namespace, in byte order.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn list_namespaces(&mut self) -> Result<Vec<String>> {
         self.scan(&keys::namespaces_prefix())?
             .values()
@@ -317,6 +339,12 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// Create a Collection in an existing Namespace.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NoSuchNamespace`] if the Namespace does not exist.
+    /// - [`Error::CollectionExists`] if the Collection does.
+    /// - [`Error::IdsExhausted`] if no unused Collection ID turned up.
     pub fn create_collection(&mut self, collection: &CollectionPath) -> Result<()> {
         let ns_id = self.resolve_namespace(collection.namespace())?;
         let key = keys::collection_entry_key(ns_id, collection.collection());
@@ -329,6 +357,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
 
     /// Drop a Collection. Its Documents become unreachable and stay behind
     /// until Garbage Collection reclaims them.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn drop_collection(&mut self, collection: &CollectionPath) -> Result<()> {
         let (ns_id, _) = self.resolve_collection(collection)?;
         self.write(
@@ -338,6 +370,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// The names of every Collection in a Namespace, in byte order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchNamespace`] if the Namespace does not exist.
     pub fn list_collections(&mut self, namespace: &str) -> Result<Vec<String>> {
         let ns_id = self.resolve_namespace(namespace)?;
         self.scan(&keys::collections_prefix(ns_id))?
@@ -511,15 +547,26 @@ mod tests {
     fn catalog_cache_answers_misses_and_defers_newer_entries_to_the_engine() {
         let cache = CatalogCache::default();
         let shop = keys::namespace_entry_key("shop");
-        assert_eq!(cache.read_at(&shop, 0), Some(None), "never written: absent");
+        assert_eq!(
+            cache.read_at(&shop, 0),
+            Cached::Known(None),
+            "never written: absent"
+        );
 
         let write_set = WriteSet::from([
             (shop.clone(), Some(entry("shop", 7))),
             (keys::namespace_id_key(7), Some(Vec::new())),
         ]);
         cache.record(5, &write_set);
-        assert_eq!(cache.read_at(&shop, 4), None, "newer than the Snapshot");
-        assert_eq!(cache.read_at(&shop, 5), Some(Some(entry("shop", 7))));
+        assert_eq!(
+            cache.read_at(&shop, 4),
+            Cached::AskEngine,
+            "newer than the Snapshot"
+        );
+        assert_eq!(
+            cache.read_at(&shop, 5),
+            Cached::Known(Some(entry("shop", 7)))
+        );
         assert!(!keys::is_catalog_entry_key(&keys::namespace_id_key(7)));
         assert!(keys::is_catalog_entry_key(&keys::collection_entry_key(
             7, "orders"
@@ -657,5 +704,56 @@ mod tests {
             pick_unused(std::iter::repeat(5), |_| Ok(true)),
             Err(Error::IdsExhausted)
         ));
+    }
+
+    /// Stored Catalog entries outlive the code: their BSON field names and
+    /// types are written out here by hand, so renaming a field or storing
+    /// `id` as an int32 fails here even if `encode` and `decode` agree.
+    #[test]
+    fn catalog_entries_have_a_fixed_shape() {
+        let stored = |bytes: Vec<u8>| Document::from_reader(bytes.as_slice()).unwrap();
+
+        assert_eq!(
+            stored(entry("shop", 7)),
+            doc! { "name": "shop", "id": 7i64 }
+        );
+
+        let mut schema = Schema::new();
+        let field = FieldSchema {
+            field_type: FieldType::Int,
+            strict: true,
+        };
+        schema.insert("n".parse().unwrap(), field);
+        let collection = CollectionEntry {
+            namespace_id: 1,
+            name: "orders".into(),
+            id: 9,
+            schema,
+            indexes: Vec::new(),
+            next_index_id: 2,
+        };
+        let shape = doc! {
+            "name": "orders",
+            "id": 9i64,
+            "fields": [{ "path": "n", "type": "int", "strict": true }],
+            "nextIndexId": 2i64,
+        };
+        assert_eq!(stored(collection.encode()), shape);
+        let mut bytes = Vec::new();
+        shape.to_writer(&mut bytes).unwrap();
+        assert_eq!(CollectionEntry::decode(1, &bytes).unwrap(), collection);
+
+        let index = IndexDef {
+            path: "n".parse().unwrap(),
+            id: 3,
+            unique: true,
+            state: IndexState::Ready,
+        };
+        let shape = doc! { "path": "n", "unique": true, "state": "ready" };
+        assert_eq!(stored(CollectionEntry::encode_index(&index)), shape);
+        let mut bytes = Vec::new();
+        shape.to_writer(&mut bytes).unwrap();
+        let key = keys::index_catalog_key(1, 9, 3);
+        assert_eq!(CollectionEntry::decode_index(&key, &bytes).unwrap(), index);
     }
 }

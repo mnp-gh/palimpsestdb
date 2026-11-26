@@ -1,0 +1,32 @@
+# Clock, I/O and randomness go through seams so the deterministic simulator
+# can drive the system (docs/CONVENTIONS.md). Seam implementations opt out
+# with `#[expect(clippy::disallowed_methods, reason = "...")]`.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "read time through the Clock seam" },
+    { path = "std::time::SystemTime::now", reason = "read time through the Clock seam" },
+    { path = "std::fs::create_dir", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::create_dir_all", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::remove_dir_all", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::remove_file", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::read", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::read_to_string", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::read_dir", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::write", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::rename", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::metadata", reason = "do I/O through a seam such as WalFile" },
+    { path = "getrandom::u32", reason = "draw randomness through IdGenerator" },
+    { path = "getrandom::u64", reason = "draw randomness through IdGenerator" },
+    { path = "getrandom::fill", reason = "draw randomness through IdGenerator" },
+    { path = "uuid::Uuid::now_v7", reason = "make ids through IdGenerator" },
+    { path = "uuid::Uuid::new_v4", reason = "make ids through IdGenerator" },
+]
+disallowed-types = [
+    { path = "std::fs::File", reason = "do I/O through a seam such as WalFile" },
+    { path = "std::fs::OpenOptions", reason = "do I/O through a seam such as WalFile" },
+]
+
+allow-unwrap-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+# Proper nouns, not code; ".." keeps clippy's defaults.
+doc-valid-idents = ["PalimpsestDB", "MongoDB", "UUIDv7", "ObjectIds", ".."]

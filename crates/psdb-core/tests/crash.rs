@@ -7,6 +7,11 @@
 //! A commit in flight at the crash may or may not survive. Two kinds of
 //! crash: simulated power loss on a [`SimDisk`], which drops unsynced bytes,
 //! and killing a real child process, which exercises the real filesystem.
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "crashes are tested on the real filesystem with random kill points"
+)]
 
 mod common;
 
@@ -153,7 +158,7 @@ proptest! {
 
         // The recovered Node keeps working and survives another reopen.
         let node = open(&disk).unwrap();
-        prop_assert_eq!(state(&node), recovered.clone());
+        prop_assert_eq!(&state(&node), &recovered);
         if recovered.orders.is_some() {
             node.insert(&collection("shop.orders"), doc! { "_id": 99, "v": 0 }).unwrap();
             drop(node);
@@ -178,7 +183,7 @@ fn kill_child() {
     node.create_namespace("shop").unwrap();
     node.create_collection(&collection("shop.orders")).unwrap();
     let mut out = std::io::stdout().lock();
-    for id in 0.. {
+    for id in 0..i32::MAX {
         node.insert(&collection("shop.orders"), doc! { "_id": id, "v": 0 })
             .unwrap();
         writeln!(out, "acknowledged {id}").unwrap();
@@ -221,7 +226,7 @@ fn kill_keeps_exactly_a_prefix_of_commits() {
         // Inserted in order 0, 1, 2, …, so an unbroken run with nothing
         // invented is exactly 0..n.
         assert!(
-            ids.iter().copied().eq(0..ids.len() as i32),
+            ids.iter().copied().eq(0..i32::try_from(ids.len()).unwrap()),
             "round {round}: {ids:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();

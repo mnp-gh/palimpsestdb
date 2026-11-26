@@ -1,0 +1,15 @@
+[package]
+name = "psdb-lint"
+description = "The comment rules from docs/CONVENTIONS.md that clippy cannot check."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Parsing only, to keep the build small: the tool never prints Rust.
+syn = { workspace = true, features = ["full", "parsing"] }
+
+[lints]
+workspace = true

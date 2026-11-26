@@ -21,10 +21,18 @@ pub const MAX_NAME_BYTES: usize = 64;
 /// you need:
 ///
 /// ```
-/// use psdb_core::Limits;
+/// use bson::doc;
+/// use psdb_core::{Error, Limits, Node};
+/// use psdb_storage_memory::MemoryEngine;
 ///
 /// let limits = Limits::default().with_max_document_bytes(1024);
-/// assert_eq!(limits.max_document_bytes, 1024);
+/// let node = Node::with_limits(MemoryEngine::new(), limits)?;
+/// node.create_namespace("shop")?;
+/// let orders = "shop.orders".parse()?;
+/// node.create_collection(&orders)?;
+/// let large = doc! { "note": "x".repeat(2000) };
+/// assert!(matches!(node.insert(&orders, large), Err(Error::InvalidDocument(_))));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -64,6 +72,7 @@ impl Default for Limits {
 impl Limits {
     /// These limits with [`max_document_bytes`](Self::max_document_bytes)
     /// set to `bytes`.
+    #[must_use]
     pub fn with_max_document_bytes(self, bytes: usize) -> Self {
         Self {
             max_document_bytes: bytes,
@@ -73,6 +82,7 @@ impl Limits {
 
     /// These limits with [`max_nesting_depth`](Self::max_nesting_depth)
     /// set to `depth`.
+    #[must_use]
     pub fn with_max_nesting_depth(self, depth: usize) -> Self {
         Self {
             max_nesting_depth: depth,
@@ -82,6 +92,7 @@ impl Limits {
 
     /// These limits with [`max_write_set_bytes`](Self::max_write_set_bytes)
     /// set to `bytes`.
+    #[must_use]
     pub fn with_max_write_set_bytes(self, bytes: usize) -> Self {
         Self {
             max_write_set_bytes: bytes,
@@ -91,6 +102,7 @@ impl Limits {
 
     /// These limits with [`scan_chunk_keys`](Self::scan_chunk_keys) set to
     /// `keys` and [`scan_chunk_bytes`](Self::scan_chunk_bytes) to `bytes`.
+    #[must_use]
     pub fn with_scan_chunk(self, keys: usize, bytes: usize) -> Self {
         Self {
             scan_chunk_keys: keys,

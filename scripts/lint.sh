@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# The lint checks, shared by the Claude Code hook and CI. Clippy runs twice:
+# with tests, whose dev-dependencies turn on `testing`, and on the plain
+# library, where code exported only for tests must not look public.
+# psdb-lint checks the given files, or every file if none are given.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# The toolchain rust-toolchain.toml pins, as CI uses, even when another Rust
+# (Homebrew's, say) comes first on PATH: an older clippy misses newer lints.
+if command -v rustup > /dev/null; then
+  PATH="$(dirname "$(rustup which cargo)"):$PATH"
+fi
+
+cargo clippy --workspace --all-targets --quiet -- -D warnings
+cargo clippy --workspace --quiet -- -D warnings
+scripts/check-crates.sh
+cargo run --quiet -p psdb-lint -- "$@"

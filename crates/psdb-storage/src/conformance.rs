@@ -14,6 +14,7 @@
 //! atomicity and ordering, read-your-writes). Crash behaviour needs a
 //! persistent engine and is checked by the crash tests that arrive with the
 //! WAL.
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
@@ -148,10 +149,11 @@ fn scan_respects_range_bounds<E: StorageEngine>(engine: &E) {
         vec![b"b".to_vec(), b"c".to_vec()],
         "start is inclusive, end exclusive"
     );
-    assert!(collect(engine, &KeyRange::new("x", "z")).is_empty());
+    assert_eq!(collect(engine, &KeyRange::new("x", "z")), []);
     for empty in [KeyRange::new("d", "b"), KeyRange::new("b", "b")] {
-        assert!(
-            collect(engine, &empty).is_empty(),
+        assert_eq!(
+            collect(engine, &empty),
+            [],
             "an empty range (end <= start) visits nothing: {empty:?}"
         );
     }
@@ -245,14 +247,14 @@ impl XorShift {
         self.0
     }
 
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
+    fn below(&mut self, n: usize) -> usize {
+        usize::try_from(self.next() % n as u64).expect("less than n, so it fits")
     }
 
     fn key(&mut self) -> Vec<u8> {
         // A tiny alphabet with the edge bytes makes collisions and prefixes common.
         const ALPHABET: [u8; 4] = [0x00, b'a', b'b', 0xFF];
-        let len = self.below(4) as usize;
-        (0..len).map(|_| ALPHABET[self.below(4) as usize]).collect()
+        let len = self.below(4);
+        (0..len).map(|_| ALPHABET[self.below(4)]).collect()
     }
 }

@@ -17,6 +17,7 @@
 //! The suite checks the in-process rules of the contract. What survives
 //! power loss is checked against [`SimDisk`](super::SimDisk) by the crash
 //! tests, since a real file cannot be made to lose power.
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
 
 use super::WalFile;
 

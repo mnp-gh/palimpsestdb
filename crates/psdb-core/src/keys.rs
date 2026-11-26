@@ -315,7 +315,7 @@ pub(crate) fn type_tag(component: &[u8]) -> u8 {
 /// Big-endian bytes of `n` with the sign bit flipped, so negative numbers
 /// sort before positive ones.
 fn flip_sign(n: i64) -> [u8; 8] {
-    ((n as u64) ^ (1 << 63)).to_be_bytes()
+    (n.cast_unsigned() ^ (1 << 63)).to_be_bytes()
 }
 
 /// Append `bytes` with each `0x00` escaped as `0x00 0xFF`, then the
@@ -497,7 +497,7 @@ mod tests {
             Bson::Double(1.0),
             Bson::Null,
             Bson::Array(vec![]),
-            Bson::Document(Default::default()),
+            Bson::Document(bson::Document::new()),
         ] {
             assert!(
                 matches!(encode_id(&id, &mut Vec::new()), Err(Error::InvalidId(_))),
@@ -510,5 +510,96 @@ mod tests {
     fn rejects_oversized_id() {
         let id = Bson::String("x".repeat(MAX_ID_BYTES));
         assert!(matches!(document_key(1, 1, &id), Err(Error::InvalidId(_))));
+    }
+
+    /// Stored keys outlive the code: these bytes are written out from
+    /// ADR 0008 by hand, not by the encoder, so a change to the layout fails
+    /// here even if every encoder and decoder changes with it.
+    #[test]
+    fn key_layout_matches_adr_0008_byte_for_byte() {
+        // A Document's key in Namespace 7, Collection 9. Integers and dates
+        // flip the sign bit (0x80 here), so negatives sort first.
+        let in_collection_7_9 = |id: &[u8]| [&[0, 0, 0, 7, 0, 0, 0, 9][..], id].concat();
+        assert_eq!(
+            document_key(7, 9, &Bson::Int32(5)).unwrap(),
+            in_collection_7_9(&[0x10, 0x80, 0, 0, 0, 0, 0, 0, 5])
+        );
+        assert_eq!(
+            document_key(7, 9, &Bson::Int64(-1)).unwrap(),
+            in_collection_7_9(&[0x10, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        );
+        assert_eq!(
+            document_key(7, 9, &Bson::String("a\0b".into())).unwrap(),
+            in_collection_7_9(&[0x20, b'a', 0x00, 0xFF, b'b', 0x00, 0x00])
+        );
+        let uuid = Binary {
+            subtype: BinarySubtype::Uuid,
+            bytes: vec![1, 0],
+        };
+        assert_eq!(
+            document_key(7, 9, &Bson::Binary(uuid)).unwrap(),
+            in_collection_7_9(&[0x30, 0x04, 0x01, 0x00, 0xFF, 0x00, 0x00])
+        );
+        assert_eq!(
+            document_key(7, 9, &Bson::ObjectId(ObjectId::from_bytes([3; 12]))).unwrap(),
+            in_collection_7_9(&[[0x40].as_slice(), &[3; 12]].concat())
+        );
+        assert_eq!(
+            document_key(7, 9, &Bson::Boolean(true)).unwrap(),
+            in_collection_7_9(&[0x50, 0x01])
+        );
+        assert_eq!(
+            document_key(7, 9, &Bson::DateTime(DateTime::from_millis(1))).unwrap(),
+            in_collection_7_9(&[0x60, 0x80, 0, 0, 0, 0, 0, 0, 1])
+        );
+
+        let component = |push: fn(&mut Vec<u8>)| {
+            let mut out = Vec::new();
+            push(&mut out);
+            out
+        };
+        assert_eq!(component(push_null), [0x05]);
+        assert_eq!(
+            component(|out| push_double(out, 1.0)),
+            [0x11, 0xBF, 0xF0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            component(|out| push_double(out, -1.0)),
+            [0x11, 0x40, 0x0F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            component(|out| push_double(out, -0.0)),
+            [0x11, 0x80, 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        assert_eq!(
+            physical_key(b"k", 1),
+            [b'k', 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]
+        );
+        assert_eq!(
+            index_prefix(7, 9, 3),
+            [0, 0, 0, 7, 0, 0, 0, 9, 0x00, 0, 0, 0, 3]
+        );
+        assert_eq!(
+            namespace_entry_key("shop"),
+            [0, 0, 0, 0, 0, 0, 0, 1, b's', b'h', b'o', b'p', 0, 0]
+        );
+        assert_eq!(
+            collection_entry_key(7, "c"),
+            [0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 7, b'c', 0, 0]
+        );
+        assert_eq!(namespace_id_key(7), [0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 7]);
+        assert_eq!(
+            collection_id_key(7, 9),
+            [0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 7, 0, 0, 0, 9]
+        );
+        assert_eq!(
+            index_catalog_key(7, 9, 3),
+            [0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 7, 0, 0, 0, 9, 0, 0, 0, 3]
+        );
+        assert_eq!(
+            applied_up_to_key(),
+            [&[0; 8][..], b"applied_up_to"].concat()
+        );
     }
 }

@@ -14,7 +14,8 @@ psdb-cli ──────► psdb-core ──────► psdb-storage ◄�
 - **`psdb-storage`**: the `StorageEngine` trait (ordered byte keys to byte values, atomic batches, range scans) and its conformance suite. It knows nothing about Documents, Versions or Transactions (ADR 0001).
 - **`psdb-storage-memory`**: the only engine until v0.9. Nothing it holds survives a restart; the WAL rebuilds it.
 - **`psdb-core`**: the Database Layer, everything that gives bytes meaning. Generic over the engine: `Node<E: StorageEngine>`.
-- **`psdb-cli`**: the `psdb` shell, the only binary. It picks the engine.
+- **`psdb-cli`**: the `psdb` shell, the only binary shipped. It picks the engine.
+- **`psdb-lint`**: a development tool, not part of the database: the comment rules from `docs/CONVENTIONS.md` that clippy cannot check. `scripts/lint.sh` runs it.
 
 Inside `psdb-core`, from the public API down:
 

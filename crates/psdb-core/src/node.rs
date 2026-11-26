@@ -27,6 +27,12 @@ use crate::wal::{self, OsWalFile, Wal, WalFile};
 /// (ADR 0005). [`open`](Self::open) makes it durable with a WAL (ADR 0004);
 /// [`new`](Self::new) keeps nothing durable.
 ///
+/// # Panics
+///
+/// A thread that panics while holding one of a Node's locks poisons the
+/// lock: the state it guards may be half-updated. From then on, calls that
+/// take that lock panic too, and the Node must be dropped and opened again.
+///
 /// ```
 /// use bson::doc;
 /// use psdb_core::Node;
@@ -80,6 +86,10 @@ pub struct IdGenerator {
     pub catalog_id: Box<dyn Fn() -> u32 + Send + Sync>,
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the OS clock and random number generator behind the IdGenerator seam"
+)]
 impl Default for IdGenerator {
     fn default() -> Self {
         Self {
@@ -161,21 +171,35 @@ impl CommitState {
 impl<E: StorageEngine> Node<E> {
     /// Open over `engine` with default [`Limits`], keeping nothing
     /// durable. An engine that already holds data is reopened where it
-    /// left off. Fails with [`Error::Corruption`] if it holds data without
+    /// left off.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corruption`] if the engine holds data without
     /// `applied_up_to`.
     pub fn new(engine: E) -> Result<Self> {
         Self::with_limits(engine, Limits::default())
     }
 
     /// Open over `engine` with custom [`Limits`], keeping nothing
-    /// durable. Fails as [`new`](Self::new) does.
+    /// durable.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`new`](Self::new).
     pub fn with_limits(engine: E, limits: Limits) -> Result<Self> {
         Self::recover(engine, limits, IdGenerator::default(), None)
     }
 
     /// Open a durable Node whose WAL lives in `dir`, creating `dir` and
     /// the WAL if needed, and replay into `engine` the WAL Records it does
-    /// not hold yet. Fails with [`Error::Io`] if another Node has `dir` open.
+    /// not hold yet.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if another Node has `dir` open, or `dir` or the WAL
+    ///   cannot be created.
+    /// - Those of [`open_with`](Self::open_with).
     ///
     /// ```
     /// use bson::doc;
@@ -205,12 +229,18 @@ impl<E: StorageEngine> Node<E> {
     /// Open a durable Node over any [`WalFile`], such as a `SimDisk` file
     /// in tests (feature `testing`), taking new IDs from `id_generator`, and replay
     /// into `engine` the WAL Records above its `applied_up_to` (ADR 0015).
+    /// A torn write at the WAL's end is truncated, and a WAL cut off while
+    /// being created is rewritten.
     ///
-    /// Fails with [`Error::UnrecognisedWal`], or with [`Error::Corruption`]
-    /// for a damaged WAL, an engine that holds data without
-    /// `applied_up_to`, or an engine ahead of the WAL, without changing any
-    /// WAL Record. A torn write at the WAL's end is truncated, and a WAL
-    /// cut off while being created is rewritten.
+    /// # Errors
+    ///
+    /// - [`Error::UnrecognisedWal`] if the WAL has the wrong magic number or
+    ///   an unknown format version.
+    /// - [`Error::Corruption`] for a damaged WAL, an engine that holds data
+    ///   without `applied_up_to`, or an engine ahead of the WAL.
+    /// - [`Error::Io`] if `wal` fails.
+    ///
+    /// None of these changes any WAL Record.
     pub fn open_with(
         engine: E,
         wal: impl WalFile + 'static,
@@ -288,6 +318,10 @@ impl<E: StorageEngine> Node<E> {
 
     /// The oldest Snapshot any active Transaction reads, or the newest Visible
     /// commit when no Transaction is active (see `GLOSSARY.md`).
+    ///
+    /// # Panics
+    ///
+    /// If one of the Node's locks is poisoned; see [`Node`](crate::Node#panics).
     pub fn horizon(&self) -> u64 {
         let reg = self.snapshot_registry.lock().expect("registry poisoned");
         reg.keys()
@@ -315,15 +349,21 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Begin a Transaction with a Snapshot of everything committed so far.
+    ///
+    /// # Panics
+    ///
+    /// If one of the Node's locks is poisoned; see [`Node`](crate::Node#panics).
     pub fn begin_transaction(&self) -> Transaction<'_, E> {
-        if self.commit_lock.is_poisoned() {
-            panic!("commit lock poisoned");
-        }
+        assert!(!self.commit_lock.is_poisoned(), "commit lock poisoned");
         Transaction::new(self)
     }
 
     /// Run `work` in a new Transaction and commit it if `work` succeeds.
-    /// If `work` fails, the Transaction is aborted and its error returned.
+    ///
+    /// # Errors
+    ///
+    /// Those of `work`, after which the Transaction is aborted; then those of
+    /// [`Transaction::commit`].
     pub fn run<T>(&self, work: impl FnOnce(&mut Transaction<'_, E>) -> Result<T>) -> Result<T> {
         let mut txn = self.begin_transaction();
         let out = work(&mut txn)?;
@@ -332,56 +372,105 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::create_namespace`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::create_namespace`], then of [`Transaction::commit`].
     pub fn create_namespace(&self, name: &str) -> Result<()> {
         self.run(|t| t.create_namespace(name))
     }
 
     /// Autocommit [`Transaction::drop_namespace`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::drop_namespace`], then of [`Transaction::commit`].
     pub fn drop_namespace(&self, name: &str) -> Result<()> {
         self.run(|t| t.drop_namespace(name))
     }
 
     /// Autocommit [`Transaction::list_namespaces`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::list_namespaces`], then of [`Transaction::commit`].
+    #[expect(
+        clippy::redundant_closure_for_method_calls,
+        reason = "the suggested `Transaction::list_namespaces` does not compile: \
+            a method path cannot accept a Transaction of any lifetime, as `run` requires"
+    )]
     pub fn list_namespaces(&self) -> Result<Vec<String>> {
         self.run(|t| t.list_namespaces())
     }
 
     /// Autocommit [`Transaction::create_collection`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::create_collection`], then of [`Transaction::commit`].
     pub fn create_collection(&self, collection: &CollectionPath) -> Result<()> {
         self.run(|t| t.create_collection(collection))
     }
 
     /// Autocommit [`Transaction::drop_collection`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::drop_collection`], then of [`Transaction::commit`].
     pub fn drop_collection(&self, collection: &CollectionPath) -> Result<()> {
         self.run(|t| t.drop_collection(collection))
     }
 
     /// Autocommit [`Transaction::list_collections`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::list_collections`], then of [`Transaction::commit`].
     pub fn list_collections(&self, namespace: &str) -> Result<Vec<String>> {
         self.run(|t| t.list_collections(namespace))
     }
 
     /// Autocommit [`Transaction::insert`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::insert`], then of [`Transaction::commit`].
     pub fn insert(&self, collection: &CollectionPath, doc: Document) -> Result<Bson> {
         self.run(|t| t.insert(collection, doc))
     }
 
     /// Autocommit [`Transaction::get`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::get`], then of [`Transaction::commit`].
     pub fn get(&self, collection: &CollectionPath, id: &Bson) -> Result<Option<Document>> {
         self.run(|t| t.get(collection, id))
     }
 
     /// Autocommit [`Transaction::replace`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::replace`], then of [`Transaction::commit`].
     pub fn replace(&self, collection: &CollectionPath, id: &Bson, doc: Document) -> Result<bool> {
         self.run(|t| t.replace(collection, id, doc))
     }
 
     /// Autocommit [`Transaction::delete`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::delete`], then of [`Transaction::commit`].
     pub fn delete(&self, collection: &CollectionPath, id: &Bson) -> Result<bool> {
         self.run(|t| t.delete(collection, id))
     }
 
     /// Autocommit [`Transaction::set_field_type`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::set_field_type`], then of [`Transaction::commit`].
     pub fn set_field_type(
         &self,
         collection: &CollectionPath,
@@ -392,11 +481,19 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::remove_field_type`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::remove_field_type`], then of [`Transaction::commit`].
     pub fn remove_field_type(&self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
         self.run(|t| t.remove_field_type(collection, path))
     }
 
     /// Autocommit [`Transaction::collection_schema`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::collection_schema`], then of [`Transaction::commit`].
     pub fn collection_schema(
         &self,
         collection: &CollectionPath,
@@ -405,25 +502,41 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::drop_index`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::drop_index`], then of [`Transaction::commit`].
     pub fn drop_index(&self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
         self.run(|t| t.drop_index(collection, path))
     }
 
     /// Autocommit [`Transaction::list_indexes`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::list_indexes`], then of [`Transaction::commit`].
     pub fn list_indexes(&self, collection: &CollectionPath) -> Result<Vec<IndexInfo>> {
         self.run(|t| t.list_indexes(collection))
     }
 
     /// Autocommit [`Transaction::find`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::find`], then of [`Transaction::commit`].
     pub fn find(&self, collection: &CollectionPath, filter: &Document) -> Result<Vec<Document>> {
         self.run(|t| t.find(collection, filter)?.collect())
     }
 
     /// Induces a panic while holding the commit lock to poison it for testing.
     #[cfg(any(test, feature = "testing"))]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "every panic in it, induced or from a poisoned lock, is caught there"
+    )]
     pub fn poison_commit_lock_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = self.commit_lock.lock().unwrap();
+            let _guard = self.commit_lock.lock().expect("lock poisoned");
             panic!("test induced panic to poison commit lock");
         }));
     }

@@ -67,6 +67,11 @@ impl Filter {
     /// assert!(!filter.matches(&doc! { "age": 12, "address": { "city": "Paris" } })?);
     /// # Ok::<(), psdb_core::Error>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFilter`] if an operator is unknown or misused, or a
+    /// key is not a field path.
     pub fn parse(filter: &Document) -> Result<Filter> {
         let mut clauses = Vec::new();
         for (key, value) in filter {
@@ -147,7 +152,10 @@ impl Filter {
             .collect()
     }
 
-    /// Whether `doc` matches this filter. Fails with
+    /// Whether `doc` matches this filter.
+    ///
+    /// # Errors
+    ///
     /// [`Error::InvalidDocument`] if `doc` cannot be encoded as BSON.
     pub fn matches(&self, doc: &Document) -> Result<bool> {
         let raw = RawDocumentBuf::try_from(doc)
@@ -207,23 +215,26 @@ fn compare_at(found: Option<&Bson>, op: CompareOp, target: &Bson) -> bool {
 /// by these rules (as in MongoDB). Values of different types are
 /// incomparable, so range operators never match across types.
 fn compare(a: &Bson, b: &Bson) -> Option<Ordering> {
-    use Bson::*;
     match (a, b) {
-        (Int32(_) | Int64(_), Int32(_) | Int64(_)) => Some(as_i64(a)?.cmp(&as_i64(b)?)),
-        (Int32(_) | Int64(_), Double(f)) => cmp_int_double(as_i64(a)?, *f),
-        (Double(f), Int32(_) | Int64(_)) => Some(cmp_int_double(as_i64(b)?, *f)?.reverse()),
-        (Double(x), Double(y)) => x.partial_cmp(y),
-        (String(x), String(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
-        (Boolean(x), Boolean(y)) => Some(x.cmp(y)),
-        (DateTime(x), DateTime(y)) => Some(x.cmp(y)),
-        (ObjectId(x), ObjectId(y)) => Some(x.bytes().cmp(&y.bytes())),
-        (Null, Null) => Some(Ordering::Equal),
-        (Document(x), Document(y)) => (x.len() == y.len()
+        (Bson::Int32(_) | Bson::Int64(_), Bson::Int32(_) | Bson::Int64(_)) => {
+            Some(as_i64(a)?.cmp(&as_i64(b)?))
+        }
+        (Bson::Int32(_) | Bson::Int64(_), Bson::Double(f)) => cmp_int_double(as_i64(a)?, *f),
+        (Bson::Double(f), Bson::Int32(_) | Bson::Int64(_)) => {
+            Some(cmp_int_double(as_i64(b)?, *f)?.reverse())
+        }
+        (Bson::Double(x), Bson::Double(y)) => x.partial_cmp(y),
+        (Bson::String(x), Bson::String(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+        (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
+        (Bson::DateTime(x), Bson::DateTime(y)) => Some(x.cmp(y)),
+        (Bson::ObjectId(x), Bson::ObjectId(y)) => Some(x.bytes().cmp(&y.bytes())),
+        (Bson::Null, Bson::Null) => Some(Ordering::Equal),
+        (Bson::Document(x), Bson::Document(y)) => (x.len() == y.len()
             && x.iter()
                 .zip(y)
                 .all(|((kx, vx), (ky, vy))| kx == ky && equal(vx, vy)))
         .then_some(Ordering::Equal),
-        (Array(x), Array(y)) => (x.len() == y.len()
+        (Bson::Array(x), Bson::Array(y)) => (x.len() == y.len()
             && x.iter().zip(y).all(|(vx, vy)| equal(vx, vy)))
         .then_some(Ordering::Equal),
         _ if a == b => Some(Ordering::Equal),
@@ -245,6 +256,10 @@ pub(crate) const TWO_63: f64 = 9_223_372_036_854_775_808.0;
 
 /// Compare an integer with a double without converting the integer, which
 /// would round integers above 2⁵³ and make equality non-transitive.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`whole` is checked to be in the i64 range"
+)]
 fn cmp_int_double(i: i64, f: f64) -> Option<Ordering> {
     if f.is_nan() {
         return None;
@@ -274,48 +289,48 @@ mod tests {
 
     use super::*;
 
-    fn matches(filter: Document, doc: Document) -> bool {
-        Filter::parse(&filter).unwrap().matches(&doc).unwrap()
+    fn matches(filter: &Document, doc: &Document) -> bool {
+        Filter::parse(filter).unwrap().matches(doc).unwrap()
     }
 
     #[test]
     fn equality_and_missing_fields() {
-        assert!(matches(doc! { "a": 1 }, doc! { "a": 1 }));
+        assert!(matches(&doc! { "a": 1 }, &doc! { "a": 1 }));
         assert!(
-            matches(doc! { "a": 1 }, doc! { "a": 1.0 }),
+            matches(&doc! { "a": 1 }, &doc! { "a": 1.0 }),
             "numbers compare across types"
         );
-        assert!(!matches(doc! { "a": 1 }, doc! { "a": "1" }));
+        assert!(!matches(&doc! { "a": 1 }, &doc! { "a": "1" }));
         assert!(
-            matches(doc! { "a": { "b": 1 } }, doc! { "a": { "b": 1i64 } }),
+            matches(&doc! { "a": { "b": 1 } }, &doc! { "a": { "b": 1i64 } }),
             "numbers compare across types inside documents"
         );
         assert!(
-            matches(doc! { "a": [1, [2]] }, doc! { "a": [1.0, [2i64]] }),
+            matches(&doc! { "a": [1, [2]] }, &doc! { "a": [1.0, [2i64]] }),
             "and inside arrays"
         );
         assert!(
             !matches(
-                doc! { "a": { "b": 1, "c": 2 } },
-                doc! { "a": { "c": 2, "b": 1 } }
+                &doc! { "a": { "b": 1, "c": 2 } },
+                &doc! { "a": { "c": 2, "b": 1 } }
             ),
             "key order matters"
         );
-        assert!(!matches(doc! { "a": [1] }, doc! { "a": [1, 2] }));
+        assert!(!matches(&doc! { "a": [1] }, &doc! { "a": [1, 2] }));
         assert!(!matches(
-            doc! { "a": { "b": 1 } },
-            doc! { "a": { "b": 1, "c": 2 } }
+            &doc! { "a": { "b": 1 } },
+            &doc! { "a": { "b": 1, "c": 2 } }
         ));
         assert!(
-            matches(doc! { "a": null }, doc! { "b": 1 }),
+            matches(&doc! { "a": null }, &doc! { "b": 1 }),
             "missing equals null"
         );
         assert!(
-            matches(doc! { "a": { "$ne": 1 } }, doc! { "b": 1 }),
+            matches(&doc! { "a": { "$ne": 1 } }, &doc! { "b": 1 }),
             "missing is not equal to 1"
         );
         assert!(
-            matches(doc! {}, doc! { "x": 1 }),
+            matches(&doc! {}, &doc! { "x": 1 }),
             "empty filter matches everything"
         );
     }
@@ -325,42 +340,46 @@ mod tests {
         let big = 9_007_199_254_740_993i64; // 2⁵³ + 1, not a double
         let near = 9_007_199_254_740_992.0f64; // 2⁵³
         assert!(
-            !matches(doc! { "a": near }, doc! { "a": big }),
+            !matches(&doc! { "a": near }, &doc! { "a": big }),
             "2⁵³ + 1 is not 2⁵³"
         );
-        assert!(matches(doc! { "a": { "$gt": near } }, doc! { "a": big }));
-        assert!(matches(doc! { "a": near }, doc! { "a": big - 1 }));
-        assert!(matches(doc! { "a": { "$lt": 3.5 } }, doc! { "a": 3 }));
-        assert!(matches(doc! { "a": { "$gt": -3.5 } }, doc! { "a": -3 }));
-        assert!(matches(doc! { "a": { "$lt": -3.5 } }, doc! { "a": -4 }));
-        assert!(matches(doc! { "a": -0.0 }, doc! { "a": 0 }));
+        assert!(matches(&doc! { "a": { "$gt": near } }, &doc! { "a": big }));
+        assert!(matches(&doc! { "a": near }, &doc! { "a": big - 1 }));
+        assert!(matches(&doc! { "a": { "$lt": 3.5 } }, &doc! { "a": 3 }));
+        assert!(matches(&doc! { "a": { "$gt": -3.5 } }, &doc! { "a": -3 }));
+        assert!(matches(&doc! { "a": { "$lt": -3.5 } }, &doc! { "a": -4 }));
+        assert!(matches(&doc! { "a": -0.0 }, &doc! { "a": 0 }));
         assert!(matches(
-            doc! { "a": { "$lt": 1e300 } },
-            doc! { "a": i64::MAX }
+            &doc! { "a": { "$lt": 1e300 } },
+            &doc! { "a": i64::MAX }
         ));
         assert!(matches(
-            doc! { "a": { "$gt": f64::NEG_INFINITY } },
-            doc! { "a": i64::MIN }
+            &doc! { "a": { "$gt": f64::NEG_INFINITY } },
+            &doc! { "a": i64::MIN }
         ));
         // The edges of the i64 range, where casting the double would saturate.
         assert!(matches(
-            doc! { "a": { "$lt": TWO_63 } },
-            doc! { "a": i64::MAX }
+            &doc! { "a": { "$lt": TWO_63 } },
+            &doc! { "a": i64::MAX }
         ));
-        assert!(matches(doc! { "a": -TWO_63 }, doc! { "a": i64::MIN }));
+        assert!(matches(&doc! { "a": -TWO_63 }, &doc! { "a": i64::MIN }));
         assert!(
-            !matches(doc! { "a": f64::NAN }, doc! { "a": f64::NAN }),
+            !matches(&doc! { "a": f64::NAN }, &doc! { "a": f64::NAN }),
             "NaN equals nothing"
         );
-        assert!(!matches(doc! { "a": { "$lt": f64::NAN } }, doc! { "a": 1 }));
+        assert!(!matches(
+            &doc! { "a": { "$lt": f64::NAN } },
+            &doc! { "a": 1 }
+        ));
     }
 
     proptest! {
         #[test]
         fn int_double_order_agrees_with_exact_arithmetic(i: i64, f in prop::num::f64::NORMAL | prop::num::f64::ZERO) {
             // An i128 holds every i64 and every integral double in range exactly.
+            #[expect(clippy::cast_possible_truncation, reason = "`f` is integral and in range")]
             let exact = if f.fract() == 0.0 && f.abs() < 1e38 {
-                Some((i as i128).cmp(&(f as i128)))
+                Some(i128::from(i).cmp(&(f as i128)))
             } else {
                 None
             };
@@ -373,25 +392,57 @@ mod tests {
     #[test]
     fn range_operators_stay_within_a_type() {
         let adult = doc! { "age": { "$gte": 18, "$lt": 65 } };
-        assert!(matches(adult.clone(), doc! { "age": 18 }));
-        assert!(!matches(adult.clone(), doc! { "age": 65 }));
+        assert!(matches(&adult, &doc! { "age": 18 }));
+        assert!(!matches(&adult, &doc! { "age": 65 }));
         assert!(
-            !matches(adult.clone(), doc! { "age": "30" }),
+            !matches(&adult, &doc! { "age": "30" }),
             "strings are not numbers"
         );
-        assert!(!matches(adult, doc! {}), "missing never satisfies a range");
-        assert!(matches(doc! { "n": { "$gt": "b" } }, doc! { "n": "c" }));
+        assert!(
+            !matches(&adult, &doc! {}),
+            "missing never satisfies a range"
+        );
+        assert!(matches(&doc! { "n": { "$gt": "b" } }, &doc! { "n": "c" }));
+    }
+
+    #[test]
+    fn every_comparable_type_orders_against_its_own() {
+        let early = bson::DateTime::from_millis(1);
+        let late = bson::DateTime::from_millis(2);
+        let low = bson::oid::ObjectId::from_bytes([1; 12]);
+        let high = bson::oid::ObjectId::from_bytes([2; 12]);
+        for (lower, higher) in [
+            (Bson::Double(1.5), Bson::Double(2.5)),
+            (Bson::Boolean(false), Bson::Boolean(true)),
+            (Bson::DateTime(early), Bson::DateTime(late)),
+            (Bson::ObjectId(low), Bson::ObjectId(high)),
+        ] {
+            let filter = doc! { "n": { "$gt": lower.clone() } };
+            assert!(
+                matches(&filter, &doc! { "n": higher.clone() }),
+                "{lower} < {higher}"
+            );
+            assert!(
+                !matches(&filter, &doc! { "n": lower.clone() }),
+                "{lower} = {lower}"
+            );
+            let filter = doc! { "n": { "$lt": lower.clone() } };
+            assert!(
+                !matches(&filter, &doc! { "n": higher.clone() }),
+                "{higher} > {lower}"
+            );
+        }
     }
 
     #[test]
     fn dotted_paths_and_embedded_documents() {
-        assert!(matches(doc! { "a.b": 2 }, doc! { "a": { "b": 2 } }));
+        assert!(matches(&doc! { "a.b": 2 }, &doc! { "a": { "b": 2 } }));
         assert!(
-            !matches(doc! { "a.b": 2 }, doc! { "a": [ { "b": 2 } ] }),
+            !matches(&doc! { "a.b": 2 }, &doc! { "a": [ { "b": 2 } ] }),
             "arrays are not traversed yet"
         );
         assert!(
-            matches(doc! { "a": { "b": 2 } }, doc! { "a": { "b": 2 } }),
+            matches(&doc! { "a": { "b": 2 } }, &doc! { "a": { "b": 2 } }),
             "a non-operator document is an equality match"
         );
     }
@@ -399,12 +450,12 @@ mod tests {
     #[test]
     fn and_or() {
         let f = doc! { "$or": [ { "a": 1 }, { "b": { "$gt": 5 } } ] };
-        assert!(matches(f.clone(), doc! { "a": 1 }));
-        assert!(matches(f.clone(), doc! { "b": 6 }));
-        assert!(!matches(f, doc! { "a": 2, "b": 5 }));
+        assert!(matches(&f, &doc! { "a": 1 }));
+        assert!(matches(&f, &doc! { "b": 6 }));
+        assert!(!matches(&f, &doc! { "a": 2, "b": 5 }));
         assert!(matches(
-            doc! { "$and": [ { "a": 1 }, { "b": 2 } ] },
-            doc! { "a": 1, "b": 2 }
+            &doc! { "$and": [ { "a": 1 }, { "b": 2 } ] },
+            &doc! { "a": 1, "b": 2 }
         ));
     }
 

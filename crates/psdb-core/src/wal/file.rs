@@ -1,4 +1,9 @@
 //! The I/O seam under the WAL.
+#![expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "OsWalFile is the OS side of the WalFile seam"
+)]
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -22,20 +27,45 @@ use std::path::{Path, PathBuf};
 ///    the file's directory entry survives power loss. Until then a newly
 ///    created file may vanish.
 /// 5. **No retries.** After any error, the state on disk is unknown.
+///
+/// # Errors
+///
+/// Every method returns the [`io::Error`] the medium reports, after which
+/// rule 5 holds.
 pub trait WalFile: Send {
     /// The whole file.
+    ///
+    /// # Errors
+    ///
+    /// See [the trait's](WalFile#errors).
     fn read_all(&mut self) -> io::Result<Vec<u8>>;
 
     /// Append `bytes` at the end of the file.
+    ///
+    /// # Errors
+    ///
+    /// See [the trait's](WalFile#errors).
     fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
 
     /// Make every append and truncation so far durable.
+    ///
+    /// # Errors
+    ///
+    /// See [the trait's](WalFile#errors).
     fn sync(&mut self) -> io::Result<()>;
 
     /// Cut the file to `len` bytes.
+    ///
+    /// # Errors
+    ///
+    /// See [the trait's](WalFile#errors).
     fn truncate(&mut self, len: u64) -> io::Result<()>;
 
     /// Make the file's directory entry durable.
+    ///
+    /// # Errors
+    ///
+    /// See [the trait's](WalFile#errors).
     fn sync_dir(&mut self) -> io::Result<()>;
 }
 
@@ -48,10 +78,16 @@ pub struct OsWalFile {
 
 impl OsWalFile {
     /// Open `dir/wal`, creating the file and, if needed, `dir` itself (but
-    /// not `dir`'s parents). Fails with [`io::ErrorKind::WouldBlock`] if
-    /// another Node, in this process or another, has it open: two writers
-    /// would give out the same Commit Timestamps. The lock is released when
-    /// this is dropped.
+    /// not `dir`'s parents). The lock that keeps other Nodes out is released
+    /// when this is dropped.
+    ///
+    /// # Errors
+    ///
+    /// - [`io::ErrorKind::WouldBlock`] if another Node, in this process or
+    ///   another, has it open: two writers would give out the same Commit
+    ///   Timestamps.
+    /// - Any other [`io::Error`] creating, opening or syncing `dir` or the
+    ///   file.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         if !dir.exists() {

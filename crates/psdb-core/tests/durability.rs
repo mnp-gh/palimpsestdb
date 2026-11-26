@@ -1,4 +1,9 @@
 //! A durable Node: replay on open, and poisoning when the WAL fails.
+#![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "durability is tested on the real filesystem"
+)]
 
 mod common;
 

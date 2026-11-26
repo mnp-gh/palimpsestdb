@@ -100,11 +100,7 @@ fn aborted_writes_vanish() {
     t.insert(&collection("shop.orders"), doc! { "_id": 1 })
         .unwrap();
     drop(t);
-    assert!(
-        node.find(&collection("shop.orders"), &doc! {})
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(node.find(&collection("shop.orders"), &doc! {}).unwrap(), []);
 }
 
 #[test]

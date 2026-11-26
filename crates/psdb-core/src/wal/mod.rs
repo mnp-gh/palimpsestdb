@@ -350,7 +350,7 @@ mod tests {
     fn appended_records_are_read_back() {
         let disk = SimDisk::new();
         let (mut wal, records) = Wal::open(Box::new(disk.file())).unwrap();
-        assert!(records.is_empty());
+        assert_eq!(records, []);
         wal.append(&record(1, &[(b"k", Some(b"v"))])).unwrap();
         wal.append(&record(2, &[(b"k", None)])).unwrap();
         drop(wal);
@@ -409,6 +409,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a wall-clock bound on replay time"
+    )]
     fn a_large_torn_record_is_truncated_quickly() {
         // Small integers in arrays: BSON full of bytes that read as lengths
         // of about 320 KB, and (for int64s) as small Commit Timestamps.
@@ -469,5 +473,42 @@ mod tests {
         disk.set_contents(b"hello".to_vec());
         assert!(matches!(open(&disk), Err(Error::UnrecognisedWal(_))));
         assert_eq!(disk.contents(), b"hello");
+    }
+
+    /// The file layout in this module's doc comment, written out by hand:
+    /// a WAL written by an older build must still open. The CRC was
+    /// computed with a separate bitwise CRC32C, not the `crc32c` crate.
+    #[test]
+    fn file_layout_matches_the_documented_bytes() {
+        // Magic, then format version 1.
+        assert_eq!(header(), [&b"PSDBWAL\0"[..], &[0, 0, 0, 1]].concat());
+        #[rustfmt::skip]
+        let expected = [
+            &[0, 0, 0, 29][..],         // body length
+            &[0xD4, 0x48, 0x61, 0x21],  // CRC32C of the body
+            &[0, 0, 0, 0, 0, 0, 0, 1],  // body: Commit Timestamp 1
+            &[0, 0, 0, 2],              //   2 writes
+            &[0, 0, 0, 1], b"a",        //   key "a"
+            &[0x01, 0, 0, 0, 1], b"1",  //     live, value "1"
+            &[0, 0, 0, 1], b"b",        //   key "b"
+            &[0x00],                    //     tombstone
+        ]
+        .concat();
+        let writes: [(&[u8], Option<&[u8]>); 2] = [(b"a", Some(b"1")), (b"b", None)];
+        assert_eq!(record(1, &writes), expected);
+        let mut file = header();
+        file.extend_from_slice(&expected);
+        let disk = SimDisk::new();
+        disk.set_contents(file);
+        assert_eq!(
+            open(&disk).unwrap(),
+            [Record {
+                commit_ts: 1,
+                write_set: WriteSet::from([
+                    (b"a".to_vec(), Some(b"1".to_vec())),
+                    (b"b".to_vec(), None),
+                ]),
+            }]
+        );
     }
 }

@@ -238,4 +238,14 @@ mod tests {
             ]
         );
     }
+
+    /// The value layout from ADR 0008, written out by hand.
+    #[test]
+    fn version_values_match_adr_0008_byte_for_byte() {
+        assert_eq!(encode_value(None), [0x00]);
+        assert_eq!(encode_value(Some(b"x")), [0x01, b'x']);
+        assert_eq!(decode_value(&[0x00]).unwrap(), None);
+        assert_eq!(decode_value(&[0x01, b'x']).unwrap(), Some(b"x".to_vec()));
+        assert!(matches!(decode_value(&[0x02]), Err(Error::Corruption(_))));
+    }
 }

@@ -107,6 +107,11 @@ impl IndexEntry {
 
 /// The Index key component for `value` (`None` when the field is missing),
 /// or `None` if an Index on a field of Field Type `ty` leaves the value out.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "the casts saturate or round, which keeps the order"
+)]
 pub(crate) fn key_component(value: Option<&Bson>, ty: FieldType) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match (value, ty) {
@@ -123,7 +128,7 @@ pub(crate) fn key_component(value: Option<&Bson>, ty: FieldType) -> Option<Vec<u
         // Every pair of numbers was handled above; the other Field Types are
         // Document ID types, encoded as Document IDs are.
         (Some(v), _) if FieldType::of(v) == Some(ty) => {
-            keys::encode_id(v, &mut out).expect("every Document ID type encodes")
+            keys::encode_id(v, &mut out).expect("every Document ID type encodes");
         }
         _ => return None,
     }
@@ -215,14 +220,14 @@ fn comparison_range(
     value: &Bson,
 ) -> Option<CandidateRange> {
     if path.as_str() == "_id" {
-        let range = bounds(collection.prefix(), id_type(value)?, op, value)?;
+        let range = bounds(&collection.prefix(), id_type(value)?, op, value)?;
         return Some(CandidateRange::Documents(range));
     }
     let index = collection
         .index_on(path)
         .filter(|ix| ix.state == IndexState::Ready)?;
     let ty = collection.schema.get(&index.path)?.field_type;
-    let range = bounds(collection.index_prefix(index), ty, op, value)?;
+    let range = bounds(&collection.index_prefix(index), ty, op, value)?;
     Some(CandidateRange::Index(range))
 }
 
@@ -241,14 +246,14 @@ fn id_type(value: &Bson) -> Option<FieldType> {
 /// that can hold a value satisfying `op value`. Bounds are inclusive even
 /// for `$gt` and `$lt`, because coercion files different values under one
 /// key; the recheck drops the extras.
-fn bounds(base: Vec<u8>, ty: FieldType, op: CompareOp, value: &Bson) -> Option<KeyRange> {
+fn bounds(base: &[u8], ty: FieldType, op: CompareOp, value: &Bson) -> Option<KeyRange> {
     let comp = match value {
         // `{f: null}` matches null and missing, which share one component.
         Bson::Null if op == CompareOp::Eq => key_component(None, ty)?,
         v if ty.compares_with(v) => key_component(Some(v), ty)?,
         _ => return None,
     };
-    let at = |bytes: &[u8]| [base.as_slice(), bytes].concat();
+    let at = |bytes: &[u8]| [base, bytes].concat();
     // Every key whose component starts with `comp`, then the whole type.
     let exact = KeyRange::prefix(&at(&comp));
     let whole_type = KeyRange::prefix(&at(&[keys::type_tag(&comp)]));
@@ -291,12 +296,17 @@ impl CollectionEntry {
 impl<E: StorageEngine> Transaction<'_, E> {
     /// Create an Index on a field of an empty Collection, as part of this
     /// Transaction (ADR 0010). There is nothing to build, so it commits or
-    /// aborts with the rest of the Transaction.
+    /// aborts with the rest of the Transaction. A Document committed
+    /// concurrently makes the commit abort with Collection Changed.
     ///
-    /// Fails with [`Error::CollectionNotEmpty`] if the Collection holds
-    /// Documents: use [`Node::create_index`](crate::Node::create_index),
-    /// which builds the Index on its own. A Document committed concurrently
-    /// makes this Transaction abort with Collection Changed.
+    /// # Errors
+    ///
+    /// - [`Error::InvalidSchema`] if the field's type is not declared in the
+    ///   Collection Schema, or the Index is unique and the field not strict.
+    /// - [`Error::IndexExists`] if the field already has an Index.
+    /// - [`Error::CollectionNotEmpty`] if the Collection holds Documents: use
+    ///   [`Node::create_index`](crate::Node::create_index), which builds the
+    ///   Index on its own.
     pub fn create_index_on_empty(
         &mut self,
         collection: &CollectionPath,
@@ -353,6 +363,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// Drop the Index on a field: a Tombstone on its Catalog entry
     /// (ADR 0014). Its entries become unreachable and stay behind until
     /// garbage collection reclaims them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchIndex`] if the field has no Index.
     pub fn drop_index(&mut self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
         let entry = self.collection_entry(collection)?;
         let Some(index) = entry.index_on(path) else {
@@ -365,6 +379,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// The Collection's Indexes, in the order they were created.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn list_indexes(&mut self, collection: &CollectionPath) -> Result<Vec<IndexInfo>> {
         Ok(self
             .collection_entry(collection)?
@@ -390,9 +408,17 @@ impl<E: StorageEngine> Node<E> {
     /// the commit lock, so other commits wait for one chunk, not the whole
     /// build. A final commit makes it Ready.
     ///
-    /// Fails with [`Error::IndexBuildCancelled`] if the Index or its
-    /// Collection is dropped meanwhile. On any other failure, for example
-    /// [`Error::DuplicateValue`], one commit removes the Index and the
+    /// # Errors
+    ///
+    /// - [`Error::InvalidSchema`] or [`Error::IndexExists`], as for
+    ///   [`Transaction::create_index_on_empty`].
+    /// - [`Error::DuplicateValue`] if the Index is unique and two Documents
+    ///   share a value.
+    /// - [`Error::IndexBuildCancelled`] if the Index or its Collection is
+    ///   dropped meanwhile.
+    /// - Those of [`Transaction::commit`], for each commit of the build.
+    ///
+    /// After any failure but a cancel, one commit removes the Index and the
     /// original error is returned; if that commit fails too, the Index stays
     /// Building until it is dropped or the Node reopens. Committed chunks
     /// stay behind under an Index ID that is never reused in the Collection,
@@ -426,7 +452,7 @@ impl<E: StorageEngine> Node<E> {
             // std's Mutex is unfair: without this the build often takes the
             // commit lock straight back and starves waiting writers.
             // shortcut: a hint, not a guarantee; use a fair lock if writers
-            // still starve behind long builds.
+            // still starve behind long builds (docs/ROADMAP.md, v1.0).
             std::thread::yield_now();
         }
         Ok(())
@@ -435,6 +461,11 @@ impl<E: StorageEngine> Node<E> {
     /// Commit the Index as Building and return its build, for the caller to
     /// [`step`](IndexBuild::step), as [`create_index`](Self::create_index)
     /// does.
+    ///
+    /// # Errors
+    ///
+    /// The checks of [`create_index`](Self::create_index), and those of
+    /// [`Transaction::commit`].
     #[cfg(any(test, feature = "testing"))]
     pub fn start_index_build(
         &self,
@@ -491,6 +522,10 @@ impl<E: StorageEngine> Node<E> {
 }
 
 /// An Index being built, one chunk per [`step`](Self::step) (ADR 0013).
+#[cfg_attr(
+    not(any(test, feature = "testing")),
+    expect(unreachable_pub, reason = "exported only for tests (lib.rs)")
+)]
 pub struct IndexBuild<'node, E: StorageEngine> {
     node: &'node Node<E>,
     collection: CollectionPath,
@@ -505,10 +540,15 @@ pub struct IndexBuild<'node, E: StorageEngine> {
     chunk_documents: usize,
 }
 
+#[cfg_attr(
+    not(any(test, feature = "testing")),
+    expect(unreachable_pub, reason = "exported only for tests (lib.rs)")
+)]
 impl<E: StorageEngine> IndexBuild<'_, E> {
     /// Index at most `n` Documents per chunk, so tests can interleave
     /// commits between chunks of a small Collection.
     #[cfg(any(test, feature = "testing"))]
+    #[must_use]
     pub fn with_chunk_documents(mut self, n: usize) -> Self {
         self.chunk_documents = n;
         self
@@ -519,8 +559,14 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
     /// Index Ready and return true. Holds the commit lock throughout, so no
     /// Document changes between reading it and committing its entries.
     ///
-    /// Fails as [`Node::create_index`] does, removing the Index on any
+    /// # Errors
+    ///
+    /// Those of [`Node::create_index`]'s build, removing the Index on any
     /// failure but [`Error::IndexBuildCancelled`].
+    ///
+    /// # Panics
+    ///
+    /// If one of the Node's locks is poisoned; see [`Node`](crate::Node#panics).
     pub fn step(&mut self) -> Result<bool> {
         let mut commit_state = self.node.commit_lock.lock().expect("lock poisoned");
         let outcome = match self.index_next_chunk(&mut commit_state) {
@@ -669,7 +715,7 @@ mod tests {
     }
 
     fn planned(
-        filter: bson::Document,
+        filter: &bson::Document,
         schema: &Schema,
         indexes: &[IndexDef],
     ) -> Option<Vec<CandidateRange>> {
@@ -681,7 +727,7 @@ mod tests {
             indexes: indexes.to_vec(),
             next_index_id: 0,
         };
-        plan(&Filter::parse(&filter).unwrap(), &collection)
+        plan(&Filter::parse(filter).unwrap(), &collection)
     }
 
     fn range(candidate: &CandidateRange) -> &KeyRange {
@@ -689,26 +735,26 @@ mod tests {
         r
     }
 
-    fn comp(v: Bson, ty: FieldType) -> Vec<u8> {
-        key_component(Some(&v), ty).unwrap()
+    fn comp(v: &Bson, ty: FieldType) -> Vec<u8> {
+        key_component(Some(v), ty).unwrap()
     }
 
     #[test]
     fn number_indexes_coerce_the_other_kind() {
         use FieldType::*;
-        assert_eq!(comp(Bson::Double(30.5), Int), comp(Bson::Int32(30), Int));
+        assert_eq!(comp(&Bson::Double(30.5), Int), comp(&Bson::Int32(30), Int));
         assert_eq!(
-            comp(Bson::Double(-0.5), Int),
-            comp(Bson::Int32(-1), Int),
+            comp(&Bson::Double(-0.5), Int),
+            comp(&Bson::Int32(-1), Int),
             "floor, not truncate"
         );
         assert_eq!(
-            comp(Bson::Int64(3), Double),
-            comp(Bson::Double(3.0), Double)
+            comp(&Bson::Int64(3), Double),
+            comp(&Bson::Double(3.0), Double)
         );
         assert_eq!(
-            comp(Bson::Double(1e300), Int),
-            comp(Bson::Int64(i64::MAX), Int),
+            comp(&Bson::Double(1e300), Int),
+            comp(&Bson::Int64(i64::MAX), Int),
             "saturates"
         );
         assert_eq!(key_component(Some(&Bson::Double(f64::NAN)), Double), None);
@@ -722,20 +768,23 @@ mod tests {
             key_component(None, Int),
             key_component(Some(&Bson::Null), String)
         );
+        // Equal keys alone would pass for a constant: keys must still order.
+        assert!(comp(&Bson::Double(30.5), Int) < comp(&Bson::Int32(31), Int));
+        assert!(comp(&Bson::Int64(3), Double) < comp(&Bson::Double(3.5), Double));
     }
 
     #[test]
     fn plan_prefers_equality_and_narrows_ranges() {
         let s = schema(&[("age", FieldType::Int), ("status", FieldType::String)]);
         let ix = [index("age", 7), index("status", 9)];
-        let status_range = planned(doc! { "status": "open" }, &s, &ix).unwrap();
+        let status_range = planned(&doc! { "status": "open" }, &s, &ix).unwrap();
         assert_eq!(
-            planned(doc! { "age": { "$gte": 18 }, "status": "open" }, &s, &ix),
+            planned(&doc! { "age": { "$gte": 18 }, "status": "open" }, &s, &ix),
             Some(status_range),
             "equality wins"
         );
-        let adults = planned(doc! { "age": { "$gte": 18 } }, &s, &ix).unwrap();
-        let working = planned(doc! { "age": { "$gte": 18, "$lt": 65 } }, &s, &ix).unwrap();
+        let adults = planned(&doc! { "age": { "$gte": 18 } }, &s, &ix).unwrap();
+        let working = planned(&doc! { "age": { "$gte": 18, "$lt": 65 } }, &s, &ix).unwrap();
         let (adults, working) = (range(&adults[0]), range(&working[0]));
         assert_eq!(working.start, adults.start);
         assert!(
@@ -756,13 +805,13 @@ mod tests {
             doc! { "age": f64::NAN },
             doc! { "name": "x" },
         ] {
-            assert_eq!(planned(filter.clone(), &s, &ix), None, "{filter}");
+            assert_eq!(planned(&filter, &s, &ix), None, "{filter}");
         }
         assert!(
-            planned(doc! { "age": null }, &s, &ix).is_some(),
+            planned(&doc! { "age": null }, &s, &ix).is_some(),
             "null and missing are indexed"
         );
-        assert!(planned(doc! { "$and": [ { "age": 3 } ] }, &s, &ix).is_some());
+        assert!(planned(&doc! { "$and": [ { "age": 3 } ] }, &s, &ix).is_some());
     }
 
     #[test]
@@ -770,13 +819,13 @@ mod tests {
         let s = schema(&[("age", FieldType::Int), ("status", FieldType::String)]);
         let ix = [index("age", 7), index("status", 9)];
         let either = doc! { "$or": [ { "status": "open" }, { "age": { "$gt": 65 } } ] };
-        assert_eq!(planned(either, &s, &ix).map(|r| r.len()), Some(2));
+        assert_eq!(planned(&either, &s, &ix).map(|r| r.len()), Some(2));
         let nested =
             doc! { "$or": [ { "status": "a" }, { "$or": [ { "status": "b" }, { "age": 1 } ] } ] };
-        assert_eq!(planned(nested, &s, &ix).map(|r| r.len()), Some(3));
+        assert_eq!(planned(&nested, &s, &ix).map(|r| r.len()), Some(3));
         assert_eq!(
             planned(
-                doc! { "age": { "$gt": 1 }, "$or": [ { "status": "a" }, { "status": "b" } ] },
+                &doc! { "age": { "$gt": 1 }, "$or": [ { "status": "a" }, { "status": "b" } ] },
                 &s,
                 &ix
             )
@@ -786,7 +835,7 @@ mod tests {
         );
         assert_eq!(
             planned(
-                doc! { "age": 1, "$or": [ { "status": "a" }, { "status": "b" } ] },
+                &doc! { "age": 1, "$or": [ { "status": "a" }, { "status": "b" } ] },
                 &s,
                 &ix
             )
@@ -794,10 +843,10 @@ mod tests {
             Some(1),
             "an equality beats an $or"
         );
-        let open = planned(doc! { "status": "open" }, &s, &ix);
+        let open = planned(&doc! { "status": "open" }, &s, &ix);
         assert_eq!(
             planned(
-                doc! { "status": "open", "$or": [ { "status": "a" }, { "name": "x" } ] },
+                &doc! { "status": "open", "$or": [ { "status": "a" }, { "name": "x" } ] },
                 &s,
                 &ix
             ),
@@ -810,7 +859,7 @@ mod tests {
     fn id_comparisons_read_documents_directly() {
         let s = schema(&[("age", FieldType::Int)]);
         let ix = [index("age", 7)];
-        let docs = |filter| match planned(filter, &s, &ix).as_deref() {
+        let docs = |filter| match planned(&filter, &s, &ix).as_deref() {
             Some([CandidateRange::Documents(r)]) => Some(r.clone()),
             _ => None,
         };
@@ -832,10 +881,10 @@ mod tests {
             "a double bound works on integer IDs"
         );
         assert_eq!(
-            planned(doc! { "$or": [ { "_id": 1 }, { "age": 2 } ] }, &s, &ix).map(|r| r.len()),
+            planned(&doc! { "$or": [ { "_id": 1 }, { "age": 2 } ] }, &s, &ix).map(|r| r.len()),
             Some(2)
         );
-        assert_eq!(planned(doc! { "_id": null }, &s, &ix), None);
+        assert_eq!(planned(&doc! { "_id": null }, &s, &ix), None);
     }
 
     #[test]
@@ -846,7 +895,7 @@ mod tests {
             subtype: bson::spec::BinarySubtype::Generic,
             bytes: vec![1],
         });
-        assert!(planned(doc! { "b": bin.clone() }, &s, &ix).is_some());
-        assert_eq!(planned(doc! { "b": { "$gt": bin } }, &s, &ix), None);
+        assert!(planned(&doc! { "b": bin.clone() }, &s, &ix).is_some());
+        assert_eq!(planned(&doc! { "b": { "$gt": bin } }, &s, &ix), None);
     }
 }

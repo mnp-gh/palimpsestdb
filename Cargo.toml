@@ -20,7 +20,40 @@ uuid = "1.28"
 rustyline = "19"
 getrandom = "0.4"
 crc32c = "0.6"
+syn = { version = "2.0", default-features = false }
 
 [workspace.lints.rust]
 missing_docs = "deny"
 unsafe_code = "forbid"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# Code quality: all of pedantic, minus lints that are noise here.
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+# Performance lints from nursery (the perf group is already on by default;
+# see nnethercote.github.io/perf-book). Not significant_drop_tightening: lock
+# scopes here are correctness decisions.
+needless_collect = "warn"
+or_fun_call = "warn"
+redundant_clone = "warn"
+large_stack_frames = "warn"
+iter_with_drain = "warn"
+set_contains_or_insert = "warn"
+# Picked from restriction, which is not meant to be enabled whole.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+unwrap_used = "warn"
+allow_attributes_without_reason = "warn"
+# `expect`, not `allow`: it fails once the lint stops firing, so an
+# exception cannot outlive its reason.
+allow_attributes = "warn"
+# Seams for Clock, I/O and randomness: see clippy.toml.
+disallowed_methods = "deny"
+disallowed_types = "deny"
+# Closed sets are enums so `match` stays exhaustive: no `_` over variants.
+match_wildcard_for_single_variants = "deny"

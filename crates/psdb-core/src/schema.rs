@@ -162,9 +162,10 @@ fn check_field(doc: &RawDocument, path: &FieldPath, field: FieldSchema) -> Resul
 fn fits_exactly(value: &Bson, ty: FieldType) -> bool {
     const TWO_53: u64 = 1 << 53;
     match (value, ty) {
-        (Bson::Int32(_) | Bson::Int64(_), FieldType::Int) => true,
+        (Bson::Int32(_) | Bson::Int64(_), FieldType::Int) | (Bson::Int32(_), FieldType::Double) => {
+            true
+        }
         (Bson::Double(f), FieldType::Int) => f.fract() == 0.0 && *f >= -TWO_63 && *f < TWO_63,
-        (Bson::Int32(_), FieldType::Double) => true,
         (Bson::Int64(n), FieldType::Double) => n.unsigned_abs() <= TWO_53,
         (Bson::Double(f), FieldType::Double) => !f.is_nan(),
         _ => FieldType::of(value) == Some(ty),
@@ -175,10 +176,16 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// Declare a field's Field Type in the Collection Schema, or change its
     /// declaration.
     ///
-    /// While an Index on the field exists, its type cannot change, and a
-    /// field with a unique Index cannot stop being strict: drop the Index
-    /// first. Making a field strict reads every Document and fails with
-    /// [`Error::TypeMismatch`] if any breaks the rule.
+    /// Making a field strict reads every Document; one committed
+    /// concurrently makes the commit abort with Collection Changed.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidSchema`] if `path` is `_id` or under it, or the field
+    ///   has an Index and the change alters its type or makes a uniquely
+    ///   indexed field not strict: drop the Index first.
+    /// - [`Error::TypeMismatch`] if the field becomes strict and a Document
+    ///   breaks the rule.
     pub fn set_field_type(
         &mut self,
         collection: &CollectionPath,
@@ -217,8 +224,12 @@ impl<E: StorageEngine> Transaction<'_, E> {
         self.write_collection_entry(&entry)
     }
 
-    /// Remove a field's declaration from the Collection Schema. Refused
-    /// while an Index on the field exists.
+    /// Remove a field's declaration from the Collection Schema.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidSchema`] if the field is not declared, or has an
+    /// Index.
     pub fn remove_field_type(
         &mut self,
         collection: &CollectionPath,
@@ -237,6 +248,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// The Collection Schema: every declared field path and its type.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn collection_schema(
         &mut self,
         collection: &CollectionPath,
@@ -255,6 +270,15 @@ mod tests {
         assert!(fits_exactly(&Bson::Double(30.0), Int));
         assert!(!fits_exactly(&Bson::Double(30.5), Int));
         assert!(!fits_exactly(&Bson::Double(1e300), Int));
+        assert!(fits_exactly(
+            &Bson::Double(-9_223_372_036_854_775_808.0),
+            Int
+        ));
+        assert!(
+            !fits_exactly(&Bson::Double(9_223_372_036_854_775_808.0), Int),
+            "2^63 is one past i64::MAX"
+        );
+        assert!(fits_exactly(&Bson::Int32(5), Double));
         assert!(fits_exactly(&Bson::Int64(1 << 53), Double));
         assert!(!fits_exactly(&Bson::Int64((1 << 53) + 1), Double));
         assert!(!fits_exactly(&Bson::Double(f64::NAN), Double));
