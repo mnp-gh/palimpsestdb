@@ -18,3 +18,28 @@ jobs:
       - run: scripts/lint.sh
       - run: cargo test --workspace
       - run: cargo doc --workspace --no-deps
+
+  # A mutant is a small change to the code (`<` to `<=`, a constant return)
+  # that no test notices: the sign of a test that cannot fail. Only lines
+  # the pull request changed are mutated, since each mutant reruns the tests.
+  mutants:
+    runs-on: ubuntu-latest
+    env:
+      # Each mutant reruns the property tests; fewer cases keep it affordable.
+      PROPTEST_CASES: 32
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - run: git diff "origin/${{ github.base_ref }}..." -- crates > pr.diff
+      - run: cargo mutants --in-diff pr.diff
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mutants.out
+          path: mutants.out

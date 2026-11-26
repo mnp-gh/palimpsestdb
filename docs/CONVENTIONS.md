@@ -41,3 +41,6 @@ The Database Layer is generic over the Storage Engine (`Node<E: StorageEngine>`)
 - Conformance suite per seam trait, run against every implementation.
 - Property tests with `proptest` from v0.1.
 - Crash tests from v0.2; deterministic simulator from v0.4; Elle-style history checker from v0.5.
+- A test must be able to fail. Its expected value never comes from the code under test: use a model, a hand-written known answer, or a second implementation. Every on-disk format has a test with its bytes written out by hand from the spec.
+- Randomized tests must reach the behaviour they claim to test: a generator that rarely produces the interesting case (a duplicate, a full Index) is a coverage gap even when the test passes.
+- CI mutates the lines each pull request changes (`cargo-mutants`); a mutant no test notices fails the build. Exclude a mutant that cannot change behaviour in `.cargo/mutants.toml` (`exclude_re`), with a comment saying why.
