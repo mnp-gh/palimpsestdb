@@ -1,8 +1,7 @@
 name: CI
 
+# Runs when a pull request is opened and on every push to it afterwards.
 on:
-  push:
-    branches: [main]
   pull_request:
 
 jobs:
