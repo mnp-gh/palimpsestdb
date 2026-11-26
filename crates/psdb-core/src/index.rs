@@ -451,8 +451,9 @@ impl<E: StorageEngine> Node<E> {
         while !build.step()? {
             // std's Mutex is unfair: without this the build often takes the
             // commit lock straight back and starves waiting writers.
-            // shortcut: a hint, not a guarantee; use a fair lock if writers
-            // still starve behind long builds (docs/ROADMAP.md, v1.0).
+            // shortcut: a hint, not a guarantee, and writers do starve under
+            // CPU contention; fix before v0.5
+            // (.scratch/v0.4-concurrency/issues/10-index-build-starves-writers.md).
             std::thread::yield_now();
         }
         Ok(())
