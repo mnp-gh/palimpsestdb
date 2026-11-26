@@ -200,6 +200,8 @@ mod tests {
             "// a - b",
             "// Done.\n// a - b",
             "/// let x = 1; in a doc comment is an example, not dead code",
+            "/// let x = 1;",
+            "//! let x = 1;",
             "// shortcut: a hint, not a guarantee; use a fair lock (ADR 0013).",
         ] {
             assert_eq!(flagged(prose), [0; 0], "{prose}");

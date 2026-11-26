@@ -398,6 +398,35 @@ mod tests {
     }
 
     #[test]
+    fn every_comparable_type_orders_against_its_own() {
+        let early = bson::DateTime::from_millis(1);
+        let late = bson::DateTime::from_millis(2);
+        let low = bson::oid::ObjectId::from_bytes([1; 12]);
+        let high = bson::oid::ObjectId::from_bytes([2; 12]);
+        for (lower, higher) in [
+            (Bson::Double(1.5), Bson::Double(2.5)),
+            (Bson::Boolean(false), Bson::Boolean(true)),
+            (Bson::DateTime(early), Bson::DateTime(late)),
+            (Bson::ObjectId(low), Bson::ObjectId(high)),
+        ] {
+            let filter = doc! { "n": { "$gt": lower.clone() } };
+            assert!(
+                matches(&filter, &doc! { "n": higher.clone() }),
+                "{lower} < {higher}"
+            );
+            assert!(
+                !matches(&filter, &doc! { "n": lower.clone() }),
+                "{lower} = {lower}"
+            );
+            let filter = doc! { "n": { "$lt": lower.clone() } };
+            assert!(
+                !matches(&filter, &doc! { "n": higher.clone() }),
+                "{higher} > {lower}"
+            );
+        }
+    }
+
+    #[test]
     fn dotted_paths_and_embedded_documents() {
         assert!(matches(&doc! { "a.b": 2 }, &doc! { "a": { "b": 2 } }));
         assert!(

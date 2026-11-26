@@ -403,6 +403,44 @@ mod tests {
         assert_eq!(node.get(&orders, &2.into()).unwrap(), None);
     }
 
+    /// Every physical key a pass scans, and how many are Tombstones:
+    /// counted here, not by the pass, to check what it reports.
+    fn scanned_and_tombstones(node: &Node<MemoryEngine>) -> (u64, u64) {
+        let (mut keys, mut tombstones) = (0, 0);
+        let all = KeyRange {
+            start: keys::namespaces_prefix(),
+            end: None,
+        };
+        node.engine
+            .scan(&all, &mut |_, value| {
+                keys += 1;
+                tombstones += u64::from(mvcc::is_tombstone(value));
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        (keys, tombstones)
+    }
+
+    #[test]
+    fn a_step_visits_exactly_its_batch_of_keys() {
+        let (node, orders) = shop();
+        node.run(|t| {
+            for i in 0..95 {
+                t.insert(&orders, doc! { "_id": i })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        // One Version per key, so each step but the last visits exactly 10.
+        let (keys, _) = scanned_and_tombstones(&node);
+        let mut pass = node.start_garbage_collection().with_batch_keys(10);
+        let mut steps = 1;
+        while pass.step().unwrap().is_none() {
+            steps += 1;
+        }
+        assert_eq!(steps, keys.div_ceil(10));
+    }
+
     #[test]
     fn a_step_with_nothing_to_delete_stops_after_a_batch_of_keys() {
         let (node, orders) = shop();
@@ -428,7 +466,15 @@ mod tests {
         let (namespace_id, id) = ids(&node, &orders);
         node.drop_collection(&orders).unwrap();
 
+        let (keys_before, tombstones_before) = scanned_and_tombstones(&node);
         let stats = node.collect_garbage().unwrap();
+        let (keys_after, tombstones_after) = scanned_and_tombstones(&node);
+        assert_eq!(stats.versions_removed, keys_before - keys_after);
+        assert_eq!(
+            stats.tombstones_removed,
+            tombstones_before - tombstones_after
+        );
+        assert!(stats.versions_removed > stats.tombstones_removed);
         assert_eq!(stats.collections_reclaimed, 1);
         assert_eq!(stats.indexes_reclaimed, 0, "counted with its Collection");
         assert_eq!(

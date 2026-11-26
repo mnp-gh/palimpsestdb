@@ -256,6 +256,15 @@ mod tests {
         assert!(fits_exactly(&Bson::Double(30.0), Int));
         assert!(!fits_exactly(&Bson::Double(30.5), Int));
         assert!(!fits_exactly(&Bson::Double(1e300), Int));
+        assert!(fits_exactly(
+            &Bson::Double(-9_223_372_036_854_775_808.0),
+            Int
+        ));
+        assert!(
+            !fits_exactly(&Bson::Double(9_223_372_036_854_775_808.0), Int),
+            "2^63 is one past i64::MAX"
+        );
+        assert!(fits_exactly(&Bson::Int32(5), Double));
         assert!(fits_exactly(&Bson::Int64(1 << 53), Double));
         assert!(!fits_exactly(&Bson::Int64((1 << 53) + 1), Double));
         assert!(!fits_exactly(&Bson::Double(f64::NAN), Double));
