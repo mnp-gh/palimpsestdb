@@ -527,14 +527,13 @@ fn values<const N: usize>(text: &str) -> Result<[Bson; N], String> {
         .map_err(|_| format!("expected {N} JSON value(s), got {count}"))
 }
 
-/// Refuse integers above `i64::MAX`, which BSON would silently store as
-/// rounded doubles.
-// shortcut: serde_json already parses integers above u64::MAX as doubles,
-// so those still round silently; catching them needs its
-// `arbitrary_precision` feature.
+/// Refuse integers outside the `i64` range, which BSON would silently store
+/// as rounded doubles. Needs `serde_json`'s `arbitrary_precision`: without
+/// it, integers beyond `u64` already arrive as doubles.
 fn too_large_integers(json: &Value) -> Result<(), String> {
     match json {
-        Value::Number(n) if n.is_u64() && !n.is_i64() => Err(format!(
+        // An integer literal is never `is_f64`, however large.
+        Value::Number(n) if !n.is_i64() && !n.is_f64() => Err(format!(
             "{n} does not fit a 64-bit integer; write {n}.0 to store it as a rounded double"
         )),
         Value::Array(items) => items.iter().try_for_each(too_large_integers),
@@ -588,5 +587,71 @@ fn not_found(id: &Bson) {
 fn print_names(names: &[String]) {
     for name in names {
         println!("{name}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one(text: &str) -> Result<Bson, String> {
+        values::<1>(text).map(|[value]| value)
+    }
+
+    #[test]
+    fn integers_that_fit_stay_integers() {
+        assert_eq!(one("42").unwrap(), Bson::Int32(42));
+        assert_eq!(one("9223372036854775807").unwrap(), Bson::Int64(i64::MAX));
+        assert_eq!(one("-9223372036854775808").unwrap(), Bson::Int64(i64::MIN));
+    }
+
+    #[test]
+    fn integers_too_large_for_64_bits_are_refused() {
+        for text in [
+            "9223372036854775808",
+            "18446744073709551616",
+            "100000000000000000000",
+            "-9223372036854775809",
+            r#"{"a": [1, 100000000000000000000]}"#,
+        ] {
+            let err = one(text).unwrap_err();
+            assert!(
+                err.contains("does not fit a 64-bit integer"),
+                "{text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn doubles_stay_doubles() {
+        assert_eq!(one("1.5").unwrap(), Bson::Double(1.5));
+        assert_eq!(one("1e3").unwrap(), Bson::Double(1000.0));
+        assert_eq!(one("100000000000000000000.0").unwrap(), Bson::Double(1e20));
+        assert_eq!(one("-0.0").unwrap(), Bson::Double(-0.0));
+    }
+
+    #[test]
+    fn extended_json_still_parses() {
+        assert_eq!(one(r#"{"$numberLong": "5"}"#).unwrap(), Bson::Int64(5));
+        assert_eq!(
+            one(r#"{"$numberDouble": "2.5"}"#).unwrap(),
+            Bson::Double(2.5)
+        );
+        assert_eq!(
+            one(r#"{"$date": "2024-01-02T03:04:05Z"}"#).unwrap(),
+            Bson::DateTime(bson::DateTime::from_millis(1_704_164_645_000))
+        );
+        assert_eq!(
+            one(r#"{"a": {"b": [1, 2.5, "x", null, true]}}"#).unwrap(),
+            Bson::Document(bson::doc! { "a": { "b": [1, 2.5, "x", null, true] } })
+        );
+    }
+
+    #[test]
+    fn numbers_print_as_relaxed_extended_json() {
+        assert_eq!(to_json(Bson::Int32(42)), "42");
+        assert_eq!(to_json(Bson::Int64(i64::MAX)), "9223372036854775807");
+        assert_eq!(to_json(Bson::Double(1.5)), "1.5");
+        assert_eq!(to_json(Bson::Double(1e20)), "1e+20");
     }
 }

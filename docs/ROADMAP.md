@@ -133,6 +133,7 @@ A single-threaded library with no network, no durability and no garbage collecti
 
 - Documentation pass, benchmarks, fuzzing, stabilised on-disk format
 - Making a field Strict on a busy Collection: writers enforce it while the existing Documents are checked in chunks, like a background Index build, so a steady stream of new Documents cannot make the change abort on every retry
+- Writers waiting behind a long Index build: `Node::create_index` only yields between chunks, a hint to std's unfair `Mutex`, so the build can take the commit lock straight back. Benchmark commit latency during a build; if writers still starve, make the commit lock fair
 - Measure the space field names cost after compression; decide on a per-Collection field-name dictionary from the numbers (Documents stay BSON until then)
 
 ## Unscheduled

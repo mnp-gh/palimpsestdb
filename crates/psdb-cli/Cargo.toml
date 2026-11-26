@@ -14,7 +14,9 @@ path = "src/main.rs"
 psdb-core.workspace = true
 psdb-storage-memory.workspace = true
 bson = { workspace = true, features = ["serde", "serde_json-1"] }
-serde_json = { workspace = true, features = ["preserve_order"] }
+# `arbitrary_precision` keeps integers beyond 64 bits exact, so the shell
+# can refuse them instead of rounding.
+serde_json = { workspace = true, features = ["preserve_order", "arbitrary_precision"] }
 uuid.workspace = true
 rustyline.workspace = true
 
