@@ -67,6 +67,11 @@ impl Filter {
     /// assert!(!filter.matches(&doc! { "age": 12, "address": { "city": "Paris" } })?);
     /// # Ok::<(), psdb_core::Error>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFilter`] if an operator is unknown or misused, or a
+    /// key is not a field path.
     pub fn parse(filter: &Document) -> Result<Filter> {
         let mut clauses = Vec::new();
         for (key, value) in filter {
@@ -147,7 +152,10 @@ impl Filter {
             .collect()
     }
 
-    /// Whether `doc` matches this filter. Fails with
+    /// Whether `doc` matches this filter.
+    ///
+    /// # Errors
+    ///
     /// [`Error::InvalidDocument`] if `doc` cannot be encoded as BSON.
     pub fn matches(&self, doc: &Document) -> Result<bool> {
         let raw = RawDocumentBuf::try_from(doc)

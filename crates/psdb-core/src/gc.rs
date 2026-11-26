@@ -49,6 +49,10 @@ impl<E: StorageEngine> Node<E> {
     /// are known before the scan reaches it.
     ///
     /// One pass runs at a time; a second call waits for the first.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn collect_garbage(&self) -> Result<GcStats> {
         let mut pass = self.start_gc();
         loop {
@@ -149,6 +153,10 @@ impl<E: StorageEngine> GcPass<'_, E> {
     /// the pass and return what it removed.
     ///
     /// Panics if the pass already finished.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn step(&mut self) -> Result<Option<GcStats>> {
         assert!(!self.done, "stepped a finished Garbage Collection pass");
         let node = self.node;

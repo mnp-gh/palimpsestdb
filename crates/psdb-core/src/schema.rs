@@ -176,10 +176,16 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// Declare a field's Field Type in the Collection Schema, or change its
     /// declaration.
     ///
-    /// While an Index on the field exists, its type cannot change, and a
-    /// field with a unique Index cannot stop being strict: drop the Index
-    /// first. Making a field strict reads every Document and fails with
-    /// [`Error::TypeMismatch`] if any breaks the rule.
+    /// Making a field strict reads every Document; one committed
+    /// concurrently makes the commit abort with Collection Changed.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidSchema`] if `path` is `_id` or under it, or the field
+    ///   has an Index and the change alters its type or makes a uniquely
+    ///   indexed field not strict: drop the Index first.
+    /// - [`Error::TypeMismatch`] if the field becomes strict and a Document
+    ///   breaks the rule.
     pub fn set_field_type(
         &mut self,
         collection: &CollectionPath,
@@ -218,8 +224,12 @@ impl<E: StorageEngine> Transaction<'_, E> {
         self.write_collection_entry(&entry)
     }
 
-    /// Remove a field's declaration from the Collection Schema. Refused
-    /// while an Index on the field exists.
+    /// Remove a field's declaration from the Collection Schema.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidSchema`] if the field is not declared, or has an
+    /// Index.
     pub fn remove_field_type(
         &mut self,
         collection: &CollectionPath,
@@ -238,6 +248,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// The Collection Schema: every declared field path and its type.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn collection_schema(
         &mut self,
         collection: &CollectionPath,

@@ -298,6 +298,12 @@ impl CollectionEntry {
 
 impl<E: StorageEngine> Transaction<'_, E> {
     /// Create a Namespace.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidName`] if `name` breaks the naming rules.
+    /// - [`Error::NamespaceExists`] if one with that name exists.
+    /// - [`Error::IdsExhausted`] if no unused Namespace ID turned up.
     pub fn create_namespace(&mut self, name: &str) -> Result<()> {
         validate_name(name)?;
         let key = keys::namespace_entry_key(name);
@@ -311,12 +317,20 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// Drop a Namespace. Its Collections become unreachable: their Catalog
     /// entries and Documents stay behind under the old IDs until Garbage
     /// Collection reclaims them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchNamespace`] if it does not exist.
     pub fn drop_namespace(&mut self, name: &str) -> Result<()> {
         self.resolve_namespace(name)?;
         self.write(keys::namespace_entry_key(name), None)
     }
 
     /// The names of every Namespace, in byte order.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn list_namespaces(&mut self) -> Result<Vec<String>> {
         self.scan(&keys::namespaces_prefix())?
             .values()
@@ -325,6 +339,12 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// Create a Collection in an existing Namespace.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NoSuchNamespace`] if the Namespace does not exist.
+    /// - [`Error::CollectionExists`] if the Collection does.
+    /// - [`Error::IdsExhausted`] if no unused Collection ID turned up.
     pub fn create_collection(&mut self, collection: &CollectionPath) -> Result<()> {
         let ns_id = self.resolve_namespace(collection.namespace())?;
         let key = keys::collection_entry_key(ns_id, collection.collection());
@@ -337,6 +357,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
 
     /// Drop a Collection. Its Documents become unreachable and stay behind
     /// until Garbage Collection reclaims them.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn drop_collection(&mut self, collection: &CollectionPath) -> Result<()> {
         let (ns_id, _) = self.resolve_collection(collection)?;
         self.write(
@@ -346,6 +370,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// The names of every Collection in a Namespace, in byte order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchNamespace`] if the Namespace does not exist.
     pub fn list_collections(&mut self, namespace: &str) -> Result<Vec<String>> {
         let ns_id = self.resolve_namespace(namespace)?;
         self.scan(&keys::collections_prefix(ns_id))?

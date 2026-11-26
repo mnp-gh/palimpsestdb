@@ -165,21 +165,35 @@ impl CommitState {
 impl<E: StorageEngine> Node<E> {
     /// Open over `engine` with default [`Limits`], keeping nothing
     /// durable. An engine that already holds data is reopened where it
-    /// left off. Fails with [`Error::Corruption`] if it holds data without
+    /// left off.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corruption`] if the engine holds data without
     /// `applied_up_to`.
     pub fn new(engine: E) -> Result<Self> {
         Self::with_limits(engine, Limits::default())
     }
 
     /// Open over `engine` with custom [`Limits`], keeping nothing
-    /// durable. Fails as [`new`](Self::new) does.
+    /// durable.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`new`](Self::new).
     pub fn with_limits(engine: E, limits: Limits) -> Result<Self> {
         Self::recover(engine, limits, IdGenerator::default(), None)
     }
 
     /// Open a durable Node whose WAL lives in `dir`, creating `dir` and
     /// the WAL if needed, and replay into `engine` the WAL Records it does
-    /// not hold yet. Fails with [`Error::Io`] if another Node has `dir` open.
+    /// not hold yet.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if another Node has `dir` open, or `dir` or the WAL
+    ///   cannot be created.
+    /// - Those of [`open_with`](Self::open_with).
     ///
     /// ```
     /// use bson::doc;
@@ -209,12 +223,18 @@ impl<E: StorageEngine> Node<E> {
     /// Open a durable Node over any [`WalFile`], such as a `SimDisk` file
     /// in tests (feature `testing`), taking new IDs from `id_generator`, and replay
     /// into `engine` the WAL Records above its `applied_up_to` (ADR 0015).
+    /// A torn write at the WAL's end is truncated, and a WAL cut off while
+    /// being created is rewritten.
     ///
-    /// Fails with [`Error::UnrecognisedWal`], or with [`Error::Corruption`]
-    /// for a damaged WAL, an engine that holds data without
-    /// `applied_up_to`, or an engine ahead of the WAL, without changing any
-    /// WAL Record. A torn write at the WAL's end is truncated, and a WAL
-    /// cut off while being created is rewritten.
+    /// # Errors
+    ///
+    /// None of these changes any WAL Record.
+    ///
+    /// - [`Error::UnrecognisedWal`] if the WAL has the wrong magic number or
+    ///   an unknown format version.
+    /// - [`Error::Corruption`] for a damaged WAL, an engine that holds data
+    ///   without `applied_up_to`, or an engine ahead of the WAL.
+    /// - [`Error::Io`] if `wal` fails.
     pub fn open_with(
         engine: E,
         wal: impl WalFile + 'static,
@@ -325,7 +345,11 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Run `work` in a new Transaction and commit it if `work` succeeds.
-    /// If `work` fails, the Transaction is aborted and its error returned.
+    ///
+    /// # Errors
+    ///
+    /// Those of `work`, after which the Transaction is aborted; then those of
+    /// [`Transaction::commit`].
     pub fn run<T>(&self, work: impl FnOnce(&mut Transaction<'_, E>) -> Result<T>) -> Result<T> {
         let mut txn = self.begin_transaction();
         let out = work(&mut txn)?;
@@ -334,16 +358,28 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::create_namespace`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::create_namespace`], then of [`Transaction::commit`].
     pub fn create_namespace(&self, name: &str) -> Result<()> {
         self.run(|t| t.create_namespace(name))
     }
 
     /// Autocommit [`Transaction::drop_namespace`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::drop_namespace`], then of [`Transaction::commit`].
     pub fn drop_namespace(&self, name: &str) -> Result<()> {
         self.run(|t| t.drop_namespace(name))
     }
 
     /// Autocommit [`Transaction::list_namespaces`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::list_namespaces`], then of [`Transaction::commit`].
     #[expect(
         clippy::redundant_closure_for_method_calls,
         reason = "`Transaction::list_namespaces` is not general over the Transaction lifetime"
@@ -353,41 +389,73 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::create_collection`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::create_collection`], then of [`Transaction::commit`].
     pub fn create_collection(&self, collection: &CollectionPath) -> Result<()> {
         self.run(|t| t.create_collection(collection))
     }
 
     /// Autocommit [`Transaction::drop_collection`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::drop_collection`], then of [`Transaction::commit`].
     pub fn drop_collection(&self, collection: &CollectionPath) -> Result<()> {
         self.run(|t| t.drop_collection(collection))
     }
 
     /// Autocommit [`Transaction::list_collections`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::list_collections`], then of [`Transaction::commit`].
     pub fn list_collections(&self, namespace: &str) -> Result<Vec<String>> {
         self.run(|t| t.list_collections(namespace))
     }
 
     /// Autocommit [`Transaction::insert`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::insert`], then of [`Transaction::commit`].
     pub fn insert(&self, collection: &CollectionPath, doc: Document) -> Result<Bson> {
         self.run(|t| t.insert(collection, doc))
     }
 
     /// Autocommit [`Transaction::get`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::get`], then of [`Transaction::commit`].
     pub fn get(&self, collection: &CollectionPath, id: &Bson) -> Result<Option<Document>> {
         self.run(|t| t.get(collection, id))
     }
 
     /// Autocommit [`Transaction::replace`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::replace`], then of [`Transaction::commit`].
     pub fn replace(&self, collection: &CollectionPath, id: &Bson, doc: Document) -> Result<bool> {
         self.run(|t| t.replace(collection, id, doc))
     }
 
     /// Autocommit [`Transaction::delete`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::delete`], then of [`Transaction::commit`].
     pub fn delete(&self, collection: &CollectionPath, id: &Bson) -> Result<bool> {
         self.run(|t| t.delete(collection, id))
     }
 
     /// Autocommit [`Transaction::set_field_type`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::set_field_type`], then of [`Transaction::commit`].
     pub fn set_field_type(
         &self,
         collection: &CollectionPath,
@@ -398,11 +466,19 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::remove_field_type`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::remove_field_type`], then of [`Transaction::commit`].
     pub fn remove_field_type(&self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
         self.run(|t| t.remove_field_type(collection, path))
     }
 
     /// Autocommit [`Transaction::collection_schema`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::collection_schema`], then of [`Transaction::commit`].
     pub fn collection_schema(
         &self,
         collection: &CollectionPath,
@@ -411,16 +487,28 @@ impl<E: StorageEngine> Node<E> {
     }
 
     /// Autocommit [`Transaction::drop_index`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::drop_index`], then of [`Transaction::commit`].
     pub fn drop_index(&self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
         self.run(|t| t.drop_index(collection, path))
     }
 
     /// Autocommit [`Transaction::list_indexes`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::list_indexes`], then of [`Transaction::commit`].
     pub fn list_indexes(&self, collection: &CollectionPath) -> Result<Vec<IndexInfo>> {
         self.run(|t| t.list_indexes(collection))
     }
 
     /// Autocommit [`Transaction::find`].
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Transaction::find`], then of [`Transaction::commit`].
     pub fn find(&self, collection: &CollectionPath, filter: &Document) -> Result<Vec<Document>> {
         self.run(|t| t.find(collection, filter)?.collect())
     }

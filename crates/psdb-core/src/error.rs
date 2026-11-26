@@ -15,6 +15,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// New kinds of failure arrive with new features, so a `match` on it needs
 /// a `_` arm.
+///
+/// # Errors every operation can return
+///
+/// The `# Errors` section of each function lists only what is particular
+/// to it. Beyond that:
+///
+/// - Every read can fail with [`Error::Storage`] if the Storage Engine
+///   fails, or [`Error::Corruption`] if stored data cannot be decoded.
+/// - Every write in a Transaction can fail with
+///   [`Error::TransactionTooLarge`], and then nothing is written.
+/// - Every operation on a Collection fails with [`Error::NoSuchNamespace`]
+///   or [`Error::NoSuchCollection`] if it does not exist at the
+///   Transaction's Snapshot.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {

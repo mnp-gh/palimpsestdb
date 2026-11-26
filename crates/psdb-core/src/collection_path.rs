@@ -29,8 +29,11 @@ pub struct CollectionPath {
 
 impl CollectionPath {
     /// The path to the Collection `collection` in the Namespace
-    /// `namespace`. Fails with [`Error::InvalidName`] if either name breaks
-    /// the naming rules.
+    /// `namespace`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidName`] if either name breaks the naming rules.
     pub fn new(namespace: &str, collection: &str) -> Result<Self> {
         validate_name(namespace)?;
         validate_name(collection)?;

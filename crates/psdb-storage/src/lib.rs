@@ -214,8 +214,18 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 ///
 /// Engines are `Send + Sync`: every method takes `&self`, so implementations
 /// use interior mutability.
+///
+/// # Errors
+///
+/// Every method fails with [`StorageError::Io`] if the medium fails, and a
+/// read with [`StorageError::Corruption`] if stored data cannot be
+/// interpreted.
 pub trait StorageEngine: Send + Sync {
     /// The value stored at `key`, if any.
+    ///
+    /// # Errors
+    ///
+    /// See [the trait's](StorageEngine#errors).
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Visit every key in `range` in ascending order, calling `visit` with
@@ -224,13 +234,25 @@ pub trait StorageEngine: Send + Sync {
     /// [`KeyRange::intersect`], visits nothing.
     ///
     /// `visit` must not call back into the engine.
+    ///
+    /// # Errors
+    ///
+    /// See [the trait's](StorageEngine#errors).
     fn scan(&self, range: &KeyRange, visit: &mut ScanVisitor<'_>) -> Result<()>;
 
     /// Apply every op in `batch` atomically, in order.
+    ///
+    /// # Errors
+    ///
+    /// See [the trait's](StorageEngine#errors).
     fn write_batch(&self, batch: WriteBatch) -> Result<()>;
 
     /// Make every batch written so far durable. A no-op for engines that
     /// keep nothing on disk.
+    ///
+    /// # Errors
+    ///
+    /// See [the trait's](StorageEngine#errors).
     fn flush(&self) -> Result<()>;
 }
 

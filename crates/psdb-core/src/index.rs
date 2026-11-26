@@ -296,12 +296,17 @@ impl CollectionEntry {
 impl<E: StorageEngine> Transaction<'_, E> {
     /// Create an Index on a field of an empty Collection, as part of this
     /// Transaction (ADR 0010). There is nothing to build, so it commits or
-    /// aborts with the rest of the Transaction.
+    /// aborts with the rest of the Transaction. A Document committed
+    /// concurrently makes the commit abort with Collection Changed.
     ///
-    /// Fails with [`Error::CollectionNotEmpty`] if the Collection holds
-    /// Documents: use [`Node::create_index`](crate::Node::create_index),
-    /// which builds the Index on its own. A Document committed concurrently
-    /// makes this Transaction abort with Collection Changed.
+    /// # Errors
+    ///
+    /// - [`Error::InvalidSchema`] if the field's type is not declared in the
+    ///   Collection Schema, or the Index is unique and the field not strict.
+    /// - [`Error::IndexExists`] if the field already has an Index.
+    /// - [`Error::CollectionNotEmpty`] if the Collection holds Documents: use
+    ///   [`Node::create_index`](crate::Node::create_index), which builds the
+    ///   Index on its own.
     pub fn create_index_on_empty(
         &mut self,
         collection: &CollectionPath,
@@ -358,6 +363,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
     /// Drop the Index on a field: a Tombstone on its Catalog entry
     /// (ADR 0014). Its entries become unreachable and stay behind until
     /// garbage collection reclaims them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchIndex`] if the field has no Index.
     pub fn drop_index(&mut self, collection: &CollectionPath, path: &FieldPath) -> Result<()> {
         let entry = self.collection_entry(collection)?;
         let Some(index) = entry.index_on(path) else {
@@ -370,6 +379,10 @@ impl<E: StorageEngine> Transaction<'_, E> {
     }
 
     /// The Collection's Indexes, in the order they were created.
+    ///
+    /// # Errors
+    ///
+    /// Only [the errors every operation can return](crate::Error#errors-every-operation-can-return).
     pub fn list_indexes(&mut self, collection: &CollectionPath) -> Result<Vec<IndexInfo>> {
         Ok(self
             .collection_entry(collection)?
@@ -395,9 +408,17 @@ impl<E: StorageEngine> Node<E> {
     /// the commit lock, so other commits wait for one chunk, not the whole
     /// build. A final commit makes it Ready.
     ///
-    /// Fails with [`Error::IndexBuildCancelled`] if the Index or its
-    /// Collection is dropped meanwhile. On any other failure, for example
-    /// [`Error::DuplicateValue`], one commit removes the Index and the
+    /// # Errors
+    ///
+    /// - [`Error::InvalidSchema`] or [`Error::IndexExists`], as for
+    ///   [`Transaction::create_index_on_empty`].
+    /// - [`Error::DuplicateValue`] if the Index is unique and two Documents
+    ///   share a value.
+    /// - [`Error::IndexBuildCancelled`] if the Index or its Collection is
+    ///   dropped meanwhile.
+    /// - Those of [`Transaction::commit`], for each commit of the build.
+    ///
+    /// After any failure but a cancel, one commit removes the Index and the
     /// original error is returned; if that commit fails too, the Index stays
     /// Building until it is dropped or the Node reopens. Committed chunks
     /// stay behind under an Index ID that is never reused in the Collection,
@@ -440,6 +461,11 @@ impl<E: StorageEngine> Node<E> {
     /// Commit the Index as Building and return its build, for the caller to
     /// [`step`](IndexBuild::step), as [`create_index`](Self::create_index)
     /// does.
+    ///
+    /// # Errors
+    ///
+    /// The checks of [`create_index`](Self::create_index), and those of
+    /// [`Transaction::commit`].
     #[cfg(any(test, feature = "testing"))]
     pub fn start_index_build(
         &self,
@@ -532,7 +558,9 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
     /// Index Ready and return true. Holds the commit lock throughout, so no
     /// Document changes between reading it and committing its entries.
     ///
-    /// Fails as [`Node::create_index`] does, removing the Index on any
+    /// # Errors
+    ///
+    /// Those of [`Node::create_index`]'s build, removing the Index on any
     /// failure but [`Error::IndexBuildCancelled`].
     pub fn step(&mut self) -> Result<bool> {
         let mut commit_state = self.node.commit_lock.lock().expect("lock poisoned");
