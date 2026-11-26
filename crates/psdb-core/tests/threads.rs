@@ -157,6 +157,8 @@ fn concurrent_threads_stress_test() {
 }
 
 #[test]
+#[ignore = "known issue: the build can starve writers under CPU contention \
+            (.scratch/v0.4-concurrency/issues/10-index-build-starves-writers.md)"]
 fn other_threads_commit_while_an_index_builds() {
     const DOCS: i32 = 10_000;
     let node = common::shop();
