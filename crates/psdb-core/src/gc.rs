@@ -95,6 +95,10 @@ impl<E: StorageEngine> Node<E> {
 
 /// A Garbage Collection pass in progress, holding the GC lock; see
 /// [`Node::collect_garbage`].
+#[cfg_attr(
+    not(any(test, feature = "testing")),
+    expect(unreachable_pub, reason = "exported only for tests (lib.rs)")
+)]
 pub struct GcPass<'node, E: StorageEngine> {
     node: &'node Node<E>,
     _one_pass: MutexGuard<'node, ()>,
@@ -128,6 +132,10 @@ pub struct GcPass<'node, E: StorageEngine> {
     done: bool,
 }
 
+#[cfg_attr(
+    not(any(test, feature = "testing")),
+    expect(unreachable_pub, reason = "exported only for tests (lib.rs)")
+)]
 impl<E: StorageEngine> GcPass<'_, E> {
     /// Close each batch at the first logical key after visiting `n`
     /// physical keys, so tests can commit between small batches.

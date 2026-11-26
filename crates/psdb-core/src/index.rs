@@ -496,6 +496,10 @@ impl<E: StorageEngine> Node<E> {
 }
 
 /// An Index being built, one chunk per [`step`](Self::step) (ADR 0013).
+#[cfg_attr(
+    not(any(test, feature = "testing")),
+    expect(unreachable_pub, reason = "exported only for tests (lib.rs)")
+)]
 pub struct IndexBuild<'node, E: StorageEngine> {
     node: &'node Node<E>,
     collection: CollectionPath,
@@ -510,6 +514,10 @@ pub struct IndexBuild<'node, E: StorageEngine> {
     chunk_documents: usize,
 }
 
+#[cfg_attr(
+    not(any(test, feature = "testing")),
+    expect(unreachable_pub, reason = "exported only for tests (lib.rs)")
+)]
 impl<E: StorageEngine> IndexBuild<'_, E> {
     /// Index at most `n` Documents per chunk, so tests can interleave
     /// commits between chunks of a small Collection.
