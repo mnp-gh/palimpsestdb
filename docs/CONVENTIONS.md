@@ -2,7 +2,7 @@
 
 How PalimpsestDB code is shaped. Vocabulary follows [GLOSSARY.md](../GLOSSARY.md); scope per version follows [ROADMAP.md](./ROADMAP.md).
 
-What a machine can check is checked: `cargo clippy --all-targets -- -D warnings` (lints in `Cargo.toml`, seam bans in `clippy.toml`) `scripts/check-crates.sh` (crate names, READMEs, dependency direction) and `scripts/check-comments.sh` (no TODO markers or commented-out code). `scripts/lint.sh` runs them all; a Claude Code hook runs it after every edit, and CI on every pull request. The rest of this file is for review.
+What a machine can check is checked: `cargo clippy --all-targets -- -D warnings` (lints in `Cargo.toml`, seam bans in `clippy.toml`) `scripts/check-crates.sh` (crate names, READMEs, dependency direction) and `psdb-lint` (no TODO markers or commented-out code). `scripts/lint.sh` runs them all; a Claude Code hook runs it after every edit, and CI on every pull request. The rest of this file is for review.
 
 ## SOLID, applied at the seams
 
