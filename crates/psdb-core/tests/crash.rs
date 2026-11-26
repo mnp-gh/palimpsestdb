@@ -158,7 +158,7 @@ proptest! {
 
         // The recovered Node keeps working and survives another reopen.
         let node = open(&disk).unwrap();
-        prop_assert_eq!(state(&node), recovered.clone());
+        prop_assert_eq!(&state(&node), &recovered);
         if recovered.orders.is_some() {
             node.insert(&collection("shop.orders"), doc! { "_id": 99, "v": 0 }).unwrap();
             drop(node);

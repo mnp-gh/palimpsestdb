@@ -39,6 +39,15 @@ missing_panics_doc = "allow"
 needless_pass_by_value = "allow"
 # `use Enum::*` inside one function keeps a big match readable.
 enum_glob_use = "allow"
+# Performance lints from nursery (the perf group is already on by default;
+# see nnethercote.github.io/perf-book). Not significant_drop_tightening: lock
+# scopes here are correctness decisions.
+needless_collect = "warn"
+or_fun_call = "warn"
+redundant_clone = "warn"
+large_stack_frames = "warn"
+iter_with_drain = "warn"
+set_contains_or_insert = "warn"
 # Picked from restriction, which is not meant to be enabled whole.
 dbg_macro = "warn"
 todo = "warn"
