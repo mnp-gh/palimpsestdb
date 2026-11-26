@@ -2,7 +2,7 @@
 
 How PalimpsestDB code is shaped. Vocabulary follows [GLOSSARY.md](../GLOSSARY.md); scope per version follows [ROADMAP.md](./ROADMAP.md).
 
-What a machine can check is checked: `cargo clippy --all-targets -- -D warnings` (lints in `Cargo.toml`, seam bans in `clippy.toml`) and `scripts/check-crates.sh` (crate names, READMEs, dependency direction). `scripts/lint.sh` runs both; a Claude Code hook runs it after every edit, and CI on every pull request. The rest of this file is for review.
+What a machine can check is checked: `cargo clippy --all-targets -- -D warnings` (lints in `Cargo.toml`, seam bans in `clippy.toml`) `scripts/check-crates.sh` (crate names, READMEs, dependency direction) and `scripts/check-comments.sh` (no TODO markers or commented-out code). `scripts/lint.sh` runs them all; a Claude Code hook runs it after every edit, and CI on every pull request. The rest of this file is for review.
 
 ## SOLID, applied at the seams
 
@@ -30,6 +30,7 @@ The Database Layer is generic over the Storage Engine (`Node<E: StorageEngine>`)
 ## Documentation
 
 - `#![deny(missing_docs)]` in every crate.
+- A `//` comment says why, which the code cannot: an invariant, a reason, a link to an ADR. Never what the code does; rename or restructure until the code says it. Deferred work is `// shortcut: <the limit>, <when to upgrade>` or a roadmap item, never `TODO`. The hook shows Claude each comment it adds, to check.
 - A README per crate stating its responsibility and its place in the dependency graph.
 - Doc examples are tests (`cargo test` runs them).
 - Domain terms in code, comments and tests use the glossary's words.
