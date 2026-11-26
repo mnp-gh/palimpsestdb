@@ -1,4 +1,8 @@
 //! A durable Node: replay on open, and poisoning when the WAL fails.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "durability is tested on the real filesystem"
+)]
 
 mod common;
 

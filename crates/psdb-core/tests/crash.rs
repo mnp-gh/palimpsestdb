@@ -7,6 +7,10 @@
 //! A commit in flight at the crash may or may not survive. Two kinds of
 //! crash: simulated power loss on a [`SimDisk`], which drops unsynced bytes,
 //! and killing a real child process, which exercises the real filesystem.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "crashes are tested on the real filesystem with random kill points"
+)]
 
 mod common;
 

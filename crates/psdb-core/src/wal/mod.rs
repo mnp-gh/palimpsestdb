@@ -409,6 +409,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a wall-clock bound on replay time"
+    )]
     fn a_large_torn_record_is_truncated_quickly() {
         // Small integers in arrays: BSON full of bytes that read as lengths
         // of about 320 KB, and (for int64s) as small Commit Timestamps.

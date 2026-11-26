@@ -1,4 +1,9 @@
 //! The I/O seam under the WAL.
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "OsWalFile is the OS side of the WalFile seam"
+)]
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};

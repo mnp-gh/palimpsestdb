@@ -2,6 +2,8 @@
 
 How PalimpsestDB code is shaped. Vocabulary follows [GLOSSARY.md](../GLOSSARY.md); scope per version follows [ROADMAP.md](./ROADMAP.md).
 
+What a machine can check is checked: `cargo clippy --all-targets -- -D warnings` (lints in `Cargo.toml`, seam bans in `clippy.toml`) and `scripts/check-crates.sh` (crate names, READMEs, dependency direction). A Claude Code hook runs both after every edit. The rest of this file is for review.
+
 ## SOLID, applied at the seams
 
 SOLID is applied to modules and crates, and strictly only to substitutability.

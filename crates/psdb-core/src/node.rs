@@ -80,6 +80,10 @@ pub struct IdGenerator {
     pub catalog_id: Box<dyn Fn() -> u32 + Send + Sync>,
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the OS clock and random number generator behind the IdGenerator seam"
+)]
 impl Default for IdGenerator {
     fn default() -> Self {
         Self {

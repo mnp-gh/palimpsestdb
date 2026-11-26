@@ -24,3 +24,10 @@ crc32c = "0.6"
 [workspace.lints.rust]
 missing_docs = "deny"
 unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Seams for Clock, I/O and randomness: see clippy.toml.
+disallowed_methods = "deny"
+disallowed_types = "deny"
+# Closed sets are enums so `match` stays exhaustive: no `_` over variants.
+match_wildcard_for_single_variants = "deny"
