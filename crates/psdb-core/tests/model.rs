@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use bson::{Bson, doc};
 use proptest::prelude::*;
+use psdb_core::Error;
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -40,8 +41,11 @@ proptest! {
         for op in ops {
             match op {
                 Op::Insert(id, v) => {
-                    let result = node.insert(&collection("shop.orders"), doc! { "_id": id, "v": v });
-                    prop_assert_eq!(result.is_ok(), !model.contains_key(&id));
+                    match node.insert(&collection("shop.orders"), doc! { "_id": id, "v": v }) {
+                        Ok(_) => prop_assert!(!model.contains_key(&id)),
+                        Err(Error::DuplicateId(_)) => prop_assert!(model.contains_key(&id)),
+                        Err(e) => prop_assert!(false, "unexpected {e:?}"),
+                    }
                     model.entry(id).or_insert(v);
                 }
                 Op::Replace(id, v) => {

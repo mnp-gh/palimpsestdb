@@ -21,10 +21,18 @@ pub const MAX_NAME_BYTES: usize = 64;
 /// you need:
 ///
 /// ```
-/// use psdb_core::Limits;
+/// use bson::doc;
+/// use psdb_core::{Error, Limits, Node};
+/// use psdb_storage_memory::MemoryEngine;
 ///
 /// let limits = Limits::default().with_max_document_bytes(1024);
-/// assert_eq!(limits.max_document_bytes, 1024);
+/// let node = Node::with_limits(MemoryEngine::new(), limits)?;
+/// node.create_namespace("shop")?;
+/// let orders = "shop.orders".parse()?;
+/// node.create_collection(&orders)?;
+/// let large = doc! { "note": "x".repeat(2000) };
+/// assert!(matches!(node.insert(&orders, large), Err(Error::InvalidDocument(_))));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

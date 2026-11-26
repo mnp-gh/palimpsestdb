@@ -135,7 +135,10 @@ impl Slot<'_> {
                         self.writes.insert(id, Some(value));
                     }
                     Err(Error::DuplicateId(_)) => prop_assert!(present),
-                    Err(Error::DuplicateValue(_) | Error::CollectionChanged) => {}
+                    Err(Error::DuplicateValue(_)) => {
+                        prop_assert!(held_by_another(id, value, &[&view, model.latest()]));
+                    }
+                    Err(Error::CollectionChanged) => {}
                     Err(e) => return crash_or_fail("insert", &e).map(Some),
                 }
             }
@@ -148,7 +151,10 @@ impl Slot<'_> {
                             self.writes.insert(id, Some(value));
                         }
                     }
-                    Err(Error::DuplicateValue(_) | Error::CollectionChanged) => {}
+                    Err(Error::DuplicateValue(_)) => {
+                        prop_assert!(held_by_another(id, value, &[&view, model.latest()]));
+                    }
+                    Err(Error::CollectionChanged) => {}
                     Err(e) => return crash_or_fail("replace", &e).map(Some),
                 }
             }
@@ -202,11 +208,27 @@ impl Slot<'_> {
                     ready_survives: false,
                 }));
             }
-            Err(Error::WriteConflict | Error::CollectionChanged | Error::DuplicateValue(_)) => {}
+            Err(Error::DuplicateValue(_)) => {
+                // The commit would have left two Documents sharing a value.
+                let mut values: Vec<_> = after.values().collect();
+                let len = values.len();
+                values.sort();
+                values.dedup();
+                prop_assert!(values.len() < len, "DuplicateValue with no duplicate");
+            }
+            Err(Error::WriteConflict | Error::CollectionChanged) => {}
             Err(e) => return crash_or_fail("commit", &e).map(Some),
         }
         Ok(None)
     }
+}
+
+/// Whether a Document other than `id` holds `n` in any of `states`: the
+/// only reason a unique Index may refuse a write of `n` to `id`.
+fn held_by_another(id: i32, n: i32, states: &[&BTreeMap<i32, i32>]) -> bool {
+    states
+        .iter()
+        .any(|docs| docs.iter().any(|(&other, &v)| other != id && v == n))
 }
 
 fn apply(docs: &mut BTreeMap<i32, i32>, writes: &BTreeMap<i32, Option<i32>>) {

@@ -46,9 +46,14 @@ fn horizon_tracks_active_snapshots_and_advances_on_drop() {
     drop(reader1);
     assert_eq!(node.horizon(), snap2);
 
-    // Dropping reader2 advances horizon to latest_visible_commit_ts.
+    // Dropping reader2 advances horizon past it, to the newest commit.
+    node.insert(&collection("shop.orders"), doc! { "item": "pen" })
+        .unwrap();
+    assert_eq!(node.horizon(), snap2);
     drop(reader2);
-    assert!(node.horizon() >= snap2);
+    let latest = node.begin_transaction().snapshot_ts();
+    assert!(latest > snap2);
+    assert_eq!(node.horizon(), latest);
 }
 
 #[test]

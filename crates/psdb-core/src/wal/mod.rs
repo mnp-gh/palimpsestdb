@@ -474,4 +474,32 @@ mod tests {
         assert!(matches!(open(&disk), Err(Error::UnrecognisedWal(_))));
         assert_eq!(disk.contents(), b"hello");
     }
+
+    /// The file layout in this module's doc comment, written out by hand:
+    /// a WAL written by an older build must still open. The CRC was
+    /// computed with a separate bitwise CRC32C, not the `crc32c` crate.
+    #[test]
+    fn file_layout_matches_the_documented_bytes() {
+        assert_eq!(header(), b"PSDBWAL\0\x00\x00\x00\x01");
+        let expected = b"\x00\x00\x00\x1d\xd4\x48\x61\x21\
+            \x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\
+            \x00\x00\x00\x01a\x01\x00\x00\x00\x011\
+            \x00\x00\x00\x01b\x00";
+        let writes: [(&[u8], Option<&[u8]>); 2] = [(b"a", Some(b"1")), (b"b", None)];
+        assert_eq!(record(1, &writes), expected);
+        let mut file = header();
+        file.extend_from_slice(expected);
+        let disk = SimDisk::new();
+        disk.set_contents(file);
+        assert_eq!(
+            open(&disk).unwrap(),
+            [Record {
+                commit_ts: 1,
+                write_set: WriteSet::from([
+                    (b"a".to_vec(), Some(b"1".to_vec())),
+                    (b"b".to_vec(), None),
+                ]),
+            }]
+        );
+    }
 }

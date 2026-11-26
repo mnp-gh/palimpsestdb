@@ -735,6 +735,9 @@ mod tests {
             key_component(None, Int),
             key_component(Some(&Bson::Null), String)
         );
+        // Equal keys alone would pass for a constant: keys must still order.
+        assert!(comp(&Bson::Double(30.5), Int) < comp(&Bson::Int32(31), Int));
+        assert!(comp(&Bson::Int64(3), Double) < comp(&Bson::Double(3.5), Double));
     }
 
     #[test]

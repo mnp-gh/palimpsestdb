@@ -677,4 +677,55 @@ mod tests {
             Err(Error::IdsExhausted)
         ));
     }
+
+    /// Stored Catalog entries outlive the code: their BSON field names and
+    /// types are written out here by hand, so renaming a field or storing
+    /// `id` as an int32 fails here even if `encode` and `decode` agree.
+    #[test]
+    fn catalog_entries_have_a_fixed_shape() {
+        let stored = |bytes: Vec<u8>| Document::from_reader(bytes.as_slice()).unwrap();
+
+        assert_eq!(
+            stored(entry("shop", 7)),
+            doc! { "name": "shop", "id": 7i64 }
+        );
+
+        let mut schema = Schema::new();
+        let field = FieldSchema {
+            field_type: FieldType::Int,
+            strict: true,
+        };
+        schema.insert("n".parse().unwrap(), field);
+        let collection = CollectionEntry {
+            namespace_id: 1,
+            name: "orders".into(),
+            id: 9,
+            schema,
+            indexes: Vec::new(),
+            next_index_id: 2,
+        };
+        let shape = doc! {
+            "name": "orders",
+            "id": 9i64,
+            "fields": [{ "path": "n", "type": "int", "strict": true }],
+            "nextIndexId": 2i64,
+        };
+        assert_eq!(stored(collection.encode()), shape);
+        let mut bytes = Vec::new();
+        shape.to_writer(&mut bytes).unwrap();
+        assert_eq!(CollectionEntry::decode(1, &bytes).unwrap(), collection);
+
+        let index = IndexDef {
+            path: "n".parse().unwrap(),
+            id: 3,
+            unique: true,
+            state: IndexState::Ready,
+        };
+        let shape = doc! { "path": "n", "unique": true, "state": "ready" };
+        assert_eq!(stored(CollectionEntry::encode_index(&index)), shape);
+        let mut bytes = Vec::new();
+        shape.to_writer(&mut bytes).unwrap();
+        let key = keys::index_catalog_key(1, 9, 3);
+        assert_eq!(CollectionEntry::decode_index(&key, &bytes).unwrap(), index);
+    }
 }

@@ -43,37 +43,61 @@ enum Op {
 }
 
 fn value() -> impl Strategy<Value = Bson> {
-    // Few distinct values of each Field Type, so that equal values, and
-    // ints, doubles and coerced keys, collide often.
+    let typed: Vec<_> = FieldType::ALL.into_iter().map(value_of).collect();
     prop_oneof![
-        (-3i32..3).prop_map(Bson::Int32),
-        (-3i64..3).prop_map(Bson::Int64),
-        prop::sample::select(vec![-1.5, -0.0, 0.5, 1.0, 2.5, f64::NAN, f64::INFINITY])
-            .prop_map(Bson::Double),
-        prop::sample::select(vec!["a", "b", "1"]).prop_map(|s| Bson::String(s.into())),
-        prop::sample::select(vec![-1i64, 0, 5])
-            .prop_map(|ms| Bson::DateTime(DateTime::from_millis(ms))),
-        any::<bool>().prop_map(Bson::Boolean),
-        prop::sample::select(vec![1u8, 2])
-            .prop_map(|b| Bson::ObjectId(ObjectId::from_bytes([b; 12]))),
-        prop::sample::select(vec![vec![], vec![1u8], vec![1, 0]]).prop_map(|bytes| {
-            Bson::Binary(Binary {
-                subtype: BinarySubtype::Generic,
-                bytes,
-            })
-        }),
+        prop::strategy::Union::new(typed),
         Just(Bson::Null),
         Just(Bson::Array(vec![Bson::Int32(1)])),
         Just(Bson::Document(doc! { "x": 1 })),
     ]
 }
 
-fn op() -> impl Strategy<Value = Op> {
+/// Few distinct values of `field_type`, so that equal values, and ints,
+/// doubles and coerced keys, collide often.
+fn value_of(field_type: FieldType) -> BoxedStrategy<Bson> {
+    match field_type {
+        FieldType::Int => prop_oneof![
+            (-3i32..3).prop_map(Bson::Int32),
+            (-3i64..3).prop_map(Bson::Int64),
+        ]
+        .boxed(),
+        FieldType::Double => {
+            prop::sample::select(vec![-1.5, -0.0, 0.5, 1.0, 2.5, f64::NAN, f64::INFINITY])
+                .prop_map(Bson::Double)
+                .boxed()
+        }
+        FieldType::String => prop::sample::select(vec!["a", "b", "1"])
+            .prop_map(|s| Bson::String(s.into()))
+            .boxed(),
+        FieldType::Date => prop::sample::select(vec![-1i64, 0, 5])
+            .prop_map(|ms| Bson::DateTime(DateTime::from_millis(ms)))
+            .boxed(),
+        FieldType::Bool => any::<bool>().prop_map(Bson::Boolean).boxed(),
+        FieldType::ObjectId => prop::sample::select(vec![1u8, 2])
+            .prop_map(|b| Bson::ObjectId(ObjectId::from_bytes([b; 12])))
+            .boxed(),
+        FieldType::Binary => prop::sample::select(vec![vec![], vec![1u8], vec![1, 0]])
+            .prop_map(|bytes| {
+                Bson::Binary(Binary {
+                    subtype: BinarySubtype::Generic,
+                    bytes,
+                })
+            })
+            .boxed(),
+        other => panic!("no values for {other:?}; add them here"),
+    }
+}
+
+/// Writes to `_id`s that collide often, with values mostly of `field_type`:
+/// a Strict Field refuses the others, so drawing every type evenly would
+/// leave an Index on one almost empty.
+fn op(field_type: FieldType) -> impl Strategy<Value = Op> {
     // Negative too, so `_id` ranges cross zero.
     let id = -3..4i32;
+    let v = prop::option::weighted(0.8, prop_oneof![3 => value_of(field_type), 1 => value()]);
     prop_oneof![
-        (id.clone(), prop::option::of(value())).prop_map(|(i, v)| Op::Insert(i, v)),
-        (id.clone(), prop::option::of(value())).prop_map(|(i, v)| Op::Replace(i, v)),
+        (id.clone(), v.clone()).prop_map(|(i, v)| Op::Insert(i, v)),
+        (id.clone(), v).prop_map(|(i, v)| Op::Replace(i, v)),
         id.prop_map(Op::Delete),
     ]
 }
@@ -145,6 +169,15 @@ fn create_index(node: &Node<MemoryEngine>, unique: bool) {
     }
 }
 
+/// A write may fail only for a reason the generated writes can cause.
+fn expected_outcome(outcome: psdb_core::Result<()>, unique: bool) -> Result<(), TestCaseError> {
+    match outcome {
+        Ok(()) | Err(Error::TypeMismatch(_) | Error::DuplicateId(_)) => Ok(()),
+        Err(Error::DuplicateValue(_)) if unique => Ok(()),
+        Err(e) => Err(TestCaseError::fail(format!("unexpected {e:?}"))),
+    }
+}
+
 /// `find` in `orders` and in `plain` return the same Documents.
 fn same_in_both(
     find: &mut dyn FnMut(&CollectionPath) -> psdb_core::Result<Vec<Document>>,
@@ -169,12 +202,15 @@ proptest! {
     /// Documents and in a Transaction that has written more of its own.
     #[test]
     fn index_backed_find_matches_a_full_scan(
-        field_type in prop::sample::select(FieldType::ALL.to_vec()),
+        (field_type, ops, own_writes) in prop::sample::select(FieldType::ALL.to_vec())
+            .prop_flat_map(|ty| (
+                Just(ty),
+                prop::collection::vec(op(ty), 0..30),
+                prop::collection::vec(op(ty), 0..10),
+            )),
         strict in any::<bool>(),
         unique in any::<bool>(),
-        ops in prop::collection::vec(op(), 0..30),
         build_after in 0..30usize,
-        own_writes in prop::collection::vec(op(), 0..10),
         filters in prop::collection::vec(filter(), 1..8),
     ) {
         let node = common::shop();
@@ -189,8 +225,9 @@ proptest! {
             if n == build_after {
                 create_index(&node, unique);
             }
-            // Outcomes are checked by comparing the Collections, not here.
-            let _ = node.run(|t| apply(t, op));
+            // What each write did is checked by comparing the Collections;
+            // here only that it failed, if it did, for a reason it may.
+            expected_outcome(node.run(|t| apply(t, op)), unique)?;
         }
         if build_after >= ops.len() {
             create_index(&node, unique);
@@ -211,7 +248,7 @@ proptest! {
         }
         let mut txn = node.begin_transaction();
         for op in &own_writes {
-            let _ = apply(&mut txn, op);
+            expected_outcome(apply(&mut txn, op), unique)?;
         }
         for f in &filters {
             same_in_both(&mut |coll| txn.find(coll, f)?.collect(), f)?;
