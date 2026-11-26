@@ -149,137 +149,28 @@ impl<E: StorageEngine> GcPass<'_, E> {
     /// the pass and return what it removed.
     ///
     /// Panics if the pass already finished.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "shortcut: one long step, split when it next grows"
-    )]
     pub fn step(&mut self) -> Result<Option<GcStats>> {
         assert!(!self.done, "stepped a finished Garbage Collection pass");
-        let Self {
-            node,
-            horizon,
-            stats,
-            range,
-            batch_keys,
-            current,
-            seen_newest,
-            dead_id_follows,
-            dead_namespaces,
-            dead_collections,
-            reclaimed_collections,
-            dead_indexes,
-            reclaimed_indexes,
-            uncached,
-            held_back,
-            done,
-            ..
-        } = self;
+        let node = self.node;
+        // A copy, so `visit` can borrow `self` mutably during the scan.
+        let range = self.range.clone();
         let mut batch = WriteBatch::new();
         let mut visited = 0;
         let mut next_start = None;
         let mut failure = None;
-        node.engine.scan(range, &mut |key, value| {
+        node.engine.scan(&range, &mut |key, value| {
             visited += 1;
-            let (logical, ts) = match keys::split_physical(key) {
-                Ok(parts) => parts,
+            match self.visit(key, value, visited, &mut batch) {
+                Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
+                Ok(ControlFlow::Break(())) => {
+                    next_start = Some(key.to_vec());
+                    ControlFlow::Break(())
+                }
                 Err(e) => {
                     failure = Some(e);
-                    return ControlFlow::Break(());
+                    ControlFlow::Break(())
                 }
-            };
-            if logical != current.as_slice() {
-                // Close the batch only between keys: deleting a Tombstone
-                // without the Versions under it would show them to readers.
-                if visited > *batch_keys {
-                    next_start = Some(key.to_vec());
-                    return ControlFlow::Break(());
-                }
-                *current = logical.to_vec();
-                *seen_newest = false;
-                *dead_id_follows = false;
             }
-            let reclaim = if let Some((namespace_id, collection_id)) =
-                keys::data_collection(logical)
-                && (dead_namespaces.contains(&namespace_id)
-                    || dead_collections.contains(&(namespace_id, collection_id)))
-            {
-                reclaimed_collections.insert((namespace_id, collection_id));
-                true
-            } else if let Some(index) = keys::index_entry_ids(logical)
-                && dead_indexes.contains(&index)
-            {
-                reclaimed_indexes.insert(index);
-                true
-            } else if let Some(namespace_id) = keys::collection_entry_namespace(logical)
-                && dead_namespaces.contains(&namespace_id)
-            {
-                uncached.insert(logical.to_vec());
-                true
-            } else if let Some((namespace_id, collection_id, _)) = keys::index_catalog_ids(logical)
-                && (dead_namespaces.contains(&namespace_id)
-                    || dead_collections.contains(&(namespace_id, collection_id)))
-            {
-                uncached.insert(logical.to_vec());
-                true
-            } else {
-                false
-            };
-            if reclaim {
-                stats.versions_removed += 1;
-                stats.tombstones_removed += u64::from(mvcc::is_tombstone(value));
-                if keys::is_system_key(logical) {
-                    held_back.push(key.to_vec());
-                } else {
-                    batch.delete(key.to_vec());
-                }
-                return ControlFlow::Continue(());
-            }
-            if ts > *horizon {
-                return ControlFlow::Continue(());
-            }
-            if !*seen_newest {
-                *seen_newest = true;
-                if !mvcc::is_tombstone(value) {
-                    return ControlFlow::Continue(());
-                }
-                stats.tombstones_removed += 1;
-            }
-            stats.versions_removed += 1;
-            // Every Version older than a deleted one is deleted too, so
-            // the one holding the dropped ID is reached here.
-            let collection_namespace = keys::collection_entry_namespace(logical);
-            if collection_namespace.is_some() || keys::is_namespace_entry(logical) {
-                if *dead_id_follows {
-                    *dead_id_follows = false;
-                    let id = mvcc::decode_value(value)
-                        .and_then(|v| v.map(|bytes| catalog::entry_id(&bytes)).transpose());
-                    match (id, collection_namespace) {
-                        (Ok(Some(id)), Some(namespace_id)) => {
-                            dead_collections.insert((namespace_id, id));
-                        }
-                        (Ok(Some(id)), None) => {
-                            dead_namespaces.insert(id);
-                        }
-                        (Ok(None), _) => {}
-                        (Err(e), _) => {
-                            failure = Some(e);
-                            return ControlFlow::Break(());
-                        }
-                    }
-                }
-                *dead_id_follows = mvcc::is_tombstone(value);
-            }
-            if let Some(index) = keys::index_catalog_ids(logical)
-                && mvcc::is_tombstone(value)
-            {
-                dead_indexes.insert(index);
-            }
-            if keys::is_system_key(logical) {
-                held_back.push(key.to_vec());
-            } else {
-                batch.delete(key.to_vec());
-            }
-            ControlFlow::Continue(())
         })?;
         if let Some(e) = failure {
             return Err(e);
@@ -288,24 +179,148 @@ impl<E: StorageEngine> GcPass<'_, E> {
             node.engine.write_batch(batch)?;
         }
         if let Some(start) = next_start {
-            range.start = start;
+            self.range.start = start;
             return Ok(None);
         }
+        self.finish().map(Some)
+    }
+
+    /// Visit the physical `key`, the `visited`th of this step: queue it in
+    /// `batch` if it is garbage. Breaks to close the batch before `key`.
+    fn visit(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        visited: usize,
+        batch: &mut WriteBatch,
+    ) -> Result<ControlFlow<()>> {
+        let (logical, ts) = keys::split_physical(key)?;
+        if logical != self.current.as_slice() {
+            // Close the batch only between keys: deleting a Tombstone
+            // without the Versions under it would show them to readers.
+            if visited > self.batch_keys {
+                return Ok(ControlFlow::Break(()));
+            }
+            self.current = logical.to_vec();
+            self.seen_newest = false;
+            self.dead_id_follows = false;
+        }
+        if self.reclaim(logical) {
+            self.stats.versions_removed += 1;
+            self.stats.tombstones_removed += u64::from(mvcc::is_tombstone(value));
+            self.delete(key, logical, batch);
+            return Ok(ControlFlow::Continue(()));
+        }
+        if ts > self.horizon {
+            return Ok(ControlFlow::Continue(()));
+        }
+        if !self.seen_newest {
+            self.seen_newest = true;
+            if !mvcc::is_tombstone(value) {
+                return Ok(ControlFlow::Continue(()));
+            }
+            self.stats.tombstones_removed += 1;
+        }
+        self.stats.versions_removed += 1;
+        self.note_drop(logical, value)?;
+        self.delete(key, logical, batch);
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Whether `logical` belongs to a dropped Namespace, Collection or
+    /// Index found so far, so every Version of it goes.
+    fn reclaim(&mut self, logical: &[u8]) -> bool {
+        if let Some((namespace_id, collection_id)) = keys::data_collection(logical)
+            && (self.dead_namespaces.contains(&namespace_id)
+                || self
+                    .dead_collections
+                    .contains(&(namespace_id, collection_id)))
+        {
+            self.reclaimed_collections
+                .insert((namespace_id, collection_id));
+            true
+        } else if let Some(index) = keys::index_entry_ids(logical)
+            && self.dead_indexes.contains(&index)
+        {
+            self.reclaimed_indexes.insert(index);
+            true
+        } else if let Some(namespace_id) = keys::collection_entry_namespace(logical)
+            && self.dead_namespaces.contains(&namespace_id)
+        {
+            self.uncached.insert(logical.to_vec());
+            true
+        } else if let Some((namespace_id, collection_id, _)) = keys::index_catalog_ids(logical)
+            && (self.dead_namespaces.contains(&namespace_id)
+                || self
+                    .dead_collections
+                    .contains(&(namespace_id, collection_id)))
+        {
+            self.uncached.insert(logical.to_vec());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record the ID a deleted Catalog Version of `logical` frees: the
+    /// Namespace, Collection or Index whose data is now dead.
+    fn note_drop(&mut self, logical: &[u8], value: &[u8]) -> Result<()> {
+        // Every Version older than a deleted one is deleted too, so the one
+        // holding the dropped ID is reached here.
+        let collection_namespace = keys::collection_entry_namespace(logical);
+        if collection_namespace.is_some() || keys::is_namespace_entry(logical) {
+            if self.dead_id_follows {
+                self.dead_id_follows = false;
+                let id = mvcc::decode_value(value)?
+                    .map(|bytes| catalog::entry_id(&bytes))
+                    .transpose()?;
+                match (id, collection_namespace) {
+                    (Some(id), Some(namespace_id)) => {
+                        self.dead_collections.insert((namespace_id, id));
+                    }
+                    (Some(id), None) => {
+                        self.dead_namespaces.insert(id);
+                    }
+                    (None, _) => {}
+                }
+            }
+            self.dead_id_follows = mvcc::is_tombstone(value);
+        }
+        if let Some(index) = keys::index_catalog_ids(logical)
+            && mvcc::is_tombstone(value)
+        {
+            self.dead_indexes.insert(index);
+        }
+        Ok(())
+    }
+
+    /// Delete `key` in `batch`, or hold it back if it is a Catalog key.
+    fn delete(&mut self, key: &[u8], logical: &[u8], batch: &mut WriteBatch) {
+        if keys::is_system_key(logical) {
+            self.held_back.push(key.to_vec());
+        } else {
+            batch.delete(key.to_vec());
+        }
+    }
+
+    /// Delete the held-back Catalog keys, now that their data is gone, and
+    /// return what the pass removed.
+    fn finish(&mut self) -> Result<GcStats> {
         // One batch, so no Catalog Tombstone is deleted apart from the
         // Versions under it; the Catalog is small.
         let mut catalog = WriteBatch::new();
-        for key in std::mem::take(held_back) {
+        for key in std::mem::take(&mut self.held_back) {
             catalog.delete(key);
         }
         if !catalog.ops().is_empty() {
-            node.engine.write_batch(catalog)?;
+            self.node.engine.write_batch(catalog)?;
         }
-        node.catalog_cache.remove(uncached);
-        node.catalog_cache.purge_tombstones(*horizon);
-        stats.collections_reclaimed = reclaimed_collections.len() as u64;
-        stats.indexes_reclaimed = reclaimed_indexes.len() as u64;
-        *done = true;
-        Ok(Some(*stats))
+        self.node.catalog_cache.remove(&self.uncached);
+        self.node.catalog_cache.purge_tombstones(self.horizon);
+        self.stats.collections_reclaimed = self.reclaimed_collections.len() as u64;
+        self.stats.indexes_reclaimed = self.reclaimed_indexes.len() as u64;
+        self.done = true;
+        Ok(self.stats)
     }
 }
 
@@ -424,7 +439,7 @@ mod tests {
         assert_eq!(versions_under(&node, &index_entry), 0);
         assert_eq!(
             node.catalog_cache.read_at(&index_entry, u64::MAX),
-            Some(None)
+            catalog::Cached::Known(None)
         );
         assert_eq!(node.collect_garbage().unwrap(), GcStats::default());
     }
@@ -564,7 +579,10 @@ mod tests {
             keys::index_catalog_key(namespace_id, orders_id, 0),
         ] {
             assert_eq!(versions_under(&node, &entry), 0);
-            assert_eq!(node.catalog_cache.read_at(&entry, u64::MAX), Some(None));
+            assert_eq!(
+                node.catalog_cache.read_at(&entry, u64::MAX),
+                catalog::Cached::Known(None)
+            );
         }
         assert_eq!(
             versions_under(&node, &keys::namespace_id_key(namespace_id)),

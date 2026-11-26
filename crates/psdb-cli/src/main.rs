@@ -206,10 +206,6 @@ impl Input {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "shortcut: one long step, split when it next grows"
-)]
 fn execute<'node>(
     node: &'node MemNode,
     txn: &mut Option<Txn<'node>>,
@@ -255,119 +251,18 @@ fn execute<'node>(
             with_txn(node, txn, |t| t.drop_collection(&coll))?;
         }
 
-        "insert" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [doc] = values::<1>(args)?;
-            let doc = as_document(doc)?;
-            let id = with_txn(node, txn, |t| t.insert(&coll, doc))?;
-            println!("{}", to_json(id));
-        }
-        "get" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [id] = values::<1>(args)?;
-            match with_txn(node, txn, |t| t.get(&coll, &id))? {
-                Some(doc) => println!("{}", to_json(Bson::Document(doc))),
-                None => not_found(&id),
-            }
-        }
-        "replace" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [id, doc] = values::<2>(args)?;
-            let doc = as_document(doc)?;
-            let replaced = with_txn(node, txn, |t| t.replace(&coll, &id, doc))?;
-            if replaced {
-                println!("replaced");
-            } else {
-                not_found(&id);
-            }
-        }
-        "delete" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [id] = values::<1>(args)?;
-            let deleted = with_txn(node, txn, |t| t.delete(&coll, &id))?;
-            if deleted {
-                println!("deleted");
-            } else {
-                not_found(&id);
-            }
-        }
-        "find" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let filter = if args.is_empty() {
-                Document::new()
-            } else {
-                let [filter] = values::<1>(args)?;
-                as_document(filter)?
-            };
-            let docs: Vec<_> = with_txn(node, txn, |t| t.find(&coll, &filter)?.collect())?;
-            let found = docs.len();
-            for doc in docs {
-                println!("{}", to_json(Bson::Document(doc)));
-            }
-            println!("({found} found)");
-        }
+        "insert" => insert(node, txn, rest)?,
+        "get" => get(node, txn, rest)?,
+        "replace" => replace(node, txn, rest)?,
+        "delete" => delete(node, txn, rest)?,
+        "find" => find(node, txn, rest)?,
 
-        "schema" => {
-            let coll = collection_path(rest)?;
-            for (path, field) in with_txn(node, txn, |t| t.collection_schema(&coll))? {
-                let strict = if field.strict { " strict" } else { "" };
-                println!("{path}: {}{strict}", field.field_type);
-            }
-        }
-        "set-type" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let (path, field_type, strict) = match words(args)[..] {
-                [path, ty] => (path, ty, false),
-                [path, ty, "strict"] => (path, ty, true),
-                _ => return Err("usage: set-type <ns>.<coll> <path> <type> [strict]".into()),
-            };
-            let field_type: FieldType = field_type.parse().map_err(message)?;
-            let field = FieldSchema { field_type, strict };
-            let path = field_path(path)?;
-            with_txn(node, txn, |t| t.set_field_type(&coll, &path, field))?;
-        }
-        "unset-type" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [path] = words(args)[..] else {
-                return Err("usage: unset-type <ns>.<coll> <path>".into());
-            };
-            let path = field_path(path)?;
-            with_txn(node, txn, |t| t.remove_field_type(&coll, &path))?;
-        }
-        "indexes" => {
-            let coll = collection_path(rest)?;
-            for index in with_txn(node, txn, |t| t.list_indexes(&coll))? {
-                let unique = if index.unique { " unique" } else { "" };
-                let building = match index.state {
-                    IndexState::Building => " building",
-                    IndexState::Ready => "",
-                };
-                println!("{}{unique}{building}", index.path);
-            }
-        }
-        "create-index" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let (path, unique) = match words(args)[..] {
-                [path] => (path, false),
-                [path, "unique"] => (path, true),
-                _ => return Err("usage: create-index <ns>.<coll> <path> [unique]".into()),
-            };
-            let path = field_path(path)?;
-            match txn {
-                Some(open) => open.create_index_on_empty(&coll, &path, unique),
-                // Builds from existing Documents, committing on its own.
-                None => node.create_index(&coll, &path, unique),
-            }
-            .map_err(message)?;
-        }
-        "drop-index" => {
-            let (coll, args) = split_collection_path(rest)?;
-            let [path] = words(args)[..] else {
-                return Err("usage: drop-index <ns>.<coll> <path>".into());
-            };
-            let path = field_path(path)?;
-            with_txn(node, txn, |t| t.drop_index(&coll, &path))?;
-        }
+        "schema" => schema(node, txn, rest)?,
+        "set-type" => set_type(node, txn, rest)?,
+        "unset-type" => unset_type(node, txn, rest)?,
+        "indexes" => indexes(node, txn, rest)?,
+        "create-index" => create_index(node, txn, rest)?,
+        "drop-index" => drop_index(node, txn, rest)?,
 
         "gc" => {
             let stats = node.collect_garbage().map_err(message)?;
@@ -383,6 +278,180 @@ fn execute<'node>(
         other => return Err(format!("unknown command {other:?}; type `help`")),
     }
     Ok(Outcome::Continue)
+}
+
+fn insert<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [doc] = values::<1>(args)?;
+    let doc = as_document(doc)?;
+    let id = with_txn(node, txn, |t| t.insert(&coll, doc))?;
+    println!("{}", to_json(id));
+    Ok(())
+}
+
+fn get<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [id] = values::<1>(args)?;
+    match with_txn(node, txn, |t| t.get(&coll, &id))? {
+        Some(doc) => println!("{}", to_json(Bson::Document(doc))),
+        None => not_found(&id),
+    }
+    Ok(())
+}
+
+fn replace<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [id, doc] = values::<2>(args)?;
+    let doc = as_document(doc)?;
+    let replaced = with_txn(node, txn, |t| t.replace(&coll, &id, doc))?;
+    if replaced {
+        println!("replaced");
+    } else {
+        not_found(&id);
+    }
+    Ok(())
+}
+
+fn delete<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [id] = values::<1>(args)?;
+    let deleted = with_txn(node, txn, |t| t.delete(&coll, &id))?;
+    if deleted {
+        println!("deleted");
+    } else {
+        not_found(&id);
+    }
+    Ok(())
+}
+
+fn find<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let filter = if args.is_empty() {
+        Document::new()
+    } else {
+        let [filter] = values::<1>(args)?;
+        as_document(filter)?
+    };
+    let docs: Vec<_> = with_txn(node, txn, |t| t.find(&coll, &filter)?.collect())?;
+    let found = docs.len();
+    for doc in docs {
+        println!("{}", to_json(Bson::Document(doc)));
+    }
+    println!("({found} found)");
+    Ok(())
+}
+
+fn schema<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let coll = collection_path(rest)?;
+    for (path, field) in with_txn(node, txn, |t| t.collection_schema(&coll))? {
+        let strict = if field.strict { " strict" } else { "" };
+        println!("{path}: {}{strict}", field.field_type);
+    }
+    Ok(())
+}
+
+fn set_type<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let (path, field_type, strict) = match words(args)[..] {
+        [path, ty] => (path, ty, false),
+        [path, ty, "strict"] => (path, ty, true),
+        _ => return Err("usage: set-type <ns>.<coll> <path> <type> [strict]".into()),
+    };
+    let field_type: FieldType = field_type.parse().map_err(message)?;
+    let field = FieldSchema { field_type, strict };
+    let path = field_path(path)?;
+    with_txn(node, txn, |t| t.set_field_type(&coll, &path, field))
+}
+
+fn unset_type<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [path] = words(args)[..] else {
+        return Err("usage: unset-type <ns>.<coll> <path>".into());
+    };
+    let path = field_path(path)?;
+    with_txn(node, txn, |t| t.remove_field_type(&coll, &path))
+}
+
+fn indexes<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let coll = collection_path(rest)?;
+    for index in with_txn(node, txn, |t| t.list_indexes(&coll))? {
+        let unique = if index.unique { " unique" } else { "" };
+        let building = match index.state {
+            IndexState::Building => " building",
+            IndexState::Ready => "",
+        };
+        println!("{}{unique}{building}", index.path);
+    }
+    Ok(())
+}
+
+fn create_index<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let (path, unique) = match words(args)[..] {
+        [path] => (path, false),
+        [path, "unique"] => (path, true),
+        _ => return Err("usage: create-index <ns>.<coll> <path> [unique]".into()),
+    };
+    let path = field_path(path)?;
+    match txn {
+        Some(open) => open.create_index_on_empty(&coll, &path, unique),
+        // Builds from existing Documents, committing on its own.
+        None => node.create_index(&coll, &path, unique),
+    }
+    .map_err(message)
+}
+
+fn drop_index<'node>(
+    node: &'node MemNode,
+    txn: &mut Option<Txn<'node>>,
+    rest: &str,
+) -> Result<(), String> {
+    let (coll, args) = split_collection_path(rest)?;
+    let [path] = words(args)[..] else {
+        return Err("usage: drop-index <ns>.<coll> <path>".into());
+    };
+    let path = field_path(path)?;
+    with_txn(node, txn, |t| t.drop_index(&coll, &path))
 }
 
 /// Run `work` in the open transaction, or in its own autocommit transaction
@@ -401,6 +470,10 @@ fn with_txn<'node, T>(
 
 /// The error as a message to print. Exits instead if the Node can no
 /// longer commit, so a script fed to `psdb` stops with a non-zero status.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used as `map_err(message)`, which hands over the error"
+)]
 fn message(e: psdb_core::Error) -> String {
     if e.requires_reopen() {
         eprintln!("error: {e}");

@@ -90,15 +90,12 @@ impl CatalogCache {
         }
     }
 
-    /// The value of the Catalog entry `logical` at `snapshot_ts`, or `None`
-    /// if its newest Version is newer than the Snapshot, so only the engine
-    /// has the answer.
-    #[expect(clippy::option_option, reason = "the outer None means ask the engine")]
-    pub(crate) fn read_at(&self, logical: &[u8], snapshot_ts: u64) -> Option<Option<Vec<u8>>> {
+    /// What the cache knows of the Catalog entry `logical` at `snapshot_ts`.
+    pub(crate) fn read_at(&self, logical: &[u8], snapshot_ts: u64) -> Cached {
         match self.0.read().expect("catalog cache poisoned").get(logical) {
-            None => Some(None),
-            Some((ts, value)) if *ts <= snapshot_ts => Some(value.clone()),
-            Some(_) => None,
+            None => Cached::Known(None),
+            Some((ts, value)) if *ts <= snapshot_ts => Cached::Known(value.clone()),
+            Some(_) => Cached::AskEngine,
         }
     }
 
@@ -165,6 +162,16 @@ impl CatalogCache {
             .expect("catalog cache poisoned")
             .retain(|_, (ts, value)| value.is_some() || *ts > horizon);
     }
+}
+
+/// What the Catalog cache knows of an entry at a Snapshot.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Cached {
+    /// The entry's value at the Snapshot: `None` if absent or deleted.
+    Known(Option<Vec<u8>>),
+    /// Its newest Version is newer than the Snapshot, so only the engine
+    /// has the answer.
+    AskEngine,
 }
 
 /// A Collection's Catalog entry.
@@ -512,15 +519,26 @@ mod tests {
     fn catalog_cache_answers_misses_and_defers_newer_entries_to_the_engine() {
         let cache = CatalogCache::default();
         let shop = keys::namespace_entry_key("shop");
-        assert_eq!(cache.read_at(&shop, 0), Some(None), "never written: absent");
+        assert_eq!(
+            cache.read_at(&shop, 0),
+            Cached::Known(None),
+            "never written: absent"
+        );
 
         let write_set = WriteSet::from([
             (shop.clone(), Some(entry("shop", 7))),
             (keys::namespace_id_key(7), Some(Vec::new())),
         ]);
         cache.record(5, &write_set);
-        assert_eq!(cache.read_at(&shop, 4), None, "newer than the Snapshot");
-        assert_eq!(cache.read_at(&shop, 5), Some(Some(entry("shop", 7))));
+        assert_eq!(
+            cache.read_at(&shop, 4),
+            Cached::AskEngine,
+            "newer than the Snapshot"
+        );
+        assert_eq!(
+            cache.read_at(&shop, 5),
+            Cached::Known(Some(entry("shop", 7)))
+        );
         assert!(!keys::is_catalog_entry_key(&keys::namespace_id_key(7)));
         assert!(keys::is_catalog_entry_key(&keys::collection_entry_key(
             7, "orders"

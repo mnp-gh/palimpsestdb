@@ -109,6 +109,104 @@ impl Slot<'_> {
         apply(&mut docs, &self.writes);
         docs
     }
+
+    /// Run a get, insert, replace or delete and check it against the
+    /// model. Returns why to stop, if the Node crashed.
+    fn operate(
+        &mut self,
+        orders: &psdb_core::CollectionPath,
+        model: &Model,
+        action: &Action,
+    ) -> Result<Option<Stop>, TestCaseError> {
+        let view = self.view(model);
+        match *action {
+            Action::Get(_, id) => {
+                let expected = view.get(&id).map(|&n| doc! { "_id": id, "n": n });
+                match self.txn.get(orders, &id.into()) {
+                    Ok(found) => prop_assert_eq!(found, expected, "get {}", id),
+                    Err(e) => return crash_or_fail("get", &e).map(Some),
+                }
+            }
+            Action::Insert(_, id, value) => {
+                let present = view.contains_key(&id);
+                match self.txn.insert(orders, doc! { "_id": id, "n": value }) {
+                    Ok(_) => {
+                        prop_assert!(!present, "insert of existing {id}");
+                        self.writes.insert(id, Some(value));
+                    }
+                    Err(Error::DuplicateId(_)) => prop_assert!(present),
+                    Err(Error::DuplicateValue(_) | Error::CollectionChanged) => {}
+                    Err(e) => return crash_or_fail("insert", &e).map(Some),
+                }
+            }
+            Action::Replace(_, id, value) => {
+                let present = view.contains_key(&id);
+                match self.txn.replace(orders, &id.into(), doc! { "n": value }) {
+                    Ok(replaced) => {
+                        prop_assert_eq!(replaced, present);
+                        if replaced {
+                            self.writes.insert(id, Some(value));
+                        }
+                    }
+                    Err(Error::DuplicateValue(_) | Error::CollectionChanged) => {}
+                    Err(e) => return crash_or_fail("replace", &e).map(Some),
+                }
+            }
+            Action::Delete(_, id) => {
+                let present = view.contains_key(&id);
+                match self.txn.delete(orders, &id.into()) {
+                    Ok(deleted) => {
+                        prop_assert_eq!(deleted, present);
+                        if deleted {
+                            self.writes.insert(id, None);
+                        }
+                    }
+                    Err(Error::CollectionChanged) => {}
+                    Err(e) => return crash_or_fail("delete", &e).map(Some),
+                }
+            }
+            _ => unreachable!("not a Transaction operation: {action:?}"),
+        }
+        Ok(None)
+    }
+
+    /// Commit and check the result against the model, recording it there
+    /// on success. `ready`: whether `orders` has a Ready unique Index.
+    /// Returns why to stop, if the Node crashed.
+    fn commit(self, model: &mut Model, ready: bool) -> Result<Option<Stop>, TestCaseError> {
+        let snapshot = self.txn.snapshot_ts();
+        let mut after = model.latest().clone();
+        apply(&mut after, &self.writes);
+        match self.txn.commit() {
+            Ok(_) if self.writes.is_empty() => {}
+            Ok(ts) => {
+                prop_assert!(ts > *model.history.keys().next_back().unwrap());
+                for (&id, value) in &self.writes {
+                    let last = model.last_write.get(&id).copied().unwrap_or(0);
+                    prop_assert!(last <= snapshot, "lost update of {id}");
+                    // A Building Index lets a duplicate of a Document it
+                    // has not reached yet commit; its build then fails
+                    // (ADR 0013).
+                    if let (true, Some(value)) = (ready, value) {
+                        let sharing = after.values().filter(|&v| v == value).count();
+                        prop_assert_eq!(sharing, 1, "duplicate n {} committed", value);
+                    }
+                    model.last_write.insert(id, ts);
+                }
+                model.history.insert(ts, after);
+                model.committed += 1;
+            }
+            Err(Error::CommitOutcomeUnknown(_)) => {
+                return Ok(Some(Stop::Crashed {
+                    in_flight: (!self.writes.is_empty()).then_some(after),
+                    ready_survives: false,
+                }));
+            }
+            Err(Error::WriteConflict | Error::CollectionChanged | Error::DuplicateValue(_)) => {}
+            Err(e) => return crash_or_fail("commit", &e).map(Some),
+        }
+        Ok(None)
+    }
 }
 
 fn apply(docs: &mut BTreeMap<i32, i32>, writes: &BTreeMap<i32, Option<i32>>) {
@@ -229,7 +327,7 @@ enum Stop {
 
 /// A crash with nothing in flight if `err` needs a reopen; otherwise a
 /// test failure.
-fn crash_or_fail(what: &str, err: Error) -> Result<Stop, TestCaseError> {
+fn crash_or_fail(what: &str, err: &Error) -> Result<Stop, TestCaseError> {
     if err.requires_reopen() {
         return Ok(Stop::Crashed {
             in_flight: None,
@@ -243,15 +341,11 @@ fn crash_or_fail(what: &str, err: Error) -> Result<Stop, TestCaseError> {
 fn ready_index(node: &Node<Engine>) -> Result<Result<bool, Stop>, TestCaseError> {
     match node.list_indexes(&collection("shop.orders")) {
         Ok(indexes) => Ok(Ok(indexes.iter().any(|i| i.state == IndexState::Ready))),
-        Err(e) => crash_or_fail("list indexes", e).map(Err),
+        Err(e) => crash_or_fail("list indexes", &e).map(Err),
     }
 }
 
 /// Run `actions` until they run out or the process crashes.
-#[expect(
-    clippy::too_many_lines,
-    reason = "shortcut: one long step, split when it next grows"
-)]
 fn run(
     node: &Node<Engine>,
     disk: &SimDisk,
@@ -276,96 +370,21 @@ fn run(
             Action::Begin(s) => {
                 slots[s].get_or_insert_with(begin);
             }
-            Action::Get(s, id) => {
+            Action::Get(s, _)
+            | Action::Insert(s, ..)
+            | Action::Replace(s, ..)
+            | Action::Delete(s, _) => {
                 let slot = slots[s].get_or_insert_with(begin);
-                let expected = slot
-                    .view(model)
-                    .get(&id)
-                    .map(|&n| doc! { "_id": id, "n": n });
-                match slot.txn.get(&orders, &id.into()) {
-                    Ok(found) => prop_assert_eq!(found, expected, "get {}", id),
-                    Err(e) => return crash_or_fail("get", e),
-                }
-            }
-            Action::Insert(s, id, value) => {
-                let slot = slots[s].get_or_insert_with(begin);
-                let present = slot.view(model).contains_key(&id);
-                match slot.txn.insert(&orders, doc! { "_id": id, "n": value }) {
-                    Ok(_) => {
-                        prop_assert!(!present, "insert of existing {id}");
-                        slot.writes.insert(id, Some(value));
-                    }
-                    Err(Error::DuplicateId(_)) => prop_assert!(present),
-                    Err(Error::DuplicateValue(_) | Error::CollectionChanged) => {}
-                    Err(e) => return crash_or_fail("insert", e),
-                }
-            }
-            Action::Replace(s, id, value) => {
-                let slot = slots[s].get_or_insert_with(begin);
-                let present = slot.view(model).contains_key(&id);
-                match slot.txn.replace(&orders, &id.into(), doc! { "n": value }) {
-                    Ok(replaced) => {
-                        prop_assert_eq!(replaced, present);
-                        if replaced {
-                            slot.writes.insert(id, Some(value));
-                        }
-                    }
-                    Err(Error::DuplicateValue(_) | Error::CollectionChanged) => {}
-                    Err(e) => return crash_or_fail("replace", e),
-                }
-            }
-            Action::Delete(s, id) => {
-                let slot = slots[s].get_or_insert_with(begin);
-                let present = slot.view(model).contains_key(&id);
-                match slot.txn.delete(&orders, &id.into()) {
-                    Ok(deleted) => {
-                        prop_assert_eq!(deleted, present);
-                        if deleted {
-                            slot.writes.insert(id, None);
-                        }
-                    }
-                    Err(Error::CollectionChanged) => {}
-                    Err(e) => return crash_or_fail("delete", e),
+                if let Some(stop) = slot.operate(&orders, model, &action)? {
+                    return Ok(stop);
                 }
             }
             Action::Commit(s) => {
                 let Some(slot) = slots[s].take() else {
                     continue;
                 };
-                let snapshot = slot.txn.snapshot_ts();
-                let mut after = model.latest().clone();
-                apply(&mut after, &slot.writes);
-                match slot.txn.commit() {
-                    Ok(ts) => {
-                        if slot.writes.is_empty() {
-                            continue;
-                        }
-                        prop_assert!(ts > *model.history.keys().next_back().unwrap());
-                        for (&id, value) in &slot.writes {
-                            let last = model.last_write.get(&id).copied().unwrap_or(0);
-                            prop_assert!(last <= snapshot, "lost update of {id}");
-                            // A Building Index lets a duplicate of a Document it
-                            // has not reached yet commit; its build then fails
-                            // (ADR 0013).
-                            if let (true, Some(value)) = (ready, value) {
-                                let sharing = after.values().filter(|&v| v == value).count();
-                                prop_assert_eq!(sharing, 1, "duplicate n {} committed", value);
-                            }
-                            model.last_write.insert(id, ts);
-                        }
-                        model.history.insert(ts, after);
-                        model.committed += 1;
-                    }
-                    Err(Error::CommitOutcomeUnknown(_)) => {
-                        return Ok(Stop::Crashed {
-                            in_flight: (!slot.writes.is_empty()).then_some(after),
-                            ready_survives: false,
-                        });
-                    }
-                    Err(
-                        Error::WriteConflict | Error::CollectionChanged | Error::DuplicateValue(_),
-                    ) => {}
-                    Err(e) => return crash_or_fail("commit", e),
+                if let Some(stop) = slot.commit(model, ready)? {
+                    return Ok(stop);
                 }
             }
             Action::Abort(s) => slots[s] = None,
@@ -377,7 +396,7 @@ fn run(
                     // One Document per chunk, so commits land between chunks.
                     Ok(b) => build = Some(b.with_chunk_documents(1)),
                     Err(Error::IndexExists { .. }) => {}
-                    Err(e) => return crash_or_fail("start build", e),
+                    Err(e) => return crash_or_fail("start build", &e),
                 }
             }
             Action::BuildStep => {
@@ -387,12 +406,12 @@ fn run(
                     Ok(true) | Err(Error::DuplicateValue(_) | Error::IndexBuildCancelled) => {
                         build = None;
                     }
-                    Err(e) => return crash_or_fail("build step", e),
+                    Err(e) => return crash_or_fail("build step", &e),
                 }
             }
             Action::DropIndex => match node.drop_index(&orders, &n_path) {
                 Ok(()) | Err(Error::NoSuchIndex { .. }) => {}
-                Err(e) => return crash_or_fail("drop index", e),
+                Err(e) => return crash_or_fail("drop index", &e),
             },
             Action::StartGc => {
                 if gc.is_none() {

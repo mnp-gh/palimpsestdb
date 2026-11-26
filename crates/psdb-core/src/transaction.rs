@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use bson::{Bson, Document, RawDocument};
 use psdb_storage::{KeyRange, StorageEngine};
 
-use crate::catalog::CollectionEntry;
+use crate::catalog::{Cached, CollectionEntry};
 use crate::collection_path::CollectionPath;
 use crate::document;
 use crate::error::{Error, Result};
@@ -101,7 +101,8 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
             return Ok(own.clone());
         }
         if keys::is_catalog_entry_key(logical)
-            && let Some(cached) = self.node.catalog_cache.read_at(logical, self.snapshot_ts)
+            && let Cached::Known(cached) =
+                self.node.catalog_cache.read_at(logical, self.snapshot_ts)
         {
             // Debug builds check the cache against the engine; release builds skip the read.
             debug_assert_eq!(

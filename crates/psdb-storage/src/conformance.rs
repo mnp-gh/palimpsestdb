@@ -246,15 +246,14 @@ impl XorShift {
         self.0
     }
 
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
+    fn below(&mut self, n: usize) -> usize {
+        usize::try_from(self.next() % n as u64).expect("less than n, so it fits")
     }
 
-    #[expect(clippy::cast_possible_truncation, reason = "values are below 4")]
     fn key(&mut self) -> Vec<u8> {
         // A tiny alphabet with the edge bytes makes collisions and prefixes common.
         const ALPHABET: [u8; 4] = [0x00, b'a', b'b', 0xFF];
-        let len = self.below(4) as usize;
-        (0..len).map(|_| ALPHABET[self.below(4) as usize]).collect()
+        let len = self.below(4);
+        (0..len).map(|_| ALPHABET[self.below(4)]).collect()
     }
 }

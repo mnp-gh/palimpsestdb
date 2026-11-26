@@ -35,10 +35,6 @@ return_self_not_must_use = "allow"
 missing_errors_doc = "allow"
 # Every Mutex lock can panic on poisoning; documenting each adds nothing.
 missing_panics_doc = "allow"
-# Fights `map_err(message)` and `doc!` arguments, which are owned by nature.
-needless_pass_by_value = "allow"
-# `use Enum::*` inside one function keeps a big match readable.
-enum_glob_use = "allow"
 # Performance lints from nursery (the perf group is already on by default;
 # see nnethercote.github.io/perf-book). Not significant_drop_tightening: lock
 # scopes here are correctness decisions.
