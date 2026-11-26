@@ -1,5 +1,5 @@
-# cargo-mutants, run by hand when a change adds a test (docs/CONVENTIONS.md):
-# `cargo mutants --in-diff <(git diff origin/main...)`.
+# cargo-mutants, run through scripts/mutants.sh before a pull request that
+# changes non-test code (docs/CONVENTIONS.md).
 # Each exclusion says why no test should catch it.
 
 exclude_globs = [
