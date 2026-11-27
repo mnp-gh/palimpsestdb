@@ -164,10 +164,12 @@ impl<E: StorageEngine> GcPass<'_, E> {
         assert!(!self.done, "stepped a finished Garbage Collection pass");
         let node = self.node;
         let mut batch = WriteBatch::new();
+        let mut visited = 0;
         let mut next_start = None;
         // A fresh iterator per step, so none outlives it (ADR 0018).
-        for (visited, item) in (1..).zip(node.engine.scan(&self.range)) {
+        for item in node.engine.scan(&self.range) {
             let (key, value) = item?;
+            visited += 1;
             if self.visit(&key, &value, visited, &mut batch)?.is_break() {
                 next_start = Some(key);
                 break;
