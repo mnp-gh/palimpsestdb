@@ -1,8 +1,8 @@
-# v0.4.5: Checkpoint
+# v0.4.6: Checkpoint
 
 Status: ready-for-agent
 
-An explicit Checkpoint cuts WAL Records the Storage Engine no longer needs, so the WAL stops growing without bound and opens read less. Needs v0.4.4. Design: [ADR 0015](../../docs/adr/0015-wal-is-the-authority-engine-may-lag.md); staged delivery in [ADR 0004](../../docs/adr/0004-database-layer-owns-wal.md).
+An explicit Checkpoint cuts WAL Records the Storage Engine no longer needs, so the WAL stops growing without bound and opens read less. Needs v0.4.5. Design: [ADR 0015](../../docs/adr/0015-wal-is-the-authority-engine-may-lag.md); staged delivery in [ADR 0004](../../docs/adr/0004-database-layer-owns-wal.md).
 
 ## Out of scope
 

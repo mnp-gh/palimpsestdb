@@ -1,12 +1,12 @@
-# v0.4.4: Persistent engine
+# v0.4.5: Persistent engine
 
 Status: ready-for-agent
 
-A `fjall` Storage Engine, so data outlives the process. Needs v0.4.2 (otherwise a reopened engine cannot be opened). Design: [ADR 0015](../../docs/adr/0015-wal-is-the-authority-engine-may-lag.md).
+A `fjall` Storage Engine, so data outlives the process. Needs v0.4.2 (otherwise a reopened engine cannot be opened) and v0.4.4 (its `scan` is a pull iterator). Design: [ADR 0015](../../docs/adr/0015-wal-is-the-authority-engine-may-lag.md).
 
 ## Out of scope
 
-- WAL trimming (v0.4.5); pull iterators (v0.4.6); zstd.
+- WAL trimming (v0.4.6); zstd.
 - Testing power loss (data the OS had not yet written to disk); v1.0 Hardening.
 
 ## Engine
@@ -15,6 +15,7 @@ A `fjall` Storage Engine, so data outlives the process. Needs v0.4.2 (otherwise 
 - One partition holds every key; the key encoding already separates Namespaces, Collections and Indexes (ADR 0008).
 - LZ4 block compression. Check the feature name in the current `fjall` release.
 - `write_batch` is one atomic `fjall` batch written to the journal without sync; `flush` syncs fully. Satisfies the crash clauses: whole batches, surviving batches a prefix.
+- `scan`'s `Scan` type wraps `fjall`'s range iterator, mapping errors to `StorageError` and ending after the first one. Its frozen view satisfies the loose-view contract (ADR 0018).
 
 ## Opening a Node
 

@@ -11,9 +11,9 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | v0.4.1 | Catalog from engine | Done |
 | v0.4.2 | Resume Recovery | Done |
 | v0.4.3 | Streaming find | Done |
-| v0.4.4 | Persistent engine | Planned |
-| v0.4.5 | Checkpoint | Planned |
-| v0.4.6 | Pull iterators | Planned |
+| v0.4.4 | Pull iterators | Planned |
+| v0.4.5 | Persistent engine | Planned |
+| v0.4.6 | Checkpoint | Planned |
 | v0.4.7 | Unordered find | Planned |
 | v0.5 | Serializable | Planned |
 | v0.6 | Server | Planned |
@@ -84,23 +84,23 @@ A single-threaded library with no network, no durability and no garbage collecti
 - `Transaction::find` and Document and Index range reads return iterators built from chunked rescans at the Snapshot (chunk limits in Documents and bytes in `Limits`); the Storage Engine trait is unchanged ([ADR 0016](./adr/0016-streaming-reads-rescan-in-chunks.md)). Results stay in Document ID order; Index plans buffer candidate keys, not Documents
 - Only an explicit Transaction streams; `Node::find` (autocommit) still returns a `Vec`, as PostgreSQL's JDBC driver streams only outside autocommit. Catalog listings are not streamed
 
-## v0.4.4: Persistent engine
+## v0.4.4: Pull iterators
+
+- The Storage Engine's `scan` returns an iterator the caller pulls from, promising only a loose view (ascending keys; keys not written meanwhile exactly once; no promise for keys written meanwhile), so streaming reads stop rescanning in chunks and the chunk limits go ([ADR 0018](./adr/0018-storage-engine-scans-are-pull-iterators.md), superseding ADR 0016)
+- `MemoryEngine` copies a few entries at a time under its read lock and re-seeks, holding no lock between pulls
+
+## v0.4.5: Persistent engine
 
 - `fjall` Storage Engine in its own crate, one partition, LZ4 block compression; `write_batch` writes the journal unsynced, `flush` syncs
 - `Node::open(dir, open_engine)`: the Database Layer puts the WAL and the engine in fixed subdirectories and is handed a function that opens the engine, so an engine opens only beside its own WAL; the CLI's data directory runs on `fjall`
 - Conformance suite gains reopen checks (`run_reopen`) next to `run_all`; a `kill -9` test checks `fjall` keeps whole batches and a prefix after a process crash
 
-## v0.4.5: Checkpoint
+## v0.4.6: Checkpoint
 
 - Explicit `Node::checkpoint()`: under the commit lock, flush the engine, then replace the WAL with a header recording `trimmed_up_to` (new file, sync, rename, directory sync); WAL format version bumps ([ADR 0015](./adr/0015-wal-is-the-authority-engine-may-lag.md))
 - Only an engine whose `is_durable()` is true may be checkpointed (the in-memory engine is not); in the simulator a flush raises the shortest prefix a crash may keep
 - A poisoned Node refuses to Checkpoint; the CLI gains `checkpoint`
 - Running Checkpoints automatically waits for v0.6
-
-## v0.4.6: Pull iterators
-
-- The Storage Engine's `scan` returns an iterator the caller pulls from, promising only a loose view (ascending keys; keys not written meanwhile exactly once), so streaming reads stop rescanning in chunks and the chunk limits go ([ADR 0018](./adr/0018-storage-engine-scans-are-pull-iterators.md), superseding ADR 0016)
-- `MemoryEngine` copies a few entries at a time under its read lock and re-seeks, holding no lock between pulls
 
 ## v0.4.7: Unordered find
 

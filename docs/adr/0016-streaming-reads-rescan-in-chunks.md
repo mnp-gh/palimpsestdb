@@ -1,6 +1,6 @@
 # Streaming reads rescan the engine in chunks
 
-Superseded by [ADR 0018](./0018-storage-engine-scans-are-pull-iterators.md) from v0.4.6.
+Superseded by [ADR 0018](./0018-storage-engine-scans-are-pull-iterators.md) from v0.4.4.
 
 `Transaction::find` returns an iterator, but the Storage Engine trait keeps its push-style `scan(range, visit)`. Each chunk is one `scan` at the Transaction's Snapshot that stops after a set number of Documents or bytes; the next chunk starts just past the last Document's Versions. A Snapshot's Versions cannot change while it is registered, so rescanning from a resume key returns exactly what one long scan would.
 

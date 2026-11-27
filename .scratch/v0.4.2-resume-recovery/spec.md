@@ -6,7 +6,7 @@ Recovery brings an engine that already holds data level with the WAL by replayin
 
 ## Out of scope
 
-- A persistent engine (v0.4.4); trimming the WAL (v0.4.5).
+- A persistent engine (v0.4.5); trimming the WAL (v0.4.6).
 - Streaming scans (v0.4.3).
 
 ## Recovery
