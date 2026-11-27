@@ -12,4 +12,5 @@ Supersedes [ADR 0016](./0016-streaming-reads-rescan-in-chunks.md). From v0.4.4 t
 
 - The in-memory engine copies a few entries at a time under its read lock and re-seeks past the last key returned, as InnoDB's cursor restores its position after releasing a latch.
 - An iterator kept open in `fjall` pins its files, as a registered Snapshot already holds back Garbage Collection.
+- The argument needs a fixed Snapshot. A read whose timestamp moves, like an Index build reading each chunk at the newest Commit Timestamp, opens a fresh iterator per chunk: one kept open could return a Version that a writer replaced between chunks, stale but still not "written meanwhile" from the build's point of view.
 - Only an explicit Transaction streams; `Node::find` collects into a `Vec` because its Transaction ends before it returns (as PostgreSQL's JDBC driver streams only outside autocommit). A cursor that owns its Transaction can come with the v0.6 server.

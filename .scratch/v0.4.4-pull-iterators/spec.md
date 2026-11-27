@@ -24,7 +24,7 @@ The Storage Engine's `scan` returns an iterator the caller pulls from, instead o
 
 - `mvcc::scan_range_at` returns an iterator of visible `(logical key, value)` pairs at a Snapshot, built on the engine iterator.
 - The chunked `Scan` in `transaction.rs` becomes a merge of that iterator with the Write Set's entries in the range (own writes overlaid, as today). `Limits::scan_chunk_keys`, `scan_chunk_bytes` and `with_scan_chunk` go.
-- Other `scan` callers (GC, Catalog cache load, `mvcc` helpers, Index build, tests) become loops over the iterator. Garbage Collection keeps its shape: each `GcPass::step` opens a fresh iterator at `next_start` and deletes one batch, so under `fjall` no iterator outlives a step. An Index build still commits per chunk under the commit lock (ADR 0013); its chunk is a count of Documents taken from one engine iterator kept open for the whole build, across the commit-lock releases between chunks (under `fjall` this pins its files for the build, as the build's Snapshot already holds back GC).
+- Other `scan` callers (GC, Catalog cache load, `mvcc` helpers, Index build, tests) become loops over the iterator. Garbage Collection keeps its shape: each `GcPass::step` opens a fresh iterator at `next_start` and deletes one batch, so under `fjall` no iterator outlives a step. An Index build still commits per chunk under the commit lock (ADR 0013), and opens a fresh engine iterator per chunk, like GC. (Changed in implementation: the spec first kept one iterator open for the whole build, but each chunk reads at a newer Commit Timestamp, so the loose view could hand it a Version a writer replaced between chunks, leaving a stale Index entry.)
 - `Node::find` and other autocommit reads still collect into a `Vec`.
 
 ## Tests

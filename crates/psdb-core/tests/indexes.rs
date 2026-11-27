@@ -1158,6 +1158,54 @@ fn states(node: &Node<MemoryEngine>) -> Vec<IndexState> {
 }
 
 #[test]
+fn a_build_chunk_reads_documents_replaced_after_the_previous_chunk() {
+    let node = unindexed();
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), true)
+        .unwrap()
+        .with_chunk_documents(10);
+    assert!(!build.step().unwrap());
+    // A Document of a later chunk, replaced between chunks: its chunk must
+    // index the new value, not a Version read before the replace.
+    node.replace(
+        &collection("shop.orders"),
+        &Bson::Int32(20),
+        doc! { "n": 9999 },
+    )
+    .unwrap();
+    while !build.step().unwrap() {}
+    node.insert(&collection("shop.orders"), doc! { "_id": 5000, "n": 20 })
+        .unwrap();
+}
+
+#[test]
+fn a_build_chunk_stops_at_16_mib() {
+    let node = common::shop();
+    node.set_field_type(
+        &collection("shop.orders"),
+        &field_path("n"),
+        field(FieldType::Int, false),
+    )
+    .unwrap();
+    // Two of these fit in 16 MiB, three do not.
+    for i in 0..3 {
+        node.insert(
+            &collection("shop.orders"),
+            doc! { "_id": i, "n": i, "pad": "x".repeat(6 << 20) },
+        )
+        .unwrap();
+    }
+    let mut build = node
+        .start_index_build(&collection("shop.orders"), &field_path("n"), false)
+        .unwrap();
+    assert!(
+        !build.step().unwrap(),
+        "the third Document is left for a second chunk"
+    );
+    assert!(build.step().unwrap());
+}
+
+#[test]
 fn queries_ignore_an_index_until_its_build_finishes() {
     let node = unindexed();
     let mut build = node

@@ -326,3 +326,31 @@ fn find_does_not_see_a_commit_between_chunks() {
     docs.extend(found.map(Result::unwrap));
     assert_eq!(ids(&docs), [0, 1, 2, 3, 4, 5]);
 }
+
+#[test]
+fn find_stream_ignores_commits_and_gc_between_next_calls() {
+    let node = chunked_shop(2, usize::MAX);
+    let orders = collection("shop.orders");
+    // More Documents than the engine copies per read lock, each with an
+    // old Version for Garbage Collection to remove.
+    for id in 0..200 {
+        node.insert(&orders, doc! { "_id": id, "v": -1 }).unwrap();
+        node.replace(&orders, &Bson::Int32(id), doc! { "v": 0 })
+            .unwrap();
+    }
+    let mut txn = node.begin_transaction();
+    let mut docs = Vec::new();
+    for found in txn.find(&orders, &doc! {}).unwrap() {
+        let found = found.unwrap();
+        let id = found.get_i32("_id").unwrap();
+        // Behind and ahead of the stream, plus a Document it never saw.
+        node.replace(&orders, &Bson::Int32(id / 2), doc! { "v": 1 })
+            .unwrap();
+        node.delete(&orders, &Bson::Int32((id + 7) % 200)).unwrap();
+        node.insert(&orders, doc! { "_id": 1000 + id }).unwrap();
+        node.collect_garbage().unwrap();
+        docs.push(found);
+    }
+    assert_eq!(ids(&docs), (0..200).collect::<Vec<_>>());
+    assert!(docs.iter().all(|d| d.get_i32("v").unwrap() == 0));
+}
