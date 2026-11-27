@@ -1,6 +1,6 @@
 # v0.4.4: Pull iterators
 
-Status: ready-for-agent
+Status: resolved
 
 The Storage Engine's `scan` returns an iterator the caller pulls from, instead of calling a visitor, so a streaming read no longer rescans the engine in chunks. Comes before the `fjall` engine (v0.4.5), so that engine is written once against this trait. Design: [ADR 0018](../../docs/adr/0018-storage-engine-scans-are-pull-iterators.md), superseding ADR 0016.
 

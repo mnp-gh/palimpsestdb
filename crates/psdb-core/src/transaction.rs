@@ -202,14 +202,42 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     }
 
     /// Every live key and value in `range`: the Snapshot with own writes
-    /// overlaid, in key order, read from the engine a chunk at a time
-    /// (ADR 0016).
+    /// overlaid, in key order, pulled from one engine iterator (ADR 0018).
     pub(crate) fn scan_range(
         &self,
         range: &KeyRange,
     ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
-        let mut scan = Scan::new(range);
-        std::iter::from_fn(move || scan.next(self))
+        let mut snapshot =
+            mvcc::scan_range_at(&self.node.engine, range, self.snapshot_ts).peekable();
+        let range = range.clone();
+        let mut own = self
+            .write_set
+            .range(range.start.clone()..)
+            .take_while(move |(k, _)| range.contains(k))
+            .peekable();
+        std::iter::from_fn(move || {
+            loop {
+                // Which side holds the smaller key next: the Snapshot's or
+                // the Write Set's.
+                let order = match (snapshot.peek(), own.peek()) {
+                    (None, None) => return None,
+                    (Some(Err(_)), _) | (Some(Ok(_)), None) => return snapshot.next(),
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(Ok((key, _))), Some((own_key, _))) => key.cmp(own_key),
+                };
+                if order.is_lt() {
+                    return snapshot.next();
+                }
+                if order.is_eq() {
+                    // The own write replaces the Snapshot's value.
+                    snapshot.next();
+                }
+                // An own delete yields nothing; the loop moves to the next key.
+                if let Some((key, Some(value))) = own.next() {
+                    return Some(Ok((key.clone(), value.clone())));
+                }
+            }
+        })
     }
 
     /// Insert a Document. If it has no `_id`, a UUIDv7 is generated.
@@ -530,83 +558,6 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
 impl<E: StorageEngine> Drop for Transaction<'_, E> {
     fn drop(&mut self) {
         self.node.unregister_snapshot(self.snapshot_ts);
-    }
-}
-
-/// Where a chunked scan of a key range stands (ADR 0016). It holds no
-/// borrow, so each step is handed the Transaction it reads through.
-struct Scan {
-    /// Where the next chunk starts, or `None` once the range is done or a
-    /// chunk failed.
-    next_start: Option<Vec<u8>>,
-    end: Option<Vec<u8>>,
-    chunk: std::collections::btree_map::IntoIter<Vec<u8>, Vec<u8>>,
-}
-
-impl Scan {
-    fn new(range: &KeyRange) -> Self {
-        Self {
-            next_start: Some(range.start.clone()),
-            end: range.end.clone(),
-            chunk: BTreeMap::new().into_iter(),
-        }
-    }
-
-    /// The next live key and value. After the range ends or an error,
-    /// `None`.
-    fn next<E: StorageEngine>(
-        &mut self,
-        txn: &Transaction<'_, E>,
-    ) -> Option<Result<(Vec<u8>, Vec<u8>)>> {
-        loop {
-            if let Some(item) = self.chunk.next() {
-                return Some(Ok(item));
-            }
-            let start = self.next_start.take()?;
-            let range = KeyRange {
-                start,
-                end: self.end.clone(),
-            };
-            if let Err(e) = self.read_chunk(txn, range) {
-                return Some(Err(e));
-            }
-        }
-    }
-
-    /// Read the next chunk of `range` at the Snapshot with own writes
-    /// overlaid, and set where the chunk after it starts.
-    fn read_chunk<E: StorageEngine>(
-        &mut self,
-        txn: &Transaction<'_, E>,
-        range: KeyRange,
-    ) -> Result<()> {
-        let limits = &txn.node.limits;
-        let mut live = BTreeMap::new();
-        let mut bytes = 0;
-        let mut last = None;
-        for item in mvcc::scan_range_at(&txn.node.engine, &range, txn.snapshot_ts) {
-            let (key, value) = item?;
-            bytes += value.len();
-            live.insert(key.clone(), value);
-            if live.len() >= limits.scan_chunk_keys || bytes >= limits.scan_chunk_bytes {
-                last = Some(key);
-                break;
-            }
-        }
-        // The part of `range` this chunk covers, for overlaying own writes.
-        let covered = match last {
-            None => range,
-            Some(last) => {
-                // Just past the oldest possible Version of `last`; keys are
-                // self-delimiting (ADR 0008), so no other logical key falls between.
-                let mut resume = keys::physical_key(&last, 0);
-                resume.push(0);
-                self.next_start = Some(resume.clone());
-                KeyRange::new(range.start, resume)
-            }
-        };
-        self.chunk = txn.overlay_own_writes(&covered, live).into_iter();
-        Ok(())
     }
 }
 
