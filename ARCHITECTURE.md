@@ -11,7 +11,7 @@ psdb-cli ──────► psdb-core ──────► psdb-storage ◄�
 (the shell)      (Database Layer)  (StorageEngine trait)  (BTreeMap engine)
 ```
 
-- **`psdb-storage`**: the `StorageEngine` trait (ordered byte keys to byte values, atomic batches, range scans) and its conformance suite. It knows nothing about Documents, Versions or Transactions (ADR 0001).
+- **`psdb-storage`**: the `StorageEngine` trait (ordered byte keys to byte values, atomic batches, range scans as pull iterators) and its conformance suite. It knows nothing about Documents, Versions or Transactions (ADR 0001).
 - **`psdb-storage-memory`**: the only engine until v0.9. Nothing it holds survives a restart; the WAL rebuilds it.
 - **`psdb-core`**: the Database Layer, everything that gives bytes meaning. Generic over the engine: `Node<E: StorageEngine>`.
 - **`psdb-cli`**: the `psdb` shell, the only binary shipped. It picks the engine.
@@ -83,7 +83,7 @@ So everything a Collection owns sits under one prefix, `namespace_id ‖ collect
 **An Index build** (`Node::create_index`) takes the commit lock one chunk at a time (ADR 0013):
 
 1. An ordinary Transaction writes the Index's Catalog entry as Building, taking its ID from `nextIndexId` in the Collection's entry. From then on `write_document` maintains it like any Index, but `index::plan` uses only Ready ones. A writer whose Snapshot predates this commit read the old entry, so it aborts with Collection Changed.
-2. Each `IndexBuild::step` takes the commit lock and re-reads the Collection's entries at the newest Commit Timestamp. It stops with Index Build Cancelled unless the Namespace, Collection and Index IDs still match and the Index is still Building. It then reads the next chunk (at most 1024 Documents or 16 MiB) at that timestamp and commits its entries through `commit_under_lock`, outside the Write Set cap. A unique Index fails with Duplicate Value only on an entry naming another Document, since a writer may have indexed this one already.
+2. Each `IndexBuild::step` takes the commit lock and re-reads the Collection's entries at the newest Commit Timestamp. It stops with Index Build Cancelled unless the Namespace, Collection and Index IDs still match and the Index is still Building. It then reads the next chunk (at most 1024 Documents or 16 MiB) at that timestamp, from an engine iterator opened for that chunk (one kept open could return a Version a writer replaced since: ADR 0018), and commits its entries through `commit_under_lock`, outside the Write Set cap. A unique Index fails with Duplicate Value only on an entry naming another Document, since a writer may have indexed this one already.
 3. After the last chunk, the same step rewrites only this Index's entry as Ready and commits. On any failure but cancellation it instead writes a Tombstone on that entry.
 4. Between steps, `create_index` yields, so waiting writers get the lock.
 

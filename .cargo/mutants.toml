@@ -12,4 +12,10 @@ exclude_re = [
     # Equivalent: without this arm, `(Null, Null)` falls through to
     # `_ if a == b`, which returns the same `Equal`.
     'delete match arm \(Bson::Null, Bson::Null\) in compare',
+    # Equivalent: a scan not marked done after a short copy makes one more
+    # copy, finds nothing and ends the same.
+    'replace < with > in MemoryScan<.*>::refill',
+    # Compiled only with the `testing` feature, which psdb-storage's own
+    # tests leave off; where it is on, `Default` does not compile.
+    'replace <impl StorageEngine for std::sync::Arc<E>>::scan',
 ]

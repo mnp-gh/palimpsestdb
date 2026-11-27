@@ -2,7 +2,6 @@
 //! wins Snapshot Isolation at commit.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
 
 use bson::{Bson, Document, RawDocument};
@@ -149,16 +148,14 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         if own.any(|(_, v)| v.is_some()) {
             return Ok(true);
         }
-        let mut found = false;
-        mvcc::scan_range_at(&self.node.engine, range, self.snapshot_ts, &mut |key, _| {
+        for item in mvcc::scan_range_at(&self.node.engine, range, self.snapshot_ts) {
+            let (key, _) = item?;
             // Skip a value this Transaction deleted.
-            if self.write_set.get(key) == Some(&None) {
-                return ControlFlow::Continue(());
+            if self.write_set.get(&key) != Some(&None) {
+                return Ok(true);
             }
-            found = true;
-            ControlFlow::Break(())
-        })?;
-        Ok(found)
+        }
+        Ok(false)
     }
 
     /// Every live value under `prefix`: the Snapshot with own writes
@@ -182,17 +179,7 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
 
     /// Every live value in `range` at the Snapshot, read from the engine.
     fn scan_snapshot(&self, range: &KeyRange) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-        let mut live = BTreeMap::new();
-        mvcc::scan_range_at(
-            &self.node.engine,
-            range,
-            self.snapshot_ts,
-            &mut |key, value| {
-                live.insert(key.to_vec(), value);
-                ControlFlow::Continue(())
-            },
-        )?;
-        Ok(live)
+        mvcc::scan_range_at(&self.node.engine, range, self.snapshot_ts).collect()
     }
 
     /// `live` with this Transaction's writes in `range` laid over it.
@@ -597,20 +584,15 @@ impl Scan {
         let mut live = BTreeMap::new();
         let mut bytes = 0;
         let mut last = None;
-        mvcc::scan_range_at(
-            &txn.node.engine,
-            &range,
-            txn.snapshot_ts,
-            &mut |key, value| {
-                bytes += value.len();
-                live.insert(key.to_vec(), value);
-                if live.len() >= limits.scan_chunk_keys || bytes >= limits.scan_chunk_bytes {
-                    last = Some(key.to_vec());
-                    return ControlFlow::Break(());
-                }
-                ControlFlow::Continue(())
-            },
-        )?;
+        for item in mvcc::scan_range_at(&txn.node.engine, &range, txn.snapshot_ts) {
+            let (key, value) = item?;
+            bytes += value.len();
+            live.insert(key.clone(), value);
+            if live.len() >= limits.scan_chunk_keys || bytes >= limits.scan_chunk_bytes {
+                last = Some(key);
+                break;
+            }
+        }
         // The part of `range` this chunk covers, for overlaying own writes.
         let covered = match last {
             None => range,

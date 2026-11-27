@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::RwLock;
 
-use psdb_storage::{KeyRange, Result, ScanVisitor, StorageEngine, WriteBatch, WriteOp};
+use psdb_storage::{KeyRange, Result, StorageEngine, WriteBatch, WriteOp};
+
+/// The entries a [`MemoryScan`] copies per read lock.
+const SCAN_BUFFER: usize = 64;
 
 /// An in-memory Storage Engine.
 ///
@@ -30,20 +33,16 @@ impl StorageEngine for MemoryEngine {
         Ok(self.map.read().expect("lock poisoned").get(key).cloned())
     }
 
-    fn scan(&self, range: &KeyRange, visit: &mut ScanVisitor<'_>) -> Result<()> {
-        let map = self.map.read().expect("lock poisoned");
-        let end = match &range.end {
-            Some(end) if *end <= range.start => return Ok(()),
-            Some(end) => Bound::Excluded(end.as_slice()),
-            None => Bound::Unbounded,
-        };
-        let bounds = (Bound::Included(range.start.as_slice()), end);
-        for (key, value) in map.range::<[u8], _>(bounds) {
-            if visit(key, value).is_break() {
-                break;
-            }
+    type Scan<'a> = MemoryScan<'a>;
+
+    fn scan(&self, range: &KeyRange) -> MemoryScan<'_> {
+        MemoryScan {
+            engine: self,
+            from: Bound::Included(range.start.clone()),
+            end: range.end.clone(),
+            buffer: Vec::new().into_iter(),
+            done: range.end.as_ref().is_some_and(|end| *end <= range.start),
         }
-        Ok(())
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -63,6 +62,54 @@ impl StorageEngine for MemoryEngine {
 
     fn flush(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// The iterator [`MemoryEngine::scan`] returns. It copies a few entries
+/// at a time under the read lock and holds no lock between `next` calls,
+/// so a caller that pauses never blocks writers (ADR 0018).
+#[derive(Debug)]
+pub struct MemoryScan<'a> {
+    engine: &'a MemoryEngine,
+    /// Where the next copy starts: the range's start, then just past the
+    /// last key copied.
+    from: Bound<Vec<u8>>,
+    end: Option<Vec<u8>>,
+    buffer: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    /// Whether the last copy reached the end of the range.
+    done: bool,
+}
+
+impl Iterator for MemoryScan<'_> {
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buffer.len() == 0 && !self.done {
+            self.refill();
+        }
+        self.buffer.next().map(Ok)
+    }
+}
+
+impl MemoryScan<'_> {
+    /// Copy the next [`SCAN_BUFFER`] entries under the read lock.
+    fn refill(&mut self) {
+        let map = self.engine.map.read().expect("lock poisoned");
+        let end = self
+            .end
+            .as_deref()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let from = self.from.as_ref().map(Vec::as_slice);
+        let copied: Vec<_> = map
+            .range::<[u8], _>((from, end))
+            .take(SCAN_BUFFER)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        self.done = copied.len() < SCAN_BUFFER;
+        if let Some((last, _)) = copied.last() {
+            self.from = Bound::Excluded(last.clone());
+        }
+        self.buffer = copied.into_iter();
     }
 }
 

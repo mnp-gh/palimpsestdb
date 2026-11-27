@@ -33,7 +33,6 @@
 //! Collection entry to move the counter, so concurrent creates conflict.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::ControlFlow;
 use std::sync::RwLock;
 
 use bson::{Bson, Document, doc};
@@ -63,31 +62,20 @@ impl CatalogCache {
     /// included.
     pub(crate) fn load<E: StorageEngine>(engine: &E) -> Result<Self> {
         let mut cached = BTreeMap::new();
-        let mut failure = None;
         let system = KeyRange::prefix(&keys::SYSTEM_NAMESPACE.to_be_bytes());
-        engine.scan(&system, &mut |key, value| {
+        for item in engine.scan(&system) {
+            let (key, value) = item?;
             // The check reads only the first 8 bytes, so it works on physical keys.
-            if !keys::is_catalog_entry_key(key) {
-                return ControlFlow::Continue(());
+            if !keys::is_catalog_entry_key(&key) {
+                continue;
             }
-            let version = keys::split_physical(key)
-                .and_then(|(logical, ts)| Ok((logical.to_vec(), (ts, mvcc::decode_value(value)?))));
-            match version {
-                // Versions are newest first: keep the first of each key.
-                Ok((logical, version)) => {
-                    cached.entry(logical).or_insert(version);
-                    ControlFlow::Continue(())
-                }
-                Err(e) => {
-                    failure = Some(e);
-                    ControlFlow::Break(())
-                }
+            let (logical, ts) = keys::split_physical(&key)?;
+            // Versions are newest first: keep the first of each key.
+            if !cached.contains_key(logical) {
+                cached.insert(logical.to_vec(), (ts, mvcc::decode_value(&value)?));
             }
-        })?;
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(Self(RwLock::new(cached))),
         }
+        Ok(Self(RwLock::new(cached)))
     }
 
     /// What the cache knows of the Catalog entry `logical` at `snapshot_ts`.
