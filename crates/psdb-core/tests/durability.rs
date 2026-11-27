@@ -9,7 +9,6 @@ mod common;
 
 use common::{collection, durable_shop, open};
 
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use bson::{Bson, doc};
@@ -92,14 +91,10 @@ fn open_shared(
 
 /// Every key and value in `engine`.
 fn contents(engine: &MemoryEngine) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut all = Vec::new();
     engine
-        .scan(&KeyRange::all(), &mut |k, v| {
-            all.push((k.to_vec(), v.to_vec()));
-            ControlFlow::Continue(())
-        })
-        .unwrap();
-    all
+        .scan(&KeyRange::all())
+        .collect::<psdb_storage::Result<_>>()
+        .unwrap()
 }
 
 #[test]

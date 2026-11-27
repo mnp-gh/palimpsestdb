@@ -4,8 +4,6 @@
 //! value that is either a tombstone or BSON bytes. A Snapshot at `ts` sees,
 //! for each logical key, the newest Version committed at or before `ts`.
 
-use std::ops::ControlFlow;
-
 use psdb_storage::{KeyRange, StorageEngine, WriteBatch};
 
 use crate::error::{Error, Result};
@@ -82,13 +80,10 @@ pub(crate) fn read_at<E: StorageEngine>(
     // Versions are newest first, so seeking to the Snapshot's timestamp lands
     // on the newest Version at or before it.
     range.start = physical_key(logical, snapshot_ts);
-    // Decoded inside the scan, so the value is copied once.
-    let mut found = Ok(None);
-    engine.scan(&range, &mut |_, value| {
-        found = decode_value(value);
-        ControlFlow::Break(())
-    })?;
-    found
+    match engine.scan(&range).next().transpose()? {
+        Some((_, value)) => decode_value(&value),
+        None => Ok(None),
+    }
 }
 
 /// The Commit Timestamp of the newest Version of `logical`, whatever the
@@ -97,12 +92,7 @@ pub(crate) fn latest_commit_ts<E: StorageEngine>(
     engine: &E,
     logical: &[u8],
 ) -> Result<Option<u64>> {
-    let mut newest = None;
-    engine.scan(&KeyRange::prefix(logical), &mut |key, _| {
-        newest = Some(key.to_vec());
-        ControlFlow::Break(())
-    })?;
-    let Some(key) = newest else {
+    let Some((key, _)) = engine.scan(&KeyRange::prefix(logical)).next().transpose()? else {
         return Ok(None);
     };
     let (_, ts) = split_physical(&key)?;
@@ -112,53 +102,42 @@ pub(crate) fn latest_commit_ts<E: StorageEngine>(
 /// Whether any Version of any key under `prefix` exists, live or deleted,
 /// at any timestamp.
 pub(crate) fn any_version_under<E: StorageEngine>(engine: &E, prefix: &[u8]) -> Result<bool> {
-    let mut found = false;
-    engine.scan(&KeyRange::prefix(prefix), &mut |_, _| {
-        found = true;
-        ControlFlow::Break(())
-    })?;
-    Ok(found)
+    Ok(engine.scan(&KeyRange::prefix(prefix)).next().transpose()?.is_some())
 }
 
-/// A scan callback: a logical key and its visible value; `Break` stops.
-pub(crate) type Visit<'a> = dyn FnMut(&[u8], Vec<u8>) -> ControlFlow<()> + 'a;
-
-/// Call `visit` with every logical key in `range` that has a live Version
-/// at `snapshot_ts`, in key order, with that Version's value, until it
-/// returns `Break`. The range bounds compare against physical keys, so a
-/// bound should be a logical key or a prefix of one.
-pub(crate) fn scan_range_at<E: StorageEngine>(
-    engine: &E,
+/// Every logical key in `range` that has a live Version at `snapshot_ts`,
+/// in key order, with that Version's value. The range bounds compare
+/// against physical keys, so a bound should be a logical key or a prefix of
+/// one. The caller stops at the first error.
+pub(crate) fn scan_range_at<'e, E: StorageEngine>(
+    engine: &'e E,
     range: &KeyRange,
     snapshot_ts: u64,
-    visit: &mut Visit<'_>,
-) -> Result<()> {
+) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + use<'e, E> {
     // The logical key whose visible Version was already found; its older
     // Versions are skipped.
     let mut decided: Option<Vec<u8>> = None;
-    let mut failure = None;
-    engine.scan(range, &mut |key, value| {
-        let (logical, ts) = match split_physical(key) {
-            Ok(parts) => parts,
-            Err(e) => {
-                failure = Some(e);
-                return ControlFlow::Break(());
-            }
-        };
-        if ts > snapshot_ts || decided.as_deref() == Some(logical) {
-            return ControlFlow::Continue(());
-        }
-        decided = Some(logical.to_vec());
-        match decode_value(value) {
-            Ok(Some(bytes)) => visit(logical, bytes),
-            Ok(None) => ControlFlow::Continue(()),
-            Err(e) => {
-                failure = Some(e);
-                ControlFlow::Break(())
-            }
-        }
-    })?;
-    failure.map_or(Ok(()), Err)
+    engine
+        .scan(range)
+        .filter_map(move |version| visible(version, snapshot_ts, &mut decided).transpose())
+}
+
+/// The logical key and live value of `version` if it is the one a Snapshot
+/// at `snapshot_ts` sees, given that the newest Versions of `decided` came
+/// before it. `None` for a Version too new, an older Version of `decided`,
+/// or a Tombstone.
+fn visible(
+    version: psdb_storage::Result<(Vec<u8>, Vec<u8>)>,
+    snapshot_ts: u64,
+    decided: &mut Option<Vec<u8>>,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let (key, value) = version?;
+    let (logical, ts) = split_physical(&key)?;
+    if ts > snapshot_ts || decided.as_deref() == Some(logical) {
+        return Ok(None);
+    }
+    *decided = Some(logical.to_vec());
+    Ok(decode_value(&value)?.map(|bytes| (logical.to_vec(), bytes)))
 }
 
 #[cfg(test)]
@@ -215,13 +194,9 @@ mod tests {
         put_version(&engine, b"q", 1, Some(b"outside prefix"));
 
         let collect = |ts| {
-            let mut out = Vec::new();
-            scan_range_at(&engine, &KeyRange::prefix(b"p"), ts, &mut |k, v| {
-                out.push((k.to_vec(), v));
-                ControlFlow::Continue(())
-            })
-            .unwrap();
-            out
+            scan_range_at(&engine, &KeyRange::prefix(b"p"), ts)
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
         };
         assert_eq!(
             collect(2),

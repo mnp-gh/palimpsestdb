@@ -163,28 +163,15 @@ impl<E: StorageEngine> GcPass<'_, E> {
     pub fn step(&mut self) -> Result<Option<GcStats>> {
         assert!(!self.done, "stepped a finished Garbage Collection pass");
         let node = self.node;
-        // A copy, so `visit` can borrow `self` mutably during the scan.
-        let range = self.range.clone();
         let mut batch = WriteBatch::new();
-        let mut visited = 0;
         let mut next_start = None;
-        let mut failure = None;
-        node.engine.scan(&range, &mut |key, value| {
-            visited += 1;
-            match self.visit(key, value, visited, &mut batch) {
-                Ok(ControlFlow::Continue(())) => ControlFlow::Continue(()),
-                Ok(ControlFlow::Break(())) => {
-                    next_start = Some(key.to_vec());
-                    ControlFlow::Break(())
-                }
-                Err(e) => {
-                    failure = Some(e);
-                    ControlFlow::Break(())
-                }
+        // A fresh iterator per step, so none outlives it (ADR 0018).
+        for (visited, item) in (1..).zip(node.engine.scan(&self.range)) {
+            let (key, value) = item?;
+            if self.visit(&key, &value, visited, &mut batch)?.is_break() {
+                next_start = Some(key);
+                break;
             }
-        })?;
-        if let Some(e) = failure {
-            return Err(e);
         }
         if !batch.ops().is_empty() {
             node.engine.write_batch(batch)?;
@@ -380,14 +367,7 @@ mod tests {
 
     /// Physical keys under `prefix`, whatever their timestamp.
     fn versions_under(node: &Node<MemoryEngine>, prefix: &[u8]) -> usize {
-        let mut n = 0;
-        node.engine
-            .scan(&KeyRange::prefix(prefix), &mut |_, _| {
-                n += 1;
-                ControlFlow::Continue(())
-            })
-            .unwrap();
-        n
+        node.engine.scan(&KeyRange::prefix(prefix)).count()
     }
 
     #[test]
@@ -426,13 +406,11 @@ mod tests {
             start: keys::namespaces_prefix(),
             end: None,
         };
-        node.engine
-            .scan(&all, &mut |_, value| {
-                keys += 1;
-                tombstones += u64::from(mvcc::is_tombstone(value));
-                ControlFlow::Continue(())
-            })
-            .unwrap();
+        for item in node.engine.scan(&all) {
+            let (_, value) = item.unwrap();
+            keys += 1;
+            tombstones += u64::from(mvcc::is_tombstone(&value));
+        }
         (keys, tombstones)
     }
 

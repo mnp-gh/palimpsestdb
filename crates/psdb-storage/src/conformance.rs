@@ -17,7 +17,6 @@
 #![expect(clippy::unwrap_used, reason = "test code: a failure should panic")]
 
 use std::collections::BTreeMap;
-use std::ops::ControlFlow;
 
 use crate::{KeyRange, StorageEngine, WriteBatch, WriteOp};
 
@@ -33,7 +32,7 @@ pub fn run_all<E: StorageEngine>(make: impl Fn() -> E) {
     scan_is_byte_ordered(&make());
     scan_respects_range_bounds(&make());
     scan_prefix(&make());
-    scan_stops_on_break(&make());
+    scan_survives_writes_between_next_calls(&make());
     matches_model_under_random_ops(&make());
 }
 
@@ -129,14 +128,10 @@ fn scanned_keys<E: StorageEngine>(engine: &E, range: &KeyRange) -> Vec<Vec<u8>> 
 }
 
 fn collect<E: StorageEngine>(engine: &E, range: &KeyRange) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut out = Vec::new();
     engine
-        .scan(range, &mut |k, v| {
-            out.push((k.to_vec(), v.to_vec()));
-            ControlFlow::Continue(())
-        })
-        .expect("scan failed");
-    out
+        .scan(range)
+        .collect::<crate::Result<_>>()
+        .expect("scan failed")
 }
 
 fn scan_respects_range_bounds<E: StorageEngine>(engine: &E) {
@@ -174,22 +169,41 @@ fn scan_prefix<E: StorageEngine>(engine: &E) {
     );
 }
 
-fn scan_stops_on_break<E: StorageEngine>(engine: &E) {
+fn scan_survives_writes_between_next_calls<E: StorageEngine>(engine: &E) {
+    // Enough keys that an engine copying entries a few at a time refills
+    // mid-scan. Even keys are never written during the scan; odd ones are.
+    let key = |i: u16| i.to_be_bytes().to_vec();
     write(engine, |b| {
-        b.put("a", "").put("b", "").put("c", "");
+        for i in 0..300 {
+            b.put(key(i), key(i));
+        }
     });
-    let mut seen = 0;
-    engine
-        .scan(&KeyRange::all(), &mut |_, _| {
-            seen += 1;
-            if seen == 2 {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .unwrap();
-    assert_eq!(seen, 2, "scan must stop when visit returns Break");
+    let mut seen = Vec::new();
+    for item in engine.scan(&KeyRange::all()) {
+        let (k, v) = item.expect("scan failed");
+        if let Ok(i) = <[u8; 2]>::try_from(k.as_slice()).map(u16::from_be_bytes) {
+            write(engine, |b| {
+                // Behind and ahead of the cursor, plus a key that did not exist.
+                b.put(key(i.saturating_sub(9) | 1), "new")
+                    .delete(key((i + 9) | 1))
+                    .put([&k[..], b"\0"].concat(), "inserted");
+            });
+        }
+        seen.push((k, v));
+    }
+    assert!(
+        seen.windows(2).all(|w| w[0].0 < w[1].0),
+        "scan must yield keys in ascending order, each once"
+    );
+    let untouched: Vec<_> = seen
+        .into_iter()
+        .filter(|(k, _)| k.len() == 2 && k[1] % 2 == 0)
+        .collect();
+    let want: Vec<_> = (0..300).step_by(2).map(|i| (key(i), key(i))).collect();
+    assert_eq!(
+        untouched, want,
+        "a key not written during the scan comes exactly once, with its value"
+    );
 }
 
 fn matches_model_under_random_ops<E: StorageEngine>(engine: &E) {

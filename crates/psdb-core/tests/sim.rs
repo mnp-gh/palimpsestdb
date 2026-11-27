@@ -20,7 +20,7 @@ use psdb_core::{
     Error, FieldSchema, FieldType, GcPass, IdGenerator, IndexBuild, IndexState, Limits, Node,
     Transaction,
 };
-use psdb_storage::{KeyRange, ScanVisitor, StorageEngine, WriteBatch};
+use psdb_storage::{KeyRange, StorageEngine, WriteBatch};
 use psdb_storage_memory::MemoryEngine;
 use uuid::Builder;
 
@@ -308,8 +308,10 @@ impl StorageEngine for LoggedEngine {
         self.engine.get(key)
     }
 
-    fn scan(&self, range: &KeyRange, visit: &mut ScanVisitor<'_>) -> psdb_storage::Result<()> {
-        self.engine.scan(range, visit)
+    type Scan<'a> = <MemoryEngine as StorageEngine>::Scan<'a>;
+
+    fn scan(&self, range: &KeyRange) -> Self::Scan<'_> {
+        self.engine.scan(range)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> psdb_storage::Result<()> {

@@ -7,7 +7,6 @@
 //! Every implementation must pass [`conformance::run_all`].
 
 use std::fmt;
-use std::ops::ControlFlow;
 
 pub mod conformance;
 
@@ -185,10 +184,6 @@ impl From<std::io::Error> for StorageError {
     }
 }
 
-/// The callback [`StorageEngine::scan`] calls with each key and value.
-/// Return [`ControlFlow::Break`] to stop the scan.
-pub type ScanVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> ControlFlow<()> + 'a;
-
 /// Result type for Storage Engine operations.
 pub type Result<T> = std::result::Result<T, StorageError>;
 
@@ -199,7 +194,7 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 ///
 /// 1. **Byte order.** Keys compare lexicographically as unsigned bytes
 ///    (like `memcmp`, shorter key first on a tie). [`scan`](Self::scan)
-///    visits keys in ascending order.
+///    yields keys in ascending order.
 /// 2. **Atomic batches.** After [`write_batch`](Self::write_batch) returns,
 ///    every op in the batch is visible to later reads. After a crash, either
 ///    the whole batch is present or none of it is.
@@ -229,17 +224,26 @@ pub trait StorageEngine: Send + Sync {
     /// See [the trait's](StorageEngine#errors).
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
-    /// Visit every key in `range` in ascending order, calling `visit` with
-    /// each key and value. Return [`ControlFlow::Break`] from `visit` to stop
-    /// early. An empty range (`end <= start`), such as one from
-    /// [`KeyRange::intersect`], visits nothing.
+    /// The iterator [`scan`](Self::scan) returns.
+    type Scan<'a>: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>
+    where
+        Self: 'a;
+
+    /// Every key in `range` with its value, in ascending key order, pulled
+    /// one at a time. An empty range (`end <= start`), such as one from
+    /// [`KeyRange::intersect`], yields nothing.
     ///
-    /// `visit` must not call back into the engine.
+    /// The caller may write to the engine between `next` calls; the
+    /// iterator promises only a loose view (ADR 0018). A key not written
+    /// while the iterator is alive comes exactly once, with its value. A
+    /// key written meanwhile may come with its new value, its old value, or
+    /// not at all. After an `Err` the iterator yields `None`. An engine that
+    /// freezes its view when the scan starts satisfies this.
     ///
     /// # Errors
     ///
-    /// See [the trait's](StorageEngine#errors).
-    fn scan(&self, range: &KeyRange, visit: &mut ScanVisitor<'_>) -> Result<()>;
+    /// The iterator yields [the trait's](StorageEngine#errors).
+    fn scan(&self, range: &KeyRange) -> Self::Scan<'_>;
 
     /// Apply every op in `batch` atomically, in order.
     ///
@@ -266,8 +270,13 @@ impl<E: StorageEngine + ?Sized> StorageEngine for std::sync::Arc<E> {
         (**self).get(key)
     }
 
-    fn scan(&self, range: &KeyRange, visit: &mut ScanVisitor<'_>) -> Result<()> {
-        (**self).scan(range, visit)
+    type Scan<'a>
+        = E::Scan<'a>
+    where
+        Self: 'a;
+
+    fn scan(&self, range: &KeyRange) -> Self::Scan<'_> {
+        (**self).scan(range)
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {

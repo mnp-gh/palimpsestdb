@@ -24,8 +24,6 @@
 //! `int` field files `30.5` under `30`, and range scans include their
 //! bounds.
 
-use std::ops::ControlFlow;
-
 use bson::{Bson, RawDocument};
 use psdb_storage::{KeyRange, StorageEngine};
 
@@ -595,17 +593,19 @@ impl<E: StorageEngine> IndexBuild<'_, E> {
         // The first Document of the next chunk, if this one filled up
         // before the Collection ended.
         let mut next_chunk_start = None;
-        mvcc::scan_range_at(&node.engine, &self.remaining, latest, &mut |key, value| {
+        // A fresh iterator per chunk: one kept open across chunks could
+        // yield a Version a writer replaced between them (ADR 0018).
+        for item in mvcc::scan_range_at(&node.engine, &self.remaining, latest) {
+            let (key, value) = item?;
             let full = docs.len() == self.chunk_documents
                 || (!docs.is_empty() && docs_bytes + value.len() > BUILD_CHUNK_BYTES);
             if full {
-                next_chunk_start = Some(key.to_vec());
-                return ControlFlow::Break(());
+                next_chunk_start = Some(key);
+                break;
             }
             docs_bytes += value.len();
-            docs.push((key.to_vec(), value));
-            ControlFlow::Continue(())
-        })?;
+            docs.push((key, value));
+        }
         let mut chunk = WriteSet::new();
         for (key, bytes) in &docs {
             let doc_id = &key[prefix_len..];
