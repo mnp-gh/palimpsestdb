@@ -207,32 +207,48 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
         &self,
         range: &KeyRange,
     ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
-        let mut snapshot =
-            mvcc::scan_range_at(&self.node.engine, range, self.snapshot_ts).peekable();
+        let snapshot = mvcc::scan_range_at(&self.node.engine, range, self.snapshot_ts);
         let range = range.clone();
-        let mut own = self
+        let own = self
             .write_set
             .range(range.start.clone()..)
-            .take_while(move |(k, _)| range.contains(k))
-            .peekable();
+            .take_while(move |(key, _)| range.contains(key));
+        Self::overlay(snapshot, own)
+    }
+
+    /// `snapshot` with the own writes in `own` laid over it. Both come in
+    /// key order, and so does the result: it is the merge step of merge
+    /// sort, except that where both have a key the own write wins, and an
+    /// own delete (`None`) hides the key. A Snapshot error is passed on as
+    /// soon as it comes; the caller stops there.
+    fn overlay<'w>(
+        snapshot: impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
+        own: impl Iterator<Item = (&'w Vec<u8>, &'w Option<Vec<u8>>)>,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        let mut snapshot = snapshot.peekable();
+        let mut own = own.peekable();
         std::iter::from_fn(move || {
             loop {
-                // Which side holds the smaller key next: the Snapshot's or
-                // the Write Set's.
-                let order = match (snapshot.peek(), own.peek()) {
+                // Whose key comes next: `Less` is the Snapshot's, `Greater`
+                // the own write's, `Equal` a key both have.
+                let next = match (snapshot.peek(), own.peek()) {
                     (None, None) => return None,
-                    (Some(Err(_)), _) | (Some(Ok(_)), None) => return snapshot.next(),
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(Err(_)), _) => return snapshot.next(),
+                    (Some(Ok(_)), None) => Less,
+                    (None, Some(_)) => Greater,
                     (Some(Ok((key, _))), Some((own_key, _))) => key.cmp(own_key),
                 };
-                if order.is_lt() {
-                    return snapshot.next();
-                }
-                if order.is_eq() {
+                match next {
+                    // A key this Transaction did not write.
+                    Less => return snapshot.next(),
                     // The own write replaces the Snapshot's value.
-                    snapshot.next();
+                    Equal => drop(snapshot.next()),
+                    // A key only this Transaction wrote.
+                    Greater => {}
                 }
-                // An own delete yields nothing; the loop moves to the next key.
+                // A delete returns nothing, so the loop moves on to the next key.
                 if let Some((key, Some(value))) = own.next() {
                     return Some(Ok((key.clone(), value.clone())));
                 }
@@ -575,6 +591,52 @@ mod tests {
     use psdb_storage_memory::MemoryEngine;
 
     use crate::Node;
+    use crate::error::Error;
+    use crate::transaction::{Transaction, WriteSet};
+
+    #[test]
+    fn overlay_merges_own_writes_into_the_snapshot() {
+        let pair = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
+        let snapshot = [
+            pair("a", "1"),
+            pair("b", "2"),
+            pair("c", "3"),
+            pair("d", "4"),
+        ];
+        let own: WriteSet = [
+            (b"b".to_vec(), Some(b"9".to_vec())),
+            (b"c".to_vec(), None),
+            (b"cc".to_vec(), None),
+            (b"e".to_vec(), Some(b"5".to_vec())),
+        ]
+        .into();
+        let merged: Vec<_> =
+            Transaction::<MemoryEngine>::overlay(snapshot.into_iter().map(Ok), own.iter())
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(
+            merged,
+            [
+                pair("a", "1"),
+                pair("b", "9"),
+                pair("d", "4"),
+                pair("e", "5")
+            ],
+            "b replaced, c deleted, cc deleted though never there, e inserted"
+        );
+    }
+
+    #[test]
+    fn overlay_passes_a_snapshot_error_on_before_later_own_writes() {
+        let snapshot = [
+            Ok((b"a".to_vec(), b"1".to_vec())),
+            Err(Error::Corruption("bad".into())),
+        ];
+        let own: WriteSet = [(b"b".to_vec(), Some(b"2".to_vec()))].into();
+        let mut merged = Transaction::<MemoryEngine>::overlay(snapshot.into_iter(), own.iter());
+        assert!(matches!(merged.next(), Some(Ok(_))));
+        assert!(matches!(merged.next(), Some(Err(Error::Corruption(_)))));
+    }
 
     #[test]
     fn read_only_commit_does_not_wait_for_the_commit_lock() {
