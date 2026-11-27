@@ -11,7 +11,7 @@ PalimpsestDB grows in small versions, each adding one hard idea on top of a work
 | v0.4.1 | Catalog from engine | Done |
 | v0.4.2 | Resume Recovery | Done |
 | v0.4.3 | Streaming find | Done |
-| v0.4.4 | Pull iterators | Planned |
+| v0.4.4 | Pull iterators | Done |
 | v0.4.5 | Persistent engine | Planned |
 | v0.4.6 | Checkpoint | Planned |
 | v0.4.7 | Unordered find | Planned |

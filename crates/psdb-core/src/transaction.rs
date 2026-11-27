@@ -202,14 +202,58 @@ impl<'node, E: StorageEngine> Transaction<'node, E> {
     }
 
     /// Every live key and value in `range`: the Snapshot with own writes
-    /// overlaid, in key order, read from the engine a chunk at a time
-    /// (ADR 0016).
+    /// overlaid, in key order, pulled from one engine iterator (ADR 0018).
     pub(crate) fn scan_range(
         &self,
         range: &KeyRange,
     ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + '_ {
-        let mut scan = Scan::new(range);
-        std::iter::from_fn(move || scan.next(self))
+        let snapshot = mvcc::scan_range_at(&self.node.engine, range, self.snapshot_ts);
+        let range = range.clone();
+        let own = self
+            .write_set
+            .range(range.start.clone()..)
+            .take_while(move |(key, _)| range.contains(key));
+        Self::overlay(snapshot, own)
+    }
+
+    /// `snapshot` with the own writes in `own` laid over it. Both come in
+    /// key order, and so does the result: it is the merge step of merge
+    /// sort, except that where both have a key the own write wins, and an
+    /// own delete (`None`) hides the key. A Snapshot error is passed on as
+    /// soon as it comes; the caller stops there.
+    fn overlay<'w>(
+        snapshot: impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
+        own: impl Iterator<Item = (&'w Vec<u8>, &'w Option<Vec<u8>>)>,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+
+        let mut snapshot = snapshot.peekable();
+        let mut own = own.peekable();
+        std::iter::from_fn(move || {
+            loop {
+                // Whose key comes next: `Less` is the Snapshot's, `Greater`
+                // the own write's, `Equal` a key both have.
+                let next = match (snapshot.peek(), own.peek()) {
+                    (None, None) => return None,
+                    (Some(Err(_)), _) => return snapshot.next(),
+                    (Some(Ok(_)), None) => Less,
+                    (None, Some(_)) => Greater,
+                    (Some(Ok((key, _))), Some((own_key, _))) => key.cmp(own_key),
+                };
+                match next {
+                    // A key this Transaction did not write.
+                    Less => return snapshot.next(),
+                    // The own write replaces the Snapshot's value.
+                    Equal => drop(snapshot.next()),
+                    // A key only this Transaction wrote.
+                    Greater => {}
+                }
+                // A delete returns nothing, so the loop moves on to the next key.
+                if let Some((key, Some(value))) = own.next() {
+                    return Some(Ok((key.clone(), value.clone())));
+                }
+            }
+        })
     }
 
     /// Insert a Document. If it has no `_id`, a UUIDv7 is generated.
@@ -533,83 +577,6 @@ impl<E: StorageEngine> Drop for Transaction<'_, E> {
     }
 }
 
-/// Where a chunked scan of a key range stands (ADR 0016). It holds no
-/// borrow, so each step is handed the Transaction it reads through.
-struct Scan {
-    /// Where the next chunk starts, or `None` once the range is done or a
-    /// chunk failed.
-    next_start: Option<Vec<u8>>,
-    end: Option<Vec<u8>>,
-    chunk: std::collections::btree_map::IntoIter<Vec<u8>, Vec<u8>>,
-}
-
-impl Scan {
-    fn new(range: &KeyRange) -> Self {
-        Self {
-            next_start: Some(range.start.clone()),
-            end: range.end.clone(),
-            chunk: BTreeMap::new().into_iter(),
-        }
-    }
-
-    /// The next live key and value. After the range ends or an error,
-    /// `None`.
-    fn next<E: StorageEngine>(
-        &mut self,
-        txn: &Transaction<'_, E>,
-    ) -> Option<Result<(Vec<u8>, Vec<u8>)>> {
-        loop {
-            if let Some(item) = self.chunk.next() {
-                return Some(Ok(item));
-            }
-            let start = self.next_start.take()?;
-            let range = KeyRange {
-                start,
-                end: self.end.clone(),
-            };
-            if let Err(e) = self.read_chunk(txn, range) {
-                return Some(Err(e));
-            }
-        }
-    }
-
-    /// Read the next chunk of `range` at the Snapshot with own writes
-    /// overlaid, and set where the chunk after it starts.
-    fn read_chunk<E: StorageEngine>(
-        &mut self,
-        txn: &Transaction<'_, E>,
-        range: KeyRange,
-    ) -> Result<()> {
-        let limits = &txn.node.limits;
-        let mut live = BTreeMap::new();
-        let mut bytes = 0;
-        let mut last = None;
-        for item in mvcc::scan_range_at(&txn.node.engine, &range, txn.snapshot_ts) {
-            let (key, value) = item?;
-            bytes += value.len();
-            live.insert(key.clone(), value);
-            if live.len() >= limits.scan_chunk_keys || bytes >= limits.scan_chunk_bytes {
-                last = Some(key);
-                break;
-            }
-        }
-        // The part of `range` this chunk covers, for overlaying own writes.
-        let covered = match last {
-            None => range,
-            Some(last) => {
-                // Just past the oldest possible Version of `last`; keys are
-                // self-delimiting (ADR 0008), so no other logical key falls between.
-                let mut resume = keys::physical_key(&last, 0);
-                resume.push(0);
-                self.next_start = Some(resume.clone());
-                KeyRange::new(range.start, resume)
-            }
-        };
-        self.chunk = txn.overlay_own_writes(&covered, live).into_iter();
-        Ok(())
-    }
-}
-
 /// Every entry of `write_set`, borrowed, in key order.
 pub(crate) fn writes(write_set: &WriteSet) -> impl Iterator<Item = Write<'_>> {
     write_set.iter().map(|(k, v)| (k.as_slice(), v.as_deref()))
@@ -624,6 +591,52 @@ mod tests {
     use psdb_storage_memory::MemoryEngine;
 
     use crate::Node;
+    use crate::error::Error;
+    use crate::transaction::{Transaction, WriteSet};
+
+    #[test]
+    fn overlay_merges_own_writes_into_the_snapshot() {
+        let pair = |k: &str, v: &str| (k.as_bytes().to_vec(), v.as_bytes().to_vec());
+        let snapshot = [
+            pair("a", "1"),
+            pair("b", "2"),
+            pair("c", "3"),
+            pair("d", "4"),
+        ];
+        let own: WriteSet = [
+            (b"b".to_vec(), Some(b"9".to_vec())),
+            (b"c".to_vec(), None),
+            (b"cc".to_vec(), None),
+            (b"e".to_vec(), Some(b"5".to_vec())),
+        ]
+        .into();
+        let merged: Vec<_> =
+            Transaction::<MemoryEngine>::overlay(snapshot.into_iter().map(Ok), own.iter())
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(
+            merged,
+            [
+                pair("a", "1"),
+                pair("b", "9"),
+                pair("d", "4"),
+                pair("e", "5")
+            ],
+            "b replaced, c deleted, cc deleted though never there, e inserted"
+        );
+    }
+
+    #[test]
+    fn overlay_passes_a_snapshot_error_on_before_later_own_writes() {
+        let snapshot = [
+            Ok((b"a".to_vec(), b"1".to_vec())),
+            Err(Error::Corruption("bad".into())),
+        ];
+        let own: WriteSet = [(b"b".to_vec(), Some(b"2".to_vec()))].into();
+        let mut merged = Transaction::<MemoryEngine>::overlay(snapshot.into_iter(), own.iter());
+        assert!(matches!(merged.next(), Some(Ok(_))));
+        assert!(matches!(merged.next(), Some(Err(Error::Corruption(_)))));
+    }
 
     #[test]
     fn read_only_commit_does_not_wait_for_the_commit_lock() {

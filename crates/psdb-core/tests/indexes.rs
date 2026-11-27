@@ -1345,11 +1345,7 @@ fn a_writer_that_began_before_a_build_aborts() {
 
 #[test]
 fn index_plan_with_overlapping_ranges_returns_each_document_once() {
-    let node = Node::with_limits(
-        MemoryEngine::new(),
-        Limits::default().with_scan_chunk(2, usize::MAX),
-    )
-    .unwrap();
+    let node = Node::new(MemoryEngine::new()).unwrap();
     let orders = collection("shop.orders");
     node.create_namespace("shop").unwrap();
     node.create_collection(&orders).unwrap();

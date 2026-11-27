@@ -248,14 +248,9 @@ fn client_supplied_object_ids_work_as_ids_and_fields() {
     assert_eq!(found.len(), 1);
 }
 
-/// A Node whose scans read at most `keys` Documents or `bytes` bytes per
-/// chunk, with `shop.orders` created.
-fn chunked_shop(keys: usize, bytes: usize) -> Node<MemoryEngine> {
-    let node = Node::with_limits(
-        MemoryEngine::new(),
-        Limits::default().with_scan_chunk(keys, bytes),
-    )
-    .unwrap();
+/// A Node with `shop.orders` created.
+fn shop() -> Node<MemoryEngine> {
+    let node = Node::new(MemoryEngine::new()).unwrap();
     node.create_namespace("shop").unwrap();
     node.create_collection(&collection("shop.orders")).unwrap();
     node
@@ -266,13 +261,13 @@ fn ids(docs: &[bson::Document]) -> Vec<i32> {
 }
 
 #[test]
-fn find_streams_many_chunks_with_own_writes_applied() {
-    let node = chunked_shop(2, usize::MAX);
+fn find_streams_with_own_writes_applied() {
+    let node = shop();
     let orders = collection("shop.orders");
     for id in 0..10 {
         node.insert(&orders, doc! { "_id": id, "v": 0 }).unwrap();
     }
-    // Several Versions and Tombstones, some on chunk boundaries.
+    // Several Versions and Tombstones.
     for v in 1..4 {
         node.replace(&orders, &Bson::Int32(1), doc! { "v": v })
             .unwrap();
@@ -301,35 +296,8 @@ fn find_streams_many_chunks_with_own_writes_applied() {
 }
 
 #[test]
-fn find_returns_a_document_larger_than_a_chunk() {
-    let node = chunked_shop(1000, 10);
-    let orders = collection("shop.orders");
-    for id in 0..3 {
-        node.insert(&orders, doc! { "_id": id, "pad": "x".repeat(100) })
-            .unwrap();
-    }
-    assert_eq!(ids(&node.find(&orders, &doc! {}).unwrap()), [0, 1, 2]);
-}
-
-#[test]
-fn find_does_not_see_a_commit_between_chunks() {
-    let node = chunked_shop(2, usize::MAX);
-    let orders = collection("shop.orders");
-    for id in 0..6 {
-        node.insert(&orders, doc! { "_id": id }).unwrap();
-    }
-    let mut txn = node.begin_transaction();
-    let mut found = txn.find(&orders, &doc! {}).unwrap();
-    let mut docs: Vec<_> = found.by_ref().take(2).map(Result::unwrap).collect();
-    node.insert(&orders, doc! { "_id": 9 }).unwrap();
-    node.delete(&orders, &Bson::Int32(4)).unwrap();
-    docs.extend(found.map(Result::unwrap));
-    assert_eq!(ids(&docs), [0, 1, 2, 3, 4, 5]);
-}
-
-#[test]
 fn find_stream_ignores_commits_and_gc_between_next_calls() {
-    let node = chunked_shop(2, usize::MAX);
+    let node = shop();
     let orders = collection("shop.orders");
     // More Documents than the engine copies per read lock, each with an
     // old Version for Garbage Collection to remove.
