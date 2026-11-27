@@ -102,7 +102,11 @@ pub(crate) fn latest_commit_ts<E: StorageEngine>(
 /// Whether any Version of any key under `prefix` exists, live or deleted,
 /// at any timestamp.
 pub(crate) fn any_version_under<E: StorageEngine>(engine: &E, prefix: &[u8]) -> Result<bool> {
-    Ok(engine.scan(&KeyRange::prefix(prefix)).next().transpose()?.is_some())
+    Ok(engine
+        .scan(&KeyRange::prefix(prefix))
+        .next()
+        .transpose()?
+        .is_some())
 }
 
 /// Every logical key in `range` that has a live Version at `snapshot_ts`,
