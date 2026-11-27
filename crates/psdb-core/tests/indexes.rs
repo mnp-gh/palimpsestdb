@@ -1198,7 +1198,10 @@ fn a_build_chunk_stops_at_16_mib() {
     let mut build = node
         .start_index_build(&collection("shop.orders"), &field_path("n"), false)
         .unwrap();
-    assert!(!build.step().unwrap(), "the third Document is left for a second chunk");
+    assert!(
+        !build.step().unwrap(),
+        "the third Document is left for a second chunk"
+    );
     assert!(build.step().unwrap());
 }
 
